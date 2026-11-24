@@ -354,7 +354,7 @@ class PageTests(unittest.TestCase):
         out = ps.render_html(self.an(), "o/r", NOW, same_day)
         self.assertIn("<polyline class=\"line", out)
         self.assertNotIn("<rect class=\"b-new", out)
-        self.assertEqual(out.count("No data yet"), 2)  # the bars, and the Closed tab (no closed-PR data in this analysis)
+        self.assertEqual(out.count("No data yet"), 3)  # the bars, the merged-per-day chart and the Closed tab (no closed-PR data in this analysis)
         two = [snap("2026-11-22T23:00:00Z", [1]), snap("2026-11-23T09:00:00Z", [1, 2])]
         self.assertIn("<rect class=\"b-new", ps.render_html(self.an(), "o/r", NOW, two))
 
@@ -563,7 +563,7 @@ class ToolbarTests(unittest.TestCase):
 
     def test_segmented_state_control(self):
         out = self.page({"A": 2})
-        seg = out.split('class="seg"')[1].split("</div>")[0]
+        seg = out.split('id="states"')[1].split("</div>")[0]
         self.assertEqual(re.findall(r">([^<]+)</button>", seg), ["All", "Unreviewed", "Ready", "Draft", "Closed"])
         self.assertEqual(seg.count('aria-pressed="true"'), 1)
         self.assertEqual(out.count('id="q"'), 1)
@@ -589,7 +589,7 @@ class FitTests(unittest.TestCase):
 
     def test_body_never_scrolls_on_desktop(self):
         d = self.desktop()
-        self.assertIn("html,body{height:100%;overflow:hidden}", d)
+        self.assertIn(".js,.js body{height:100%;overflow:hidden}", d)  # html has the js class; without JS the page scrolls
         self.assertIn("height:100dvh", d)
         self.assertNotIn("min-height:660px", ps.CSS + ps.SCENE_CSS)
 
@@ -597,7 +597,7 @@ class FitTests(unittest.TestCase):
         self.assertNotIn("overflow:auto", ps.SCENE_CSS)
         self.assertNotIn("overflow-y:auto", ps.SCENE_CSS)
         self.assertNotIn("overflow:scroll", ps.SCENE_CSS)
-        self.assertIn(".a-city,.a-trends,.a-road,.a-standings,.a-feed{overflow:hidden", self.desktop())
+        self.assertIn(".js .a-city,.js .a-trends,.js .a-road,.js .a-standings,.js .a-feed{overflow:hidden", self.desktop())
 
     def test_only_long_lists_scroll(self):
         css = ps.CSS + ps.SCENE_CSS
@@ -620,10 +620,11 @@ class FitTests(unittest.TestCase):
 
     def test_charts_fill_their_box(self):
         out = ps.render_html(analysis_of({"A": 2}), "o/r", NOW, [snap(t(48), [1]), snap(t(24), [1, 2]), snap(t(1), [2, 3, 4])])
-        self.assertEqual(out.count('class="chart-box"'), 2)
+        self.assertEqual(out.count('class="chart-box"'), 3)  # open and unreviewed, opened and closed, merged per day
         self.assertIn('preserveAspectRatio="xMidYMid meet"', out)
-        self.assertIn('viewBox="0 0 %d %d"' % (ps.CHART_W, ps.CHART_H), out)
-        self.assertIn(".chart-box .chart{position:absolute", self.desktop())
+        self.assertIn('viewBox="0 0 %d %d"' % ps.CHART_WIDE, out)
+        self.assertIn('viewBox="0 0 %d %d"' % ps.CHART_HALF, out)
+        self.assertIn(".js .chart-box .chart{position:absolute", self.desktop())
 
     def test_trends_have_their_own_panel(self):
         out = ps.render_html(analysis_of({"A": 2}), "o/r", NOW)
@@ -648,7 +649,7 @@ class RendererSourceTests(unittest.TestCase):
     def test_pauses_when_hidden_or_off_screen(self):
         self.assertIn("IntersectionObserver", ps.SCENE_JS)
         self.assertIn("visibilitychange", ps.SCENE_JS)
-        self.assertIn("function shown(){return vis&&!d.hidden;}", ps.SCENE_JS)
+        self.assertIn("function shown(){return vis&&!d.hidden&&N>0;}", ps.SCENE_JS)
 
     def test_resize_observer_and_cached_layers(self):
         self.assertIn("new ResizeObserver(resized)", ps.SCENE_JS)
@@ -888,15 +889,15 @@ class ClosedTests(unittest.TestCase):
         self.assertIn("closedAt", ps.PR_FIELDS)
 
     def test_closed_window(self):
-        prs = [self.cpr(1, True, 1), self.cpr(2, False, 0), self.cpr(3, True, 7), self.cpr(4, False, 8), pr(5, state="OPEN"),
+        prs = [self.cpr(1, True, 1), self.cpr(2, False, 0), self.cpr(3, True, 30), self.cpr(4, False, 31), pr(5, state="OPEN"),
                self.cpr(6, True, 1)]
         out = ps.closed_window(prs, NOW)
-        self.assertEqual([p["number"] for p in out], [2, 1, 6, 3])  # newest first, ties by number; 8 d old and open dropped
-        self.assertEqual(ps.CLOSED_DAYS, 7)
+        self.assertEqual([p["number"] for p in out], [2, 1, 6, 3])  # newest first, ties by number; 31 d old and open dropped, 30 d kept
+        self.assertEqual(ps.CLOSED_DAYS, 30)
         self.assertEqual(ps.closed_window([], NOW), [])
 
     def test_analysis_counts(self):
-        an = self.an([self.cpr(1, True), self.cpr(2, False), self.cpr(3, True, 30)])
+        an = self.an([self.cpr(1, True), self.cpr(2, False), self.cpr(3, True, 31)])
         self.assertEqual([p["number"] for p in an["closed"]], [1, 2])
         self.assertEqual([p["number"] for p in an["mergedPrs"]], [1])
         self.assertTrue(an["closed"][0]["merged"])
@@ -916,7 +917,7 @@ class ClosedTests(unittest.TestCase):
             self.assertIsNone(ps.fetch_closed("o/r", NOW))
         finally:
             ps.fetch_paged = orig
-        self.assertEqual(seen, ["repo:o/r is:pr is:closed closed:>=2026-11-16"])
+        self.assertEqual(seen, ["repo:o/r is:pr is:closed closed:>=2026-10-24"])
 
     def test_scene_merged_base_layer(self):
         opens = [pr(1, "VFS: a", ["crates/xcl/src/vfs/a.rs"], isDraft=True)]
@@ -969,9 +970,9 @@ class ClosedTests(unittest.TestCase):
         out = ps.render_html(an, "o/r", NOW)
         panel = out.split('data-panel="closed"')[1].split("</section>")[0]
         self.assertIn('data-tab="closed" aria-pressed="false">Closed</button>', out)
-        self.assertIn('data-meta="1 merged, 1 closed, last 7 days"', out)
+        self.assertIn('data-meta="1 merged, 1 closed, last 30 d"', out)
         self.assertLess(panel.index("#11"), panel.index("#10"))  # newest first
-        self.assertEqual(panel.count('<div class="row cl">'), 2)
+        self.assertEqual(panel.count('<div class="row cl rg" '), 2)
         self.assertIn('<span class="pill merged">merged</span>', panel)
         self.assertIn('<span class="pill muted">closed</span>', panel)
         self.assertIn("<b>3d</b>ago", panel)
@@ -981,8 +982,8 @@ class ClosedTests(unittest.TestCase):
 
     def test_closed_empty_and_no_data(self):
         out = ps.render_html(self.an([]), "o/r", NOW)
-        self.assertIn("None in the last 7 days", out)
-        self.assertIn('data-meta="0 merged, 0 closed, last 7 days"', out)
+        self.assertIn("None in the last 30 d", out)
+        self.assertIn('data-meta="0 merged, 0 closed, last 30 d"', out)
         out = ps.render_html(self.an(None), "o/r", NOW)
         panel = out.split('data-panel="closed"')[1].split("</section>")[0]
         self.assertIn("No data yet", panel)
@@ -994,14 +995,14 @@ class ClosedTests(unittest.TestCase):
     def test_closed_state_filter(self):
         an = self.an([self.cpr(10, True)], [pr(1, "VFS: a", ["crates/xcl/src/vfs/a.rs"])])
         out = ps.render_html(an, "o/r", NOW)
-        seg = out.split('class="seg"')[1].split("</div>")[0]
+        seg = out.split('id="states"')[1].split("</div>")[0]
         self.assertIn('data-state="closed"', seg)
         self.assertLess(seg.index('data-state="draft"'), seg.index('data-state="closed"'))
         self.assertIn("STATES=['unrev','done','draft','closed']", ps.JS)
-        self.assertIn("data-closed", ps.JS)
+        self.assertIn("data-cl", ps.JS)
         self.assertIn("wc=st.state==='closed'", ps.JS)
-        self.assertEqual(out.count('class="row pr" data-area="area-vfs" data-closed="0"'), 1)
-        self.assertEqual(out.count('class="row pr" hidden data-area="area-vfs" data-closed="1"'), 1)  # hidden until Closed is chosen
+        self.assertEqual(out.count('class="row pr" data-area="area-vfs" data-cl="0"'), 1)
+        self.assertEqual(out.count('class="row pr" hidden data-area="area-vfs" data-cl="1"'), 1)  # hidden until Closed is chosen
 
     def test_closed_only_area_group_hidden(self):
         out = ps.render_html(self.an([self.cpr(10, True, files=["crates/xcl/src/tls/a.rs"], title="TLS: a")]), "o/r", NOW)
@@ -1157,6 +1158,292 @@ class OtherTowerTests(unittest.TestCase):
         self.assertEqual(top[-1]["members"], ["Other", "A7"])
         self.assertEqual(len(top[-1]["prs"]), 50 + 13)
         self.assertEqual(len(top), 8)
+
+
+def ago(**kw):
+    return (NOW - dt.timedelta(**kw)).strftime(ps.TS_FMT)
+
+
+class RangeTests(unittest.TestCase):
+    VFS = ["crates/xcl/src/vfs/shared.rs"]
+
+    def opn(self, number, created, updated, **kw):
+        return pr(number, "VFS: a%d" % number, ["crates/xcl/src/vfs/f%d.rs" % number], createdAt=created, updatedAt=updated, **kw)
+
+    def cl(self, number, when, merged=True, **kw):
+        d = pr(number, "TLS: c%d" % number, ["crates/xcl/src/tls/c%d.rs" % number], state="MERGED" if merged else "CLOSED",
+               closedAt=when, mergedAt=when if merged else None, createdAt=ago(days=40), updatedAt=ago(days=40))
+        d.update(kw)
+        return d
+
+    def test_ranges_and_default(self):
+        self.assertEqual([(k, s_, lb) for k, s_, lb in ps.RANGES],
+                         [("1h", 3600, "1 h"), ("12h", 43200, "12 h"), ("24h", 86400, "24 h"), ("7d", 604800, "7 d"), ("30d", 2592000, "30 d")])
+        self.assertEqual(ps.DEFAULT_RANGE, "7d")
+        self.assertEqual(ps.empty_range("1 h"), "No PRs in the last 1 h.")
+
+    def test_in_range_edges_for_each_range(self):
+        for key, secs, _ in ps.RANGES:
+            edge = NOW - dt.timedelta(seconds=secs)
+            fmt = lambda t: t.strftime(ps.TS_FMT)
+            old = fmt(edge - dt.timedelta(seconds=1))
+            at = fmt(edge)
+            # open: created or updated counts; the boundary is inclusive, one second older is out
+            self.assertTrue(ps.in_range(self.opn(1, old, at), secs, NOW), key)
+            self.assertTrue(ps.in_range(self.opn(1, at, old), secs, NOW), key)
+            self.assertFalse(ps.in_range(self.opn(1, old, old), secs, NOW), key)
+            self.assertTrue(ps.in_range(self.opn(1, old, fmt(NOW)), secs, NOW), key)
+            # merged: mergedAt; closed: closedAt
+            self.assertTrue(ps.in_range(self.cl(2, at), secs, NOW), key)
+            self.assertFalse(ps.in_range(self.cl(2, old), secs, NOW), key)
+            self.assertTrue(ps.in_range(self.cl(3, at, merged=False), secs, NOW), key)
+            self.assertFalse(ps.in_range(self.cl(3, old, merged=False), secs, NOW), key)
+
+    def test_in_range_closed_ignores_creation_and_missing_times(self):
+        c = self.cl(1, ago(days=40))
+        c["createdAt"] = c["updatedAt"] = ago(minutes=1)  # recently touched, but it ended long ago
+        self.assertFalse(ps.in_range(c, 3600, NOW))
+        self.assertFalse(ps.in_range(dict(c, mergedAt=None, closedAt=None), 30 * 86400, NOW))
+        self.assertTrue(ps.in_range(pr(5), 7 * 86400, NOW))  # no "state" means open
+
+    def an(self):
+        opens = [self.opn(1, ago(days=20), ago(minutes=30)),      # updated 30 min ago
+                 self.opn(2, ago(hours=5), ago(hours=5)),         # 5 h
+                 self.opn(3, ago(days=3), ago(days=3)),           # 3 d
+                 self.opn(4, ago(days=20), ago(days=20)),         # 20 d
+                 self.opn(5, ago(days=60), ago(days=60))]         # older than every range
+        closed = [self.cl(10, ago(minutes=10)), self.cl(11, ago(hours=11), merged=False), self.cl(12, ago(hours=20)),
+                  self.cl(13, ago(days=6)), self.cl(14, ago(days=25), merged=False)]
+        return ps.build_analysis(opens, NOW, closed)
+
+    def test_counts_per_range(self):
+        an = self.an()
+        got = {k: ps.range_counts(an, secs, NOW) for k, secs, _ in ps.RANGES}
+        self.assertEqual({k: (c["active"], c["merged"], c["closed"]) for k, c in got.items()},
+                         {"1h": (1, 1, 0), "12h": (2, 1, 1), "24h": (2, 2, 1), "7d": (3, 3, 1), "30d": (4, 3, 2)})
+        self.assertEqual(len(an["prs"]), 5)  # the open total never follows the range
+
+    def test_scene_towers_follow_the_range(self):
+        an = self.an()
+        for key, secs, rl in ps.RANGES:
+            view = ps.range_view(an, secs, NOW)
+            sc = ps.effort_scene(view, rl=rl)
+            c = ps.range_counts(an, secs, NOW)
+            self.assertEqual(sum(t["open"] for t in sc["towers"]), c["active"], key)
+            self.assertEqual(sum(t["merged"] for t in sc["towers"]), c["merged"], key)
+            self.assertEqual(sum(t["closed"] for t in sc["towers"]), c["closed"], key)
+            self.assertEqual(sc["rl"], rl)
+        one = ps.effort_scene(ps.range_view(an, 3600, NOW), rl="1 h")
+        self.assertEqual(sorted(t["name"] for t in one["towers"]), ["Core runtime"])  # only the area with activity in the hour
+        self.assertEqual(one["towers"][0]["layers"][0]["label"], "Merged in 1 h")
+        self.assertIn("merged in the last 1 h", one["caption"])
+        self.assertIn("1 merged \u00b7 0 closed (1 h)", ps.scene_svg(one))
+
+    def test_empty_range_has_no_towers(self):
+        an = ps.build_analysis([self.opn(1, ago(days=60), ago(days=60))], NOW, [])
+        view = ps.range_view(an, 3600, NOW)
+        self.assertEqual(view["prs"], [])
+        self.assertEqual(ps.effort_scene(view, rl="1 h")["towers"], [])
+        self.assertEqual(ps.standings_html(view, "1 h", []), '<li class="empty-block">No PRs in the last 1 h.</li>')
+        self.assertIsNone(ps.range_view(ps.build_analysis([], NOW, None), 3600, NOW)["closed"])
+
+    def test_visible_clusters_and_hot_follow_the_range(self):
+        a = self.opn(1, ago(days=20), ago(days=20))
+        b = self.opn(2, ago(days=20), ago(minutes=5))
+        m = dict(self.cl(3, ago(days=2)), files=[{"path": f, "additions": 1, "deletions": 0} for f in self.VFS])
+        for p in (a, b):
+            p["files"] = [{"path": f, "additions": 1, "deletions": 0} for f in self.VFS]
+        an = ps.build_analysis([a, b], NOW, [m])
+        self.assertEqual(len(an["clusters"]), 1)
+        self.assertEqual(len(ps.visible_clusters(an, 30 * 86400, NOW)), 1)
+        v7 = ps.visible_clusters(an, 7 * 86400, NOW)[0]
+        self.assertEqual((v7["members"], v7["merged"], v7["superseded"]), ([2, 3], [3], True))  # PR 1 is out
+        self.assertEqual(ps.visible_clusters(an, 3600, NOW), [])  # one member left
+        an["hotFiles"] = [{"file": "x.rs", "count": 2, "prs": [1, 2]}, {"file": "y.rs", "count": 1, "prs": [1]}]
+        self.assertEqual([(h["file"], ns) for h, ns in ps.hot_in_range(an, 3600, NOW)], [("x.rs", [2])])
+        self.assertEqual(ps.range_counts(an, 3600, NOW)["hot"], 1)
+        self.assertEqual(ps.range_counts(an, 30 * 86400, NOW)["hot"], 2)  # PR 1 (created 20 d ago) is inside 30 d
+
+    def test_top_files_and_merged_per_day(self):
+        prs = [pr(1, files=[("a.rs", 5), ("b.rs", 1)]), pr(2, files=[("a.rs", 1), ("c.rs", 9)]), pr(3, files=[("b.rs", 1), ("d.rs", 1)])]
+        self.assertEqual(ps.top_files(prs), [("a.rs", 2, 6), ("b.rs", 2, 2), ("c.rs", 1, 9)])  # count, then lines, then path
+        self.assertEqual(ps.top_files([]), [])
+        closed = [self.cl(1, ago(hours=1)), self.cl(2, ago(hours=2)), self.cl(3, ago(days=1), merged=False), self.cl(4, ago(days=3))]
+        days = ps.merged_per_day(closed, NOW, 5)
+        self.assertEqual([x["day"] for x in days], ["2026-11-19", "2026-11-20", "2026-11-21", "2026-11-22", "2026-11-23"])
+        self.assertEqual([x["merged"] for x in days], [0, 1, 0, 0, 2])  # closed-unmerged does not count
+        self.assertEqual(ps.merged_per_day(None, NOW), [])
+        self.assertEqual(len(ps.merged_per_day([], NOW)), ps.TREND_DAYS)
+
+    def test_single_series_bars(self):
+        svg = ps.svg_bars([{"day": "2026-11-22", "merged": 3}, {"day": "2026-11-23", "merged": 0}], "m", 320, 240,
+                          series=(("merged", "b-merged", "merged"),))
+        self.assertEqual(svg.count('<rect class="b-merged"'), 2)
+        self.assertIn("2026-11-22: 3 merged", svg)
+
+
+class PageRangeTests(unittest.TestCase):
+    def an(self):
+        return RangeTests().an()
+
+    def page(self, an=None, hist=None):
+        return ps.render_html(an or self.an(), "o/r", NOW, hist)
+
+    def test_range_control_markup(self):
+        out = self.page()
+        seg = out.split('id="range"')[1].split("</div>")[0]
+        self.assertEqual(re.findall(r">([^<]+)</button>", seg), ["1 h", "12 h", "24 h", "7 d", "30 d"])
+        self.assertEqual(re.findall(r'data-range="([^"]+)"', seg), ["1h", "12h", "24h", "7d", "30d"])
+        self.assertEqual(seg.count('aria-pressed="true"'), 1)
+        self.assertIn('data-range="7d" aria-pressed="true"', seg)
+        self.assertIn('aria-label="Time range"', out)
+        self.assertLess(out.index('id="range"'), out.index('id="states"'))
+        self.assertLess(out.index('id="range"'), out.index('class="top-right"'))  # in the toolbar, inside the top bar
+
+    def test_page_tabs_markup_and_no_js_fallback(self):
+        out = self.page()
+        nav = out.split('id="ptabs"')[1].split("</nav>")[0]
+        self.assertEqual(re.findall(r">([^<]+)</button>", nav), ["Effort", "Areas", "Trends", "Stats"])
+        self.assertEqual(re.findall(r'data-page="([^"]+)"', nav), ["effort", "areas", "trends", "stats"])
+        self.assertIn('data-page="effort" aria-pressed="true"', nav)
+        self.assertLess(out.index('id="ptabs"'), out.index('id="filters"'))  # next to the title, before the toolbar
+        self.assertLess(out.index("<h1>"), out.index('id="ptabs"'))
+        pages = re.findall(r'<div class="page" id="page-(\w+)" data-page="(\w+)"', out)
+        self.assertEqual(pages, [("effort", "effort"), ("areas", "areas"), ("trends", "trends"), ("stats", "stats")])
+        self.assertNotIn('class="page" id="page-areas" data-page="areas" hidden', out)  # nothing is hidden without JS
+        self.assertNotIn("<div class=\"page\" hidden", out)
+        self.assertIn(".ptabs{display:none", out)
+        self.assertIn(".js .ptabs{display:flex}", out)
+        self.assertIn(".js .page-title{display:none}", out)  # the stacked pages keep a heading only without JS
+        self.assertEqual(out.count('class="page-title"'), 4)
+        for sec in ("a-city", "a-road", "a-standings", "a-trends", "a-meta"):
+            self.assertEqual(out.count('class="%s"' % sec), 1, sec)
+        self.assertIn("showPage", ps.JS)
+        self.assertIn("p.hidden=p.getAttribute('data-page')!==n", ps.JS)
+
+    def test_pages_hold_the_right_sections(self):
+        out = self.page(hist=[snap(t(48), [1]), snap(t(24), [1, 2]), snap(t(1), [2, 3, 4])])
+        parts = {k: out.split('data-page="%s"><h2' % k)[1].split('<div class="page"')[0] for k in ("effort", "areas", "trends", "stats")}
+        self.assertIn("a-city", parts["effort"])
+        self.assertIn("Road to merged", parts["effort"])
+        self.assertIn("all open", parts["effort"])
+        self.assertIn('id="stage"', parts["effort"])
+        self.assertIn('id="standings"', parts["areas"])
+        self.assertEqual(parts["trends"].count('class="chart-box"'), 3)
+        self.assertIn("Merged per day", parts["trends"])
+        for label in ("CI failing", "Stale (7d+)", "Drafts", "Possible duplicates", "Merged (7 d)", "Closed (7 d)", "Active (7 d)"):
+            self.assertIn("<span>%s</span>" % label, parts["stats"])
+        self.assertIn("no 24 h data yet", ps.render_html(self.an(), "o/r", NOW).split('data-page="stats"')[1])
+
+    def test_feed_is_one_column_after_the_pages_on_every_page(self):
+        out = self.page()
+        self.assertEqual(out.count('class="a-feed"'), 1)
+        self.assertLess(out.index("</main>"), out.index('class="a-feed"'))
+        self.assertIn(".a-feed{grid-area:feed", ps.CSS)
+        self.assertIn('grid-template-columns:minmax(0,1fr) 32%', ps.CSS)
+        self.assertIn('grid-template-areas:"top top" "pages feed" "foot foot"', ps.CSS)
+        self.assertIn('"top" "pages" "feed" "foot"', ps.CSS)  # below the page content when narrow
+
+    def test_list_rows_carry_timestamps(self):
+        an = self.an()
+        out = ps.render_html(an, "o/r", NOW)
+        ep = lambda x: int(dt.datetime.strptime(x, ps.TS_FMT).replace(tzinfo=dt.timezone.utc).timestamp())
+        row = re.search(r'<div class="row pr" data-area="[^"]+" data-cl="0" data-created="(\d+)" data-updated="(\d+)" data-draft', out)
+        self.assertTrue(row)
+        self.assertEqual(sum(1 for _ in re.finditer(r'class="row pr" data-area="[^"]+" data-cl="0" data-created="\d+" data-updated="\d+"', out)), 5)
+        self.assertIn('data-created="%d" data-updated="%d"' % (ep(ago(days=20)), ep(ago(minutes=30))), out)
+        closed_rows = re.findall(r'class="row pr" hidden data-area="[^"]+" data-cl="1" data-closed="(\d+)"', out)
+        self.assertEqual(sorted(int(x) for x in closed_rows), sorted(ep(c["mergedAt"] or c["closedAt"]) for c in an["closed"]))
+        panel = out.split('data-panel="closed"')[1]
+        self.assertEqual(len(re.findall(r'<div class="row cl rg" data-closed="\d+">', panel)), 5)
+        self.assertEqual(ps.ts_attrs(pr(1, createdAt="2026-11-20T00:00:00Z", updatedAt="2026-11-22T00:00:00Z")),
+                         'data-created="%d" data-updated="%d"' % (ep("2026-11-20T00:00:00Z"), ep("2026-11-22T00:00:00Z")))
+
+    def test_hot_ready_and_duplicate_rows_are_filterable(self):
+        prs = [pr(i, "t%d" % i, ["hot.rs", "f%d.rs" % i]) for i in range(6)]
+        an = ps.build_analysis(prs, NOW)
+        out = ps.render_html(an, "o/r", NOW)
+        self.assertEqual(len(re.findall(r'<a class="rg" data-created="\d+" data-updated="\d+" href=', out)), 6)
+        self.assertEqual(len(re.findall(r'<div class="row rd rg" data-created="\d+" data-updated="\d+">', out)), 6)
+        dup = ps.build_analysis([pr(1, "VFS: a", self.vfs()), pr(2, "VFS: a", self.vfs())], NOW)
+        self.assertEqual(len(re.findall(r'<div class="row rg" data-created="\d+" data-updated="\d+">', ps.render_html(dup, "o/r", NOW))), 2)
+
+    @staticmethod
+    def vfs():
+        return ["crates/xcl/src/vfs/a.rs"]
+
+    def test_range_data_block(self):
+        an = self.an()
+        out = ps.render_html(an, "o/<r>", NOW)
+        data = json.loads(out.split('id="range-data">')[1].split("</script>")[0])
+        self.assertEqual((data["default"], data["now"]), ("7d", int(NOW.timestamp())))
+        self.assertEqual(list(data["ranges"]), ["1h", "12h", "24h", "7d", "30d"])
+        r = data["ranges"]["1h"]
+        self.assertEqual((r["s"], r["rl"]), (3600, "1 h"))
+        self.assertEqual((r["counts"]["active"], r["counts"]["merged"], r["counts"]["closed"]), (1, 1, 0))
+        self.assertEqual(r["metas"]["closed"], "1 merged, 0 closed, last 1 h")
+        self.assertEqual(r["line"], "Last 1 h: 1 active \u00b7 1 merged \u00b7 0 closed")
+        self.assertIn("<ol", r["standings"] + "<ol")
+        sc = json.loads(out.split('id="scene-data">')[1].split("</script>")[0])
+        self.assertEqual(list(sc["ranges"]), ["1h", "12h", "24h", "7d", "30d"])
+        self.assertEqual(sc["towers"], sc["ranges"]["7d"]["towers"])  # the top level is the default range
+        self.assertEqual(sc["ranges"]["1h"]["rl"], "1 h")
+        self.assertEqual(sum(t["open"] for t in sc["ranges"]["30d"]["towers"]), 4)
+
+    def test_range_data_escapes_untrusted_text(self):
+        evil = "</script><b>x</b>"
+        an = ps.build_analysis([pr(1, "VFS: " + evil, ["</script>.rs"], author=evil)], NOW)
+        out = ps.render_html(an, "o/r", NOW)
+        for sid in ("range-data", "scene-data"):
+            block = out.split('id="%s">' % sid)[1].split("</script>")[0]
+            self.assertNotIn("<", block)
+            json.loads(block)
+        self.assertNotIn("</script><b>", out)
+
+    def test_default_range_is_what_the_static_page_shows(self):
+        out = self.page()
+        self.assertIn("Last 7 d: 3 active", out)
+        self.assertIn('id="range-line"', out)
+        self.assertIn("Merged in 7 d", out)
+        sd = json.loads(out.split('id="scene-data">')[1].split("</script>")[0])
+        self.assertEqual(sum(t["open"] for t in sd["towers"]), 3)
+        self.assertIn("(7 d)", out.split('id="stage"')[1].split("</div>")[0])  # the SVG fallback is the 7 d scene
+
+    def test_empty_range_messages(self):
+        an = ps.build_analysis([RangeTests().opn(1, ago(days=60), ago(days=60))], NOW, [])
+        out = ps.render_html(an, "o/r", NOW)
+        data = json.loads(out.split('id="range-data">')[1].split("</script>")[0])
+        self.assertEqual(data["ranges"]["1h"]["standings"], '<li class="empty-block">No PRs in the last 1 h.</li>')
+        self.assertEqual(data["ranges"]["1h"]["counts"]["active"], 0)
+        self.assertEqual(out.count('class="empty-block range-empty" hidden'), 5)  # one per list, shown by the JS when its rows are all out
+        self.assertIn("'No PRs in the last '", ps.JS)
+        self.assertIn("'No PRs in the last '", ps.SCENE_JS)
+
+    def test_empty_default_range_with_data_elsewhere_shows_the_message(self):
+        an = ps.build_analysis([RangeTests().opn(1, ago(days=20), ago(days=20))], NOW, [])
+        out = ps.render_html(an, "o/r", NOW)
+        self.assertIn('<p class="empty-block" id="scene-empty">No PRs in the last 7 d.</p>', out)
+        self.assertIn('id="stage" hidden', out)
+        self.assertIn("No PRs in the last 7 d.", json.loads(out.split('id="range-data">')[1].split("</script>")[0])["ranges"]["7d"]["standings"])
+
+    def test_hash_state_keys_include_page_and_range(self):
+        self.assertIn("k==='range'", ps.JS)
+        self.assertIn("k==='page'", ps.JS)
+        self.assertIn("p.push('range='+range)", ps.JS)
+        self.assertIn("p.push('page='+page)", ps.JS)
+        self.assertIn("range!==DEF", ps.JS)
+        self.assertIn("page!=='effort'", ps.JS)
+        self.assertIn("prscan-range", ps.JS)
+        self.assertIn("prscan-range", ps.SCENE_JS)
+
+    def test_areas_rows_have_merged_closed_and_top_files(self):
+        an = RangeTests().an()
+        data = json.loads(ps.render_html(an, "o/r", NOW).split('id="range-data">')[1].split("</script>")[0])
+        row = data["ranges"]["30d"]["standings"]
+        self.assertIn("3 merged \u00b7 2 closed", row)
+        self.assertIn('<div class="stf"><span class="fchip"', row)
+        self.assertEqual(ps.standings_html(ps.range_view(an, 3600, NOW), "1 h", []).count('class="st"'), 1)
+        self.assertIn("title=", row)
 
 
 if __name__ == "__main__":

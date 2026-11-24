@@ -422,3 +422,21 @@ Keep every version of ivall/xcl even if upstream or the whole fork network is ta
   - The unmapped-path area is also labelled **"Other"**, with no "(unmapped paths)" suffix, everywhere: towers, the select, lists and markdown.
   - In the Area select, the rolled-up optgroup is "Other" with "All Other (n)", then its member areas. The unmapped area appears in it as "Other".
 - Snapshots and history are unchanged: they count open PRs only.
+
+### Time-range filter and page tabs (user request, 2026-11-24)
+- **Time range control**, a segmented control in the toolbar: `1 h · 12 h · 24 h · 7 d · 30 d`. The default is 7 d, and the choice lives in the URL hash as `range=`.
+  - Closed and merged PRs: shown if closed or merged inside the range. The fetch window grows to 30 days (`CLOSED_DAYS = 30`), paged.
+  - Open PRs: in lists and the effort map, shown if created or updated inside the range. The "open" headline and the road keep the total open count, labelled "all open".
+  - The effort map, standings, superseded marks and tab counts all follow the range.
+  - Python precomputes one dataset per range: scene towers, standings rows and counts. The JS swaps between them without recomputing clustering in the browser.
+  - List rows carry `data-created`, `data-updated` and `data-closed` (epoch seconds), and the JS filters them by range.
+  - An empty range shows "No PRs in the last <range>." There is no fake data.
+- **Page tabs**, in the top bar next to the title, with state in the hash as `page=`:
+  - **Effort:** the hero (open count and note), the effort map as large as the panel allows, and Road to merged.
+  - **Areas:** standings in full, with per-area merged and closed for the range, the 7-day sparkline, member areas for groups, and the top 3 changed files per area.
+  - **Trends:** the open/unreviewed chart, opened vs closed per day, and merged per day (from the closed data), sized large.
+  - **Stats:** the label-over-value stat strip, expanded into a grid. It includes CI failing, stale, drafts and possible duplicates, with the 24 h change or "no 24 h data yet".
+- **The live feed is on every page:** a persistent right-hand column (about 32% wide at ≥1100px; below the page content at narrower widths) holding the tabbed list (Duplicates, Ready to merge, Hot files, All PRs, Closed), with its own scroll.
+- The page content area fits the viewport with no body scroll at ≥900px. Each page tab fills the space left of the feed.
+- With JS off, all page tabs are shown stacked, and every row is shown.
+- The rule for scroll stays the same: only long lists scroll, inside their own panel.
