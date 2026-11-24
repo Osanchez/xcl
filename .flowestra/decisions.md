@@ -368,3 +368,20 @@ Keep every version of ivall/xcl even if upstream or the whole fork network is ta
   - Hover hit-testing uses the cached projected polygons per tower and layer, and doesn't redraw unless the hovered layer changes.
   - No shadowBlur and no filters.
 - **Target:** per-frame draw calls cut by at least 5× compared with the current renderer, measured with the jsc mock-canvas op counter before and after.
+
+### Page-wide sunset, transparent scene, 180° pan (user request, 2026-11-24)
+- **The whole page sits on a sunset gradient:**
+  - light: peach `#ffd8a8` → coral `#ff9f80` → rose `#e9849c` → lavender `#b39ddb`, top to bottom;
+  - dark: deep violet `#3b2a5a` → plum `#5a2f55` → dusk `#2a1f3d` → navy `#0e1219`;
+  - the gradient is fixed to the viewport, so it does not repaint on panel scroll.
+  - Panels and the top bar get a translucent surface for readable text (light `rgba(255,255,255,.78)`, dark `rgba(14,18,25,.74)`). Text contrast stays at WCAG AA or better. No backdrop-filter, for performance.
+- **The 3D canvas is transparent:**
+  - no sky, sun, water, sand, dunes or palms in the scene;
+  - only the towers, a faint translucent ground plate under them for anchoring, and the callouts;
+  - the SVG fallback is transparent in the same way.
+  - The scene tokens `--sky-*`, `--sun`, `--sand` etc. are removed, or reused for the page gradient.
+- **Pan, not spin:** yaw is limited to a 180° arc, ±90° around the default view.
+  - Drag and arrow keys clamp to that range.
+  - The idle motion is a slow ease back and forth inside the arc. There is no idle motion under reduced motion, and it stops after user input.
+- **Zoom:** the scene is drawn about 15% smaller than it fits now (scale ×0.85), centred.
+- Everything else stays: the fit-to-viewport layout, the toolbar, the performance work and the data rules.

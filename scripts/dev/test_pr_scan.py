@@ -586,14 +586,41 @@ class RendererSourceTests(unittest.TestCase):
 
     def test_resize_observer_and_cached_layers(self):
         self.assertIn("new ResizeObserver(resized)", ps.SCENE_JS)
-        self.assertIn("function buildBase()", ps.SCENE_JS)
+        self.assertNotIn("buildBase", ps.SCENE_JS)  # nothing static is left to paint: the canvas is transparent
         self.assertIn("function buildScene()", ps.SCENE_JS)
         self.assertIn("function composite()", ps.SCENE_JS)
         self.assertIn("ordYaw===sceneYaw", ps.SCENE_JS)  # painter order is sorted once per yaw
 
-    def test_reduced_motion_stops_the_spin(self):
+    def test_reduced_motion_stops_the_idle_pan(self):
         self.assertIn("prefers-reduced-motion: reduce", ps.SCENE_JS)
-        self.assertIn("var spin=!reduce", ps.SCENE_JS)
+        self.assertIn("var auto=!reduce", ps.SCENE_JS)
+        self.assertIn("function animating(){return auto&&!reduce&&!inside&&!drag;}", ps.SCENE_JS)
+
+    def test_yaw_is_clamped_everywhere_it_changes(self):
+        js = ps.SCENE_JS
+        self.assertIn("function clampYaw(v){return Math.max(Y0-ARC,Math.min(Y0+ARC,v));}", js)
+        self.assertIn("yaw=clampYaw(yaw+(e.clientX-drag.x)*.01)", js)  # drag
+        self.assertIn("yaw=clampYaw(yaw+k*.12)", js)  # keys
+        self.assertIn("yaw=clampYaw(Y0+Math.round(Math.sin(ph)*ARC*IDLE/Q)*Q)", js)  # idle ease
+        self.assertEqual(len(re.findall(r"\byaw\s*(?:\+|-)?=(?!=)", js.replace("var yaw=Y0;", ""))), 3)  # no other write to yaw
+
+    def test_input_stops_the_idle_pan(self):
+        self.assertIn("drag={x:e.clientX};auto=false;", ps.SCENE_JS)
+        self.assertIn("e.preventDefault();auto=false;", ps.SCENE_JS)
+
+    def test_only_the_idle_pan_keeps_the_loop_running(self):
+        self.assertIn("if(animating())sched();else last=0;", ps.SCENE_JS)
+        self.assertNotIn("function animating(){return !reduce;}", ps.SCENE_JS)
+
+    def test_zoom_is_applied_and_centred(self):
+        self.assertIn("K*=ZOOM;LH*=ZOOM;", ps.SCENE_JS)
+        self.assertIn("CX=W/2;", ps.SCENE_JS)
+        self.assertEqual(ps.SCENE_ZOOM, 0.85)
+
+    def test_transparent_canvas_clears_instead_of_painting_a_backdrop(self):
+        self.assertIn("g.clearRect(0,0,cv.width,cv.height);g.drawImage(yl,0,0)", ps.SCENE_JS)
+        for gone in ("sky", "water", "palm", "dune", "sand", "foam", "HOR", "waves", "decor", "trunk", "frond"):
+            self.assertNotIn(gone, ps.SCENE_JS, gone)
 
 
 class SceneTests(unittest.TestCase):
@@ -658,32 +685,83 @@ class SceneTests(unittest.TestCase):
             self.assertEqual(all(" ghost" in x.split('"')[1] for x in polys), ghost, k)
         self.assertIn("ghost", sc["caption"])
 
-    def test_palms_deterministic(self):
-        a, b = ps.scene_decor(7), ps.scene_decor(7)
-        self.assertEqual(a, b)
-        self.assertEqual(json.dumps(a), json.dumps(b))
-        self.assertEqual(len(a["palms"]), 6)
-        self.assertEqual(a["palms"][0], {"x": -11.31, "y": -1.92, "h": 5, "lean": -0.79, "fr": [0, 53, 112, 190, 237, 304]})
-        self.assertEqual(a["dunes"][0], [-4.53, 1.66, 3.39, 0.65])
-        gx, gy = ps.scene_plate(7)
-        for pm in a["palms"]:
-            self.assertLessEqual(abs(pm["x"]), gx)
-            self.assertLessEqual(abs(pm["y"]), gy)
-        self.assertNotEqual(ps.scene_decor(3)["palms"], a["palms"])
-        self.assertEqual(ps.scene_svg(ps.effort_scene(analysis_of({"A": 3, "B": 2}))), ps.scene_svg(ps.effort_scene(analysis_of({"A": 3, "B": 2}))))
+    def test_yaw_range_is_a_180_degree_arc_around_the_default(self):
+        lo, hi = ps.yaw_range()
+        self.assertEqual((lo, hi), (ps.SCENE_YAW - 90, ps.SCENE_YAW + 90))
+        self.assertEqual(hi - lo, 180)
+        self.assertEqual(ps.clamp_yaw(ps.SCENE_YAW), ps.SCENE_YAW)
+        self.assertEqual(ps.clamp_yaw(1e6), hi)
+        self.assertEqual(ps.clamp_yaw(-1e6), lo)
+        self.assertEqual(ps.clamp_yaw(lo + 1), lo + 1)
+        geom = json.loads(ps.scene_json(ps.effort_scene(analysis_of({"A": 3}))))["geom"]
+        self.assertEqual((geom["yaw"], geom["arc"], geom["zoom"]), (ps.SCENE_YAW, 90.0, 0.85))
+        self.assertLess(0, geom["idle"])
+        self.assertLessEqual(geom["idle"], 1)  # the idle ease stays inside the arc
 
-    def test_scene_tokens_in_both_themes(self):
+    def test_scene_has_no_backdrop_decor(self):
+        self.assertFalse(hasattr(ps, "scene_decor"))
+        self.assertFalse(hasattr(ps, "SCENE_TOKENS"))
+        an = analysis_of({"A": 3, "B": 2})
+        svg = ps.scene_svg(ps.effort_scene(an))
+        for gone in ('class="sky"', 'class="sea"', "palm", "dune", "water", "sand", "wv", 'class="sun"', "rim"):
+            self.assertNotIn(gone, svg, gone)
+        self.assertEqual(svg.count('<polygon class="plate"'), 1)
+        self.assertEqual(svg, ps.scene_svg(ps.effort_scene(an)))  # deterministic
+        self.assertNotIn("decor", json.loads(ps.scene_json(ps.effort_scene(an))))
+        css = ps.CSS + ps.SCENE_CSS
+        for gone in ("--sky-", "--sun:", "--sand:", "--dune:", "--water:", "--foam:", "--trunk:", "--frond:", ".palm", ".sk0"):
+            self.assertNotIn(gone, css, gone)
+
+    def test_page_gradient_tokens_in_both_themes(self):
         light = ps.CSS.split("@media")[0]
         dark = ps._DARK_TOKENS
-        self.assertGreaterEqual(len(ps.SCENE_TOKENS), 11)
-        for name, a, b in ps.SCENE_TOKENS:
+        names = [n for n, _, _ in ps.GRADIENT_TOKENS]
+        self.assertEqual(names, ["dusk-1", "dusk-2", "dusk-3", "dusk-4", "surface"])
+        for name, a, b in ps.GRADIENT_TOKENS:
             self.assertIn("--%s:%s;" % (name, a), light)
             self.assertIn("--%s:%s;" % (name, b), dark)
             self.assertNotEqual(a, b)
-            self.assertIn("'" + name + "'", ps.SCENE_JS)
+        tok = {n: (a, b) for n, a, b in ps.GRADIENT_TOKENS}
+        self.assertEqual([tok["dusk-%d" % i][0] for i in (1, 2, 3, 4)], ["#ffd8a8", "#ff9f80", "#e9849c", "#b39ddb"])
+        self.assertEqual([tok["dusk-%d" % i][1] for i in (1, 2, 3, 4)], ["#3b2a5a", "#5a2f55", "#2a1f3d", "#0e1219"])
+        self.assertEqual(tok["surface"], ("rgba(255,255,255,.78)", "rgba(14,18,25,.74)"))
         out = ps.render_html(analysis_of({"A": 1}), "o/r", NOW)
         self.assertIn(":root[data-theme=dark]{color-scheme:dark;" + dark.split(";")[0], out)
-        self.assertIn("var(--sky-1)", out)
+        self.assertIn("linear-gradient(180deg,var(--dusk-1),var(--dusk-2),var(--dusk-3),var(--dusk-4))", out)
+        self.assertIn("position:fixed", out.split("body::before{")[1].split("}")[0])  # fixed to the viewport
+        self.assertNotIn("backdrop-filter", out)
+
+    def test_panels_and_top_bar_use_the_translucent_surface(self):
+        css = ps.CSS
+        self.assertIn(".a-trends,.a-road,.a-standings,.a-feed,.a-meta,.foot{background:var(--surface)}", css)
+        self.assertRegex(css, r"\.top\{[^}]*background:var\(--surface\)")
+
+    def test_text_keeps_aa_contrast_on_the_surface(self):
+        def lin(c):
+            c /= 255.0
+            return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+        def lum(rgb):
+            return 0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2])
+
+        def hexrgb(h):
+            return [int(h[i:i + 2], 16) for i in (1, 3, 5)]
+
+        def over(surface, bg):  # surface "rgba(r,g,b,a)" over an opaque bg
+            r, g, b, a = [float(x) for x in re.findall(r"[\d.]+", surface)]
+            return [r * a + bg[0] * (1 - a), g * a + bg[1] * (1 - a), b * a + bg[2] * (1 - a)]
+
+        def ratio(a, b):
+            la, lb = sorted((lum(a), lum(b)), reverse=True)
+            return (la + 0.05) / (lb + 0.05)
+        tok = {n: (a, b) for n, a, b in ps.GRADIENT_TOKENS}
+        text = {0: ("#10141c", "#566070", "#1546e0", "#a94f00", "#456b12", "#c4261d"),
+                1: ("#eef2f8", "#a2adbc", "#8ca8ff", "#ffab5c", "#b4e06a", "#ff8a80")}
+        for theme in (0, 1):
+            for i in (1, 2, 3, 4):
+                bg = over(tok["surface"][theme], hexrgb(tok["dusk-%d" % i][theme]))
+                for fg in text[theme]:
+                    self.assertGreaterEqual(ratio(hexrgb(fg), bg), 4.5, (theme, i, fg))
 
     def test_page_empty_state_without_prs(self):
         out = ps.render_html(analysis_of({}), "o/r", NOW)

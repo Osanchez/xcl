@@ -608,32 +608,33 @@ def category_css():
     return light, dark
 
 
-# Scene colours (light, dark): sunset sky (top, middle, horizon), sun, sand, dunes, water, deep water, foam, trunk, frond.
-SCENE_TOKENS = [("sky-1", "#b9a4de", "#0b1233"), ("sky-2", "#f09a86", "#2d1f68"), ("sky-3", "#ffd2a0", "#703b84"),
-                ("sun", "#ff7d4d", "#f5a46c"), ("sand", "#f0dcae", "#4b4560"), ("dune", "#dfc28a", "#5d5775"),
-                ("water", "#79bccb", "#1f4272"), ("deep", "#4592ad", "#142b52"), ("foam", "#fbfeff", "#a9c6ee"),
-                ("trunk", "#7b5836", "#6a5668"), ("frond", "#2e8b57", "#47a885")]
-_LIGHT_SCENE = "".join("--%s:%s;" % (n, a) for n, a, _ in SCENE_TOKENS)
-_DARK_SCENE = "".join("--%s:%s;" % (n, b) for n, _, b in SCENE_TOKENS)
+# Page tokens (light, dark): the fixed sunset gradient, top to bottom, and the translucent surface of panels, top bar
+# and callouts. The scene itself has no backdrop: the canvas is transparent and sits on this gradient.
+GRADIENT_TOKENS = [("dusk-1", "#ffd8a8", "#3b2a5a"), ("dusk-2", "#ff9f80", "#5a2f55"),
+                   ("dusk-3", "#e9849c", "#2a1f3d"), ("dusk-4", "#b39ddb", "#0e1219"),
+                   ("surface", "rgba(255,255,255,.78)", "rgba(14,18,25,.74)")]
+_LIGHT_SCENE = "".join("--%s:%s;" % (n, a) for n, a, _ in GRADIENT_TOKENS)
+_DARK_SCENE = "".join("--%s:%s;" % (n, b) for n, _, b in GRADIENT_TOKENS)
 _LIGHT_CAT, _DARK_CAT = category_css()
 _DARK_TOKENS = ("--page:#0e1219;--ink:#eef2f8;--soft:#a2adbc;--rule:#2a3240;--wash:#1a212c;--accent:#8ca8ff;--partial:#ffab5c;--partial-text:#ffab5c;"
                 "--empty:#39424f;--tip:#eef2f8;--tip-text:#0e1219;--tip-soft:#3a4454;--good:#b4e06a;--bad:#ff8a80;" + _DARK_SCENE + _DARK_CAT)
 CSS = (":root{color-scheme:light dark;--page:#fff;--ink:#10141c;--soft:#566070;--rule:#d9dee6;--wash:#eef1f5;--accent:#1546e0;"
-       "--partial:#e8770c;--partial-text:#a94f00;--empty:#c9cfd9;--tip:#10141c;--tip-text:#fff;--tip-soft:#d7dce4;--good:#4f7f16;--bad:#c4261d;"
+       "--partial:#e8770c;--partial-text:#a94f00;--empty:#c9cfd9;--tip:#10141c;--tip-text:#fff;--tip-soft:#d7dce4;--good:#456b12;--bad:#c4261d;"
        + _LIGHT_SCENE + _LIGHT_CAT + "}\n"
        "@media (prefers-color-scheme:dark){:root:not([data-theme=light]){" + _DARK_TOKENS + "}}\n"
        ":root[data-theme=dark]{color-scheme:dark;" + _DARK_TOKENS + "}\n:root[data-theme=light]{color-scheme:light}\n") + """
 *{box-sizing:border-box}
 html{background:var(--page);-webkit-text-size-adjust:100%}
-body{margin:0;background:var(--page);color:var(--ink);font:400 15px/1.45 Roboto,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;font-variant-numeric:tabular-nums}
+body::before{content:"";position:fixed;top:0;right:0;bottom:0;left:0;z-index:-1;pointer-events:none;background:linear-gradient(180deg,var(--dusk-1),var(--dusk-2),var(--dusk-3),var(--dusk-4))}
+body{margin:0;color:var(--ink);font:400 15px/1.45 Roboto,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;font-variant-numeric:tabular-nums}
 h1,h2,h3,p,ol,ul{margin:0;padding:0}ol,ul{list-style:none}
 h1,h2,h3,.cond,.score,.stat b,.rank,.step b,th{font-family:"Roboto Condensed","Arial Narrow",Roboto,system-ui,sans-serif}
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 a:focus-visible,button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.app{display:grid;grid-template-columns:minmax(0,1fr);padding:0 16px;
+.app{display:grid;grid-template-columns:minmax(0,1fr);padding:0 16px;row-gap:8px;
 grid-template-areas:"top" "city" "trends" "road" "standings" "feed" "meta" "foot"}
 .app>*{min-width:0}
-.top{grid-area:top;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 14px;min-height:50px;padding:6px 0;border-bottom:2px solid var(--ink)}
+.top{grid-area:top;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 14px;min-height:50px;padding:6px 12px;background:var(--surface);border-bottom:2px solid var(--ink)}
 h1{font:700 20px/1.1 "Roboto Condensed",Arial,sans-serif;text-transform:uppercase;letter-spacing:.04em}h1 span{color:var(--soft)}
 h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:1.3;font-weight:700}
 .top-right{display:flex;align-items:center;gap:12px;min-width:0}
@@ -651,8 +652,9 @@ h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:
 .seg button:last-child{border-right:0}.seg button:hover{background:var(--wash)}
 .seg button[aria-pressed=true]{background:var(--ink);color:var(--page)}
 .result{font-size:13px;color:var(--soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}.result:empty{display:none}
-.a-city,.a-trends,.a-road,.a-standings,.a-feed{min-width:0;min-height:0;padding:12px 0}
-.a-trends,.a-road,.a-standings,.a-feed{border-top:1px solid var(--rule)}
+.a-city,.a-trends,.a-road,.a-standings,.a-feed{min-width:0;min-height:0;padding:12px}
+.a-trends,.a-road,.a-standings,.a-feed,.a-meta,.foot{background:var(--surface)}
+.a-city .score-box,.scene-foot,.scene-key,.a-city>.empty-block,.a-city>.sec-note{background:var(--surface);padding-left:10px;padding-right:10px}
 .a-city{grid-area:city}.a-trends{grid-area:trends;display:flex;flex-direction:column}.a-road{grid-area:road;display:flex;flex-direction:column}.a-standings{grid-area:standings;display:flex;flex-direction:column}
 .a-feed{grid-area:feed;display:flex;flex-direction:column}
 .head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:8px;min-width:0}
@@ -728,11 +730,11 @@ details.area{border-bottom:1px solid var(--rule)}
 details.area>summary{cursor:pointer;padding:8px 2px;list-style:none;display:flex;gap:8px;align-items:center;font:700 15px/1.3 "Roboto Condensed",Arial,sans-serif}
 details.area>summary::-webkit-details-marker{display:none}details.area .cnt{margin-left:auto;font:400 13px Roboto,sans-serif;color:var(--soft)}
 details.area>summary:before{content:"+";width:12px;color:var(--soft);font-weight:700}details.area[open]>summary:before{content:"\\2212"}
-.a-meta{grid-area:meta;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 16px;padding:12px 0;border-top:1px solid var(--rule)}
+.a-meta{grid-area:meta;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 16px;padding:12px}
 .stat{min-width:0}.stat span{display:block;color:var(--soft);font-size:13px;line-height:1.25}
 .stat b{display:block;font-size:20px;line-height:1.15;white-space:nowrap}.stat.key b{color:var(--accent)}.stat.warn b{color:var(--partial-text)}
 .stat small{display:block;color:var(--soft);font-size:13px;line-height:1.25}
-.foot{grid-area:foot;padding:8px 0 10px;border-top:1px solid var(--rule);color:var(--soft);font-size:13px;line-height:1.35}
+.foot{grid-area:foot;padding:8px 12px 10px;color:var(--soft);font-size:13px;line-height:1.35}
 .small{color:var(--soft);font-size:13px;line-height:1.35}
 .tip{position:fixed;top:0;left:0;z-index:30;max-width:260px;padding:6px 9px;background:var(--tip);color:var(--tip-text);font-size:13px;line-height:1.3;pointer-events:none}
 .tip[hidden]{display:none}
@@ -746,23 +748,23 @@ details.area>summary:before{content:"+";width:12px;color:var(--soft);font-weight
 :root{--fs:clamp(11px,calc(.42vw + .62vh + 4.2px),14px);--fs-s:max(10.5px,calc(var(--fs) - 1px));--gap:clamp(8px,1.4vw,22px);--pad:clamp(5px,1.1vh,12px)}
 html,body{height:100%;overflow:hidden}
 body{font-size:var(--fs)}
-.app{height:100vh;height:100dvh;overflow:hidden;padding:0 var(--gap);column-gap:var(--gap);
+.app{height:100vh;height:100dvh;overflow:hidden;padding:0 var(--gap);column-gap:var(--gap);row-gap:clamp(3px,.7vh,8px);
 grid-template-columns:minmax(0,1.5fr) minmax(0,1fr) minmax(0,1.1fr);grid-template-rows:auto minmax(0,1.7fr) minmax(0,1fr) auto auto auto;
 grid-template-areas:"top top top" "city standings feed" "trends standings feed" "road road road" "meta meta meta" "foot foot foot"}
-.top{min-height:clamp(38px,6vh,50px);padding:0;flex-wrap:wrap}
+.top{min-height:clamp(38px,6vh,50px);padding:0 12px;flex-wrap:wrap}
 h1{font-size:clamp(15px,1.5vw,20px)}h2{font-size:clamp(13px,calc(var(--fs) + 1px),16px)}h3{font-size:var(--fs)}
 .toolbar{order:0;flex:1 1 360px;justify-content:center;flex-wrap:nowrap}
 .toolbar input,.toolbar select,.seg button,.theme{font-size:var(--fs-s);padding:clamp(4px,.8vh,7px) clamp(6px,.8vw,10px)}
 .toolbar input{flex:1 1 90px;max-width:240px}.toolbar select{flex:0 1 clamp(110px,13vw,190px)}
 .live,.result,.sec-note,.score-note,.legend,.step,.step small,.st-axis,.st,.row,.sys,.pill,.stat span,.stat small,.foot,.small,.head>span,.scene-cap,.tabs button{font-size:var(--fs-s)}
-.a-city,.a-trends,.a-road,.a-standings,.a-feed{overflow:hidden;padding:var(--pad) 0}
+.a-city,.a-trends,.a-road,.a-standings,.a-feed{overflow:hidden;padding:var(--pad) 12px}
 .a-city{display:flex;flex-direction:column}.a-city>.scene{flex:1;min-height:0}
 .head{margin-bottom:clamp(2px,.6vh,8px)}
 .score{font-size:clamp(34px,7.4vh,72px)}.score small{font-size:.39em}
 .score-note,.score-note b{font-size:var(--fs-s)}.score-note b{font-size:var(--fs)}
 .charts{grid-template-columns:repeat(2,minmax(0,1fr))}
 .chart-box .chart{position:absolute;left:0;top:0;width:100%;height:100%;margin:0}
-.a-road{border-top:1px solid var(--rule)}.road{flex:none;min-height:0;grid-template-columns:repeat(5,minmax(0,1fr))}
+.road{flex:none;min-height:0;grid-template-columns:repeat(5,minmax(0,1fr))}
 .step{flex-direction:row;flex-wrap:wrap;align-items:baseline;justify-content:flex-start;gap:0 8px;padding:clamp(3px,.7vh,7px) 6px;overflow:hidden}.step .pips{display:none}.step b{font-size:clamp(15px,2.7vh,22px)}
 .step>span{font-size:var(--fs-s);white-space:normal}
 .st-axis,.st{grid-template-columns:clamp(14px,1.6vw,22px) minmax(60px,1fr) minmax(28px,.7fr) clamp(46px,5vw,68px)}
@@ -771,9 +773,9 @@ h1{font-size:clamp(15px,1.5vw,20px)}h2{font-size:clamp(13px,calc(var(--fs) + 1px
 .st-list,.feed-body{max-height:none;overflow-y:auto}
 .a-feed,.a-standings{display:flex;flex-direction:column}
 .row .ttl{font-size:var(--fs)}
-.a-meta{display:flex;flex-wrap:wrap;justify-content:space-between;gap:2px var(--gap);padding:var(--pad) 0}.stat{flex:none}
+.a-meta{display:flex;flex-wrap:wrap;justify-content:space-between;gap:2px var(--gap);padding:var(--pad) 12px}.stat{flex:none}
 .stat b{font-size:clamp(14px,2.3vh,20px)}
-.foot{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:clamp(3px,.6vh,8px) 0 clamp(3px,.8vh,10px)}
+.foot{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:clamp(3px,.6vh,8px) 12px clamp(3px,.8vh,10px)}
 }
 @media (prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
 """
@@ -901,11 +903,13 @@ TOP_AREAS = 6
 ELSE_NAME = "Everything else"
 SCENE_CAP = 40          # tallest tower in layers; above it the layers are scaled
 SCENE_W, SCENE_H = 720, 520   # viewBox of the static SVG
-SCENE_YAW = -22.0       # degrees, fixed angle of the SVG and start angle of the canvas
+SCENE_YAW = -22.0       # degrees, fixed angle of the SVG and centre of the canvas pan
+SCENE_ARC = 90.0        # the canvas pans inside SCENE_YAW +/- SCENE_ARC degrees (a 180 degree arc), never spins
+SCENE_IDLE = 0.7        # the idle ease swings through this fraction of the arc on each side
+SCENE_ZOOM = 0.85       # the scene is drawn at this fraction of the size that fits, centred
 SCENE_SX, SCENE_PY = 0.87, 0.36   # screen x per cell, screen y per cell on the ground (fixed pitch)
 TOWER_CELLS, TOWER_PITCH = 2, 3   # footprint of a tower and distance between towers, in cells
-SCENE_MX, SCENE_MY = 2.2, 1.8     # sand margin around the tower row, in cells
-SCENE_SEED = 20261124   # fixed seed of the palms, dunes and waves: every render is the same
+SCENE_MX, SCENE_MY = 2.2, 1.8     # ground plate margin around the tower row, in cells
 SCENE_GHOST = ("wait", "draft")   # layers not reviewed yet are drawn as ghost voxels
 SCENE_ROWS = (16, 70)   # first text baseline of the upper and lower label rows
 SCENE_BAND_BOTTOM = 106  # bottom of the lower label row
@@ -959,46 +963,20 @@ def effort_scene(an, n=TOP_AREAS, cap=SCENE_CAP):
     return {"towers": towers, "scale": factor, "per": per, "cap": cap, "caption": caption}
 
 
-def _rng(seed):
-    """Small linear congruential generator: the same sequence on every Python version and platform."""
-    st = [seed & 0x7FFFFFFF]
-
-    def nxt():
-        st[0] = (st[0] * 1103515245 + 12345) & 0x7FFFFFFF
-        return st[0] / float(0x7FFFFFFF)
-    return nxt
-
-
 def scene_plate(n):
-    """Half sizes (gx, gy) of the sand plate in cells for n towers."""
+    """Half sizes (gx, gy) of the ground plate in cells for n towers."""
     hw = TOWER_CELLS / 2.0
     return (n - 1) * TOWER_PITCH / 2.0 + hw + SCENE_MX, hw + SCENE_MY
 
 
-def scene_decor(n, seed=SCENE_SEED):
-    """Seeded beach decor for n towers, in plate cells: palms (trunk pixels, lean, frond angles in degrees), dune
-    patches, wave rows (screen fractions) and the sun. Deterministic: the same n always gives the same decor."""
-    r = _rng(seed + n)
-    hw = TOWER_CELLS / 2.0
-    gx, gy = scene_plate(n)
-    row = gx - SCENE_MX
-    zones = [(-gx + 0.5, -row - 0.5, -gy + 0.5, -0.2), (-gx + 0.5, -row - 0.5, 0.2, gy - 0.5),
-             (row + 0.5, gx - 0.5, -gy + 0.5, -0.2), (row + 0.5, gx - 0.5, 0.2, gy - 0.5),
-             (-row + 0.5, -0.5, -gy + 0.4, -hw - 0.5), (0.5, row - 0.5, -gy + 0.4, -hw - 0.5)]
-    palms = []
-    for x0, x1, y0, y1 in zones:
-        fr = [int(k * 60 + r() * 24 - 12) for k in range(6)]
-        palms.append({"x": round(x0 + (x1 - x0) * r(), 2), "y": round(y0 + (y1 - y0) * r(), 2), "h": 5 + int(r() * 4),
-                      "lean": round(r() * 2 - 1, 2), "fr": fr})
-    dunes = []
-    for _ in range(8):
-        w, h = 1.5 + r() * 2.0, 0.6 + r() * 0.6
-        dunes.append([round(-gx + 0.4 + (2 * gx - w - 0.8) * r(), 2), round(-gy + 0.3 + (2 * gy - h - 0.6) * r(), 2), round(w, 2), round(h, 2)])
-    waves = []
-    for j in range(7):
-        segs = [[round(r(), 3), round(0.03 + r() * 0.06, 3), 1 if k % 3 == 0 else 0] for k in range(5)]
-        waves.append([round((j / 7.0) ** 1.5 * 0.92 + 0.04, 3), segs])
-    return {"palms": palms, "dunes": dunes, "waves": waves, "sun": {"x": 0.6, "r": 4}, "gx": gx, "gy": gy}
+def yaw_range(yaw=SCENE_YAW, arc=SCENE_ARC):
+    """(low, high) in degrees: the canvas yaw never leaves this range (the JS clampYaw does the same)."""
+    return yaw - arc, yaw + arc
+
+
+def clamp_yaw(deg, yaw=SCENE_YAW, arc=SCENE_ARC):
+    lo, hi = yaw_range(yaw, arc)
+    return max(lo, min(hi, deg))
 
 
 def scene_summary(scene):
@@ -1011,8 +989,9 @@ def scene_json(scene):
     """Inline JSON for the canvas renderer; every '<' is escaped so nothing can close the script block."""
     data = {"towers": scene["towers"], "per": scene["per"], "caption": scene["caption"],
             "states": [{"k": k, "label": lb, "v": v, "ghost": k in SCENE_GHOST} for k, lb, v in SCENE_STATES],
-            "geom": {"w": TOWER_CELLS, "pitch": TOWER_PITCH, "sx": SCENE_SX, "py": SCENE_PY, "yaw": SCENE_YAW},
-            "decor": scene_decor(len(scene["towers"]))}
+            "geom": {"w": TOWER_CELLS, "pitch": TOWER_PITCH, "sx": SCENE_SX, "py": SCENE_PY, "yaw": SCENE_YAW,
+                     "arc": SCENE_ARC, "idle": SCENE_IDLE, "zoom": SCENE_ZOOM, "gx": scene_plate(len(scene["towers"]))[0],
+                     "gy": scene_plate(len(scene["towers"]))[1]}}
     return json.dumps(data, separators=(",", ":")).replace("<", "\\u003c")
 
 
@@ -1046,8 +1025,9 @@ def _visible_faces(yaw):
 
 
 def scene_svg(scene):
-    """Static isometric SVG of the scene at the fixed angle: shaded squares (classes use the theme tokens),
-    one <g class="tower"> per tower, callouts with leader lines. Empty string when there are no towers."""
+    """Static isometric SVG of the scene at the default angle, transparent (the page gradient shows through): a faint
+    ground plate, shaded squares (classes use the theme tokens), one <g class="tower"> per tower, callouts with
+    leader lines. Empty string when there are no towers."""
     ts = scene["towers"]
     n = len(ts)
     if not n:
@@ -1079,8 +1059,10 @@ def scene_svg(scene):
         if lh > k * 0.25 or k < 3:
             break
         k *= 0.97
+    k, lh = k * SCENE_ZOOM, lh * SCENE_ZOOM
     x0, x1, y0, y1 = bbox(k, lh)
-    ox, oy = SCENE_W / 2.0 - (x0 + x1) / 2.0, SCENE_H - 8 - y1
+    top, bot = band_bottom + 8, SCENE_H - 8
+    ox, oy = SCENE_W / 2.0 - (x0 + x1) / 2.0, top + (bot - top - (y1 - y0)) / 2.0 - y0
 
     def P(x, y, z):
         px, py, depth = _pj(x, y, z, yaw, k, lh)
@@ -1092,53 +1074,10 @@ def scene_svg(scene):
     o = ['<svg class="scene-svg" viewBox="0 0 %d %d" preserveAspectRatio="xMidYMax meet" role="img" aria-label="%s">' % (
         SCENE_W, SCENE_H, esc(scene_summary(scene)))]
     gp = [P(x, y, 0) for x, y in ground]
-    dec = scene_decor(n)
-    hor = min(p[1] for p in gp) - 16
-    sc = max(4.0, round(k * 0.55))     # sun / wave pixel size
-    pp = max(3.0, round(k * 0.4))      # palm pixel size
-    big = 3000
-    o.append('<g class="sky">')
-    for j in range(5):
-        top = -big if j == 0 else hor * j / 5.0
-        o.append('<rect class="sk sk%d" x="%d" y="%.1f" width="%d" height="%.1f"/>' % (j, -big, top, 2 * big + SCENE_W, hor * (j + 1) / 5.0 - top + 0.5))
-    sx0 = round(SCENE_W * dec["sun"]["x"] / sc) * sc
-    for j in range(1, dec["sun"]["r"] + 1):
-        half = int(math.sqrt(dec["sun"]["r"] ** 2 - (j - 0.5) ** 2) + 0.5)
-        o.append('<rect class="sun" x="%.1f" y="%.1f" width="%.1f" height="%.1f"/>' % (sx0 - half * sc, hor - j * sc, 2 * half * sc, sc))
-    o.append('</g><g class="sea"><rect class="water" x="%d" y="%.1f" width="%d" height="%d"/>' % (-big, hor, 2 * big + SCENE_W, 2 * big))
-    for f, segs in dec["waves"]:
-        y = hor + f * (SCENE_H - hor)
-        for x, ln, foam in segs:
-            o.append('<rect class="%s" x="%.1f" y="%.1f" width="%.1f" height="%.1f"/>' % (
-                "wv foam" if foam else "wv", x * SCENE_W, round(y / (sc / 2)) * sc / 2, max(sc, ln * SCENE_W), sc / 2))
-    o.append("</g>")
-    rim = " ".join(pt(P(x + (0.5 if x > 0 else -0.5), y + (0.5 if y > 0 else -0.5), 0)) for x, y in ground)
-    o.append('<g class="ground"><polygon class="rim" points="%s" style="stroke-dasharray:%.0f %.0f"/><polygon class="sand" points="%s"/>' % (
-        rim, sc, sc * 1.5, " ".join(pt(p) for p in gp)))
-    for dx, dy, dw, dh in dec["dunes"]:
-        o.append('<polygon class="dune" points="%s"/>' % " ".join(pt(P(dx + a_, dy + b_, 0)) for a_, b_ in ((0, 0), (dw, 0), (dw, dh), (0, dh))))
-    o.append("</g>")
+    o.append('<polygon class="plate" points="%s"/>' % " ".join(pt(p) for p in gp))
     faces = _visible_faces(yaw)
-    items = [(P(xs[i], 0, 0)[2], 0, i) for i in range(n)] + [(P(pm["x"], pm["y"], 0)[2], 1, j) for j, pm in enumerate(dec["palms"])]
+    items = [(P(xs[i], 0, 0)[2], i) for i in range(n)]
     tops = {}
-
-    def palm(pm):
-        bx, by, _ = P(pm["x"], pm["y"], 0)
-        g = ['<g class="palm">']
-        for j in range(pm["h"]):
-            g.append('<rect class="trunk" x="%.1f" y="%.1f" width="%.1f" height="%.1f"/>' % (
-                round((bx + pm["lean"] * j * pp * 0.3) / pp) * pp - pp / 2, by - (j + 1) * pp, pp, pp))
-        tx_, ty_ = bx + pm["lean"] * pm["h"] * pp * 0.3, by - pm["h"] * pp
-        seen = set()
-        for ang in pm["fr"]:
-            for t_ in range(0, 5):
-                px_ = round((tx_ + math.cos(math.radians(ang)) * t_ * pp) / pp) * pp
-                py_ = round((ty_ - math.sin(math.radians(ang)) * t_ * pp * 0.45 + t_ * t_ * pp * 0.14) / pp) * pp
-                if (px_, py_) not in seen:
-                    seen.add((px_, py_))
-                    g.append('<rect class="frond" x="%.1f" y="%.1f" width="%.1f" height="%.1f"/>' % (px_ - pp / 2, py_, pp, pp))
-        g.append("</g>")
-        return "".join(g)
 
     def run_seams(i, ax, ay, bx, by, z0, z1):
         d = ["M%s L%s" % (pt(P(xs[i] + ax * hw, ay * hw, zz)), pt(P(xs[i] + bx * hw, by * hw, zz))) for zz in range(z0, z1 + 1)]
@@ -1148,10 +1087,7 @@ def scene_svg(scene):
             d.append("M%s L%s" % (pt(P(xs[i] + mx * hw, my * hw, z0)), pt(P(xs[i] + mx * hw, my * hw, z1))))
         return " ".join(d)
 
-    for _, kind, i in sorted(items):
-        if kind == 1:
-            o.append(palm(dec["palms"][i]))
-            continue
+    for _, i in sorted(items):
         t = ts[i]
         o.append('<g class="tower" data-area="%s">' % esc(t["name"]))
         for f, side in faces:
@@ -1205,8 +1141,8 @@ def scene_svg(scene):
             pts = "%.1f,%.1f %.1f,%d" % (tx, ty - 3, xe, y0 + 36)
         else:
             pts = "%.1f,%.1f %.1f,%d %.1f,%d" % (tx, ty - 3, cs[i], band_bottom + 8, cs[i], y0 - 11)
-        o.append('<g class="callout"><title>%s</title><polyline points="%s"/>' % (
-            esc("%s: %d open, %d unreviewed" % (name, t["open"], t["unreviewed"])), pts))
+        o.append('<g class="callout"><title>%s</title><polyline points="%s"/><rect class="co-bg" x="%.1f" y="%d" width="%.1f" height="48"/>' % (
+            esc("%s: %d open, %d unreviewed" % (name, t["open"], t["unreviewed"])), pts, x - 4, y0 - 13, w + 8))
         o.append('<text x="%.1f" y="%d"><tspan class="co-nm" x="%.1f">%s</tspan>'
                  '<tspan class="co-n" x="%.1f" dy="16"><tspan class="co-num">%d</tspan><tspan class="co-w"> open</tspan>'
                  '<tspan class="co-sub">%s</tspan></tspan>'
@@ -1223,10 +1159,8 @@ SCENE_CSS = """
 .scene-cv{touch-action:pan-y;cursor:grab;outline-offset:-2px}.scene-cv:active{cursor:grabbing}
 .scene .score-box{margin-bottom:6px}
 .scene-foot{display:flex;flex-wrap:wrap;align-items:center;gap:2px 14px;margin-top:4px}
-.sk0{fill:var(--sky-1)}.sk1{fill:color-mix(in srgb,var(--sky-1) 50%,var(--sky-2))}.sk2{fill:var(--sky-2)}.sk3{fill:color-mix(in srgb,var(--sky-2) 50%,var(--sky-3))}.sk4{fill:var(--sky-3)}
-.sun{fill:var(--sun)}.water{fill:var(--water)}.wv{fill:var(--deep)}.wv.foam{fill:var(--foam);opacity:.8}
-.rim{fill:none;stroke:var(--foam);stroke-width:4;stroke-linejoin:round}.sand{fill:var(--sand);stroke:var(--dune);stroke-width:1}.dune{fill:var(--dune)}
-.trunk{fill:var(--trunk)}.frond{fill:var(--frond)}
+.plate{fill:var(--ink);fill-opacity:.07;stroke:var(--ink);stroke-opacity:.2;stroke-width:1;stroke-linejoin:round}
+.co-bg{fill:var(--surface)}
 .vx{--c:var(--ink)}.v-done{--c:var(--good)}.v-rev{--c:var(--accent)}.v-wait{--c:var(--partial)}.v-draft{--c:var(--soft)}
 .vx{fill:var(--c);stroke:none}
 .f-t{fill:color-mix(in srgb,var(--c) 68%,#fff)}.f-l{fill:var(--c)}.f-r{fill:color-mix(in srgb,var(--c) 66%,#000)}
@@ -1244,10 +1178,10 @@ SCENE_CSS = """
 .scene-key small{color:var(--soft)}
 @media (min-width:900px){.stage{flex:1;height:auto;min-height:0}.scene-cap{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 @container (max-width:360px){
-.scene-svg .co-nm,.scene-svg .co-sub,.scene-svg .co-w{display:none}.scene-svg .co-n{font:700 30px "Roboto Condensed",Arial,sans-serif}
+.scene-svg .co-nm,.scene-svg .co-sub,.scene-svg .co-w,.scene-svg .co-bg{display:none}.scene-svg .co-n{font:700 30px "Roboto Condensed",Arial,sans-serif}
 .scene-key{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:12px}}
 @media (max-width:899px){@container (max-width:540px){
-.scene-svg .co-nm,.scene-svg .co-sub,.scene-svg .co-w{display:none}.scene-svg .co-n{font:700 30px "Roboto Condensed",Arial,sans-serif}
+.scene-svg .co-nm,.scene-svg .co-sub,.scene-svg .co-w,.scene-svg .co-bg{display:none}.scene-svg .co-n{font:700 30px "Roboto Condensed",Arial,sans-serif}
 .scene-key{display:block}}}
 """
 
@@ -1257,32 +1191,34 @@ var d=document,stage=d.getElementById('stage'),dEl=d.getElementById('scene-data'
 if(!stage||!dEl)return;
 var svg=stage.querySelector('svg'),data;
 try{data=JSON.parse(dEl.textContent);}catch(e){return;}
-var T=data.towers||[],N=T.length,S=data.states||[],G=data.geom||{},D=data.decor||{palms:[],dunes:[],waves:[],sun:{x:.6,r:4},gx:8,gy:3};
+var T=data.towers||[],N=T.length,S=data.states||[],G=data.geom||{};
 if(!N||!svg)return;
 var cv=d.createElement('canvas'),g=cv.getContext&&cv.getContext('2d');
 if(!g)return;
 cv.className='scene-cv';cv.tabIndex=0;cv.setAttribute('role','img');
-cv.setAttribute('aria-label',(svg.getAttribute('aria-label')||'Effort map')+' Drag or press Left and Right to rotate.');
+cv.setAttribute('aria-label',(svg.getAttribute('aria-label')||'Effort map')+' Drag or press Left and Right to pan.');
 stage.replaceChild(cv,svg);
-// Layers: bg (sky, sun, sea; size and theme only), wv (wave strips), layer (ground, palms, towers, labels; per yaw), cv (composite).
+// Layers: layer (ground plate, towers, labels; rebuilt when the yaw or the size changes), cv (transparent composite with the hover highlight).
+// The page gradient shows through both canvases: there is no backdrop to paint.
 function mk(){var c=d.createElement('canvas');return[c,c.getContext('2d')];}
-var B=mk(),bg=B[0],bx=B[1],Y=mk(),yl=Y[0],lx=Y[1],A=mk(),wv=A[0],wx=A[1];
-var TW=G.w,P=G.pitch,SX=G.sx,PY=G.py,yaw=G.yaw*Math.PI/180,HX=D.gx,HY=D.gy;
-var W=0,H=0,Wd=0,dpr=1,K=0,LH=5,CX=0,CY=0,HOR=0,sc=4,rh=1,bandTop=0,bandBottom=0,compact=false,short=false;
-var hover=null,hits=[],labelHits=[],wy=[],palms=[],col={},mc={};
+var Y=mk(),yl=Y[0],lx=Y[1];
+var TW=G.w,P=G.pitch,SX=G.sx,PY=G.py,HX=G.gx||8,HY=G.gy||3,Y0=G.yaw*Math.PI/180,ARC=(G.arc==null?90:G.arc)*Math.PI/180,IDLE=G.idle==null?.7:G.idle,ZOOM=G.zoom||.85;
+var yaw=Y0;
+var W=0,H=0,dpr=1,K=0,LH=5,CX=0,CY=0,bandTop=0,bandBottom=0,compact=false,short=false;
+var hover=null,hits=[],labelHits=[],col={},mc={};
 var reduce=!!(window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches);
-var spin=!reduce,raf=0,last=0,lastDraw=-1e9,phase=0,acc=0,inside=false,drag=null,vis=true;
-var baseDirty=true,sceneDirty=true,rz=false,sceneYaw=NaN,ordYaw=NaN,ord=[],VF=[];
-var Q=.008,RATE=7e-5,MS=30;
-var TOK=['sky-1','sky-2','sky-3','sun','sand','dune','water','deep','foam','trunk','frond'];
+var auto=!reduce,raf=0,last=0,lastDraw=-1e9,ph=0,inside=false,drag=null,vis=true;
+var sceneDirty=true,rz=false,sceneYaw=NaN,ordYaw=NaN,ord=[],VF=[];
+var Q=.008,PERIOD=42000,MS=30;
+// the pan stays inside Y0 +/- ARC (a 180 degree arc): drag, keys and the idle ease all go through clampYaw
+function clampYaw(v){return Math.max(Y0-ARC,Math.min(Y0+ARC,v));}
 function hex(s){var m=/^#([0-9a-f]{6})$/i.exec((s||'').trim());if(!m)return[128,128,128];var n=parseInt(m[1],16);return[n>>16&255,n>>8&255,n&255];}
 function mix(c,t,a){return[0,1,2].map(function(i){return Math.round(c[i]+(t[i]-c[i])*a);});}
 function rgb(c){return'rgb('+c[0]+','+c[1]+','+c[2]+')';}
 function rgba(c,a){return'rgba('+c[0]+','+c[1]+','+c[2]+','+a+')';}
 function readColors(){var cs=getComputedStyle(d.documentElement);function v(n){return hex(cs.getPropertyValue(n));}
-col={ink:rgb(v('--ink')),page:rgb(v('--page')),soft:rgb(v('--soft')),good:rgb(v('--good')),bad:rgb(v('--bad')),st:{},t:{}};
-TOK.forEach(function(n){col.t[n]=rgb(v('--'+n));});
-var a=v('--sky-1'),b=v('--sky-2'),c=v('--sky-3');col.sky=[rgb(a),rgb(mix(a,b,.5)),rgb(b),rgb(mix(b,c,.5)),rgb(c)];
+var ink=v('--ink');
+col={ink:rgb(ink),page:rgb(v('--page')),soft:rgb(v('--soft')),good:rgb(v('--good')),bad:rgb(v('--bad')),st:{},surface:(cs.getPropertyValue('--surface')||'').trim()||'rgba(255,255,255,.78)',plate:rgba(ink,.07),plateEdge:rgba(ink,.2)};
 var W3=[255,255,255],B3=[0,0,0];
 S.forEach(function(s){var c=v(s.v);col.st[s.k]={ghost:!!s.ghost,c:rgb(c),g:rgba(c,.16),gh:rgba(c,.2),l:rgb(c),t:rgb(mix(c,W3,.32)),r:rgb(mix(c,B3,.34)),
 ht:rgb(mix(c,W3,.6)),hl:rgb(mix(c,W3,.38)),hr:rgb(mix(c,W3,.16))};});}
@@ -1292,60 +1228,33 @@ r[0]=Math.min(r[0],sx);r[1]=Math.max(r[1],sx);r[2]=Math.min(r[2],sy);r[3]=Math.m
 [[-HX,-HY],[HX,-HY],[HX,HY],[-HX,HY]].forEach(function(q){add(q[0],q[1],0);});
 if(!gOnly)T.forEach(function(t,i){var x0=(i-(N-1)/2)*P;[[-h,-h],[h,-h],[h,h],[-h,h]].forEach(function(q){add(x0+q[0],q[1],t.height);});});
 return r;}
-function fitY(e){var top=bandBottom+8,bot=H-6;return(e[3]-e[2]<=bot-top)?bot-e[3]:top-e[2];}
+// vertical extent over the whole pan (samples every 15 degrees): one fixed CY keeps the scene from bobbing while it pans
+function extArc(k,lh){var r=[0,0,1e9,-1e9],a,e;for(a=-ARC;a<=ARC+1e-6;a+=Math.PI/12){e=ext(Y0+a,k,lh);r[2]=Math.min(r[2],e[2]);r[3]=Math.max(r[3],e[3]);}return r;}
 // Sizes follow the stage box; returns false when nothing changed (no canvas is resized for nothing).
 function layout(){
 var r=stage.getBoundingClientRect(),w=Math.max(200,Math.round(r.width)),h=Math.max(160,Math.round(r.height)),dp=Math.min(2,window.devicePixelRatio||1);
 if(K&&w===W&&h===H&&dp===dpr)return false;
-W=w;H=h;dpr=dp;Wd=Math.round(W*dpr);
-[cv,bg,yl].forEach(function(c){c.width=Wd;c.height=Math.round(H*dpr);});
+W=w;H=h;dpr=dp;
+[cv,yl].forEach(function(c){c.width=Math.round(W*dpr);c.height=Math.round(H*dpr);});
 compact=W<=360||(W<=540&&innerWidth<900);short=!compact&&H<300;bandTop=4;bandBottom=bandTop+(compact?28:short?40:102);
 var mh=0,a,e;for(a=0;a<Math.PI;a+=Math.PI/36){e=ext(a,1,0,true);mh=Math.max(mh,Math.abs(e[0]),Math.abs(e[1]));}
-var y0=G.yaw*Math.PI/180,avail=H-bandBottom-18;K=(W-16)/(2*mh);
-for(;;){LH=K*.9;while(LH>K*.25){e=ext(y0,K,LH);if(e[3]-e[2]<=avail)break;LH*=.97;}if(LH>K*.25||K<3)break;K*=.97;}
-CX=W/2;HOR=fitY(ext(y0,K,LH))+ext(y0,K,LH,true)[2]-16;sc=Math.max(4,Math.round(K*.55));
-baseDirty=true;sceneDirty=true;return true;}
+var avail=H-bandBottom-18;K=(W-16)/(2*mh);
+for(;;){LH=K*.9;while(LH>K*.25){e=extArc(K,LH);if(e[3]-e[2]<=avail)break;LH*=.97;}if(LH>K*.25||K<3)break;K*=.97;}
+K*=ZOOM;LH*=ZOOM;e=extArc(K,LH);CX=W/2;CY=bandBottom+8+(H-6-bandBottom-8-(e[3]-e[2]))/2-e[2];
+sceneDirty=true;return true;}
 function pj(x,y,z){var c=Math.cos(sceneYaw),s=Math.sin(sceneYaw),xr=x*c-y*s,yr=x*s+y*c;return[CX+(xr-yr)*SX*K,CY+(xr+yr)*PY*K-z*LH,xr+yr];}
 var CORN=[[-1,-1],[1,-1],[1,1],[-1,1]],NORM=[[0,-1],[1,0],[0,1],[-1,0]];
-function sq(x,px,py,w,h,f){x.fillStyle=f;x.fillRect(px,py,w,h);}
-// ---- bg: sky, sun, sea, and the wave atlas; rebuilt on resize, theme change and font load only
-function buildBase(){baseDirty=false;var x=bx,i,R=D.sun.r;
-x.setTransform(dpr,0,0,dpr,0,0);
-for(i=0;i<5;i++){var y0=i?HOR*i/5:0,y1=HOR*(i+1)/5;sq(x,0,y0,W,y1-y0+.5,col.sky[i]);}
-var sx0=Math.round(W*D.sun.x/sc)*sc;
-for(i=1;i<=R;i++){var half=Math.floor(Math.sqrt(R*R-(i-.5)*(i-.5))+.5);sq(x,sx0-half*sc,HOR-i*sc,2*half*sc,sc,col.t.sun);}
-sq(x,0,HOR,W,H-HOR,col.t.water);
-// each wave row is a strip 2 screens wide with the same pattern every W; a frame copies a window of it
-var n=D.waves.length;rh=Math.max(1,Math.round(sc/2*dpr));wv.width=2*Wd;wv.height=Math.max(1,n*rh);wx.setTransform(1,0,0,1,0,0);wy=[];
-D.waves.forEach(function(w,j){wy.push(Math.round(Math.round((HOR+w[0]*(H-HOR))/(sc/2))*sc/2*dpr));
-w[1].forEach(function(s){var len=Math.max(Math.round(sc*dpr),Math.round(s[1]*Wd)),x0=Math.round(s[0]*Wd);
-wx.globalAlpha=s[2]?.8:1;wx.fillStyle=s[2]?col.t.foam:col.t.deep;[-Wd,0,Wd].forEach(function(o){wx.fillRect(x0+o,j*rh,len,rh);});});});
-wx.globalAlpha=1;
-// palm sprites: one small canvas per palm, in pixel-art cells, drawn with a single drawImage per frame
-var pp=Math.max(3,Math.round(K*.4));palms=D.palms.map(function(pm){var sw=Math.ceil(16*pp),sh=Math.ceil((pm.h+6)*pp),ox=8*pp,oy=(pm.h+3)*pp,m=mk(),c=m[0],px=m[1],j,seen={};
-c.width=Math.round(sw*dpr);c.height=Math.round(sh*dpr);px.setTransform(dpr,0,0,dpr,0,0);
-px.fillStyle=col.t.trunk;for(j=0;j<pm.h;j++)px.fillRect(ox+Math.round(pm.lean*j*.3)*pp-pp/2,oy-(j+1)*pp,pp,pp);
-var tx=pm.lean*pm.h*pp*.3,ty=-pm.h*pp;px.fillStyle=col.t.frond;
-pm.fr.forEach(function(a){var r=a*Math.PI/180;for(var t=0;t<5;t++){var qx=Math.round((tx+Math.cos(r)*t*pp)/pp)*pp,qy=Math.round((ty-Math.sin(r)*t*pp*.45+t*t*pp*.14)/pp)*pp,k=qx+','+qy;
-if(!seen[k]){seen[k]=1;px.fillRect(ox+qx-pp/2,oy+qy,pp,pp);}}});
-return{c:c,w:sw,h:sh,ox:ox,oy:oy,x:pm.x,y:pm.y};});}
-// ---- layer: everything that depends on the yaw. Painter order and visible faces are cached per yaw.
+// ---- layer: everything that depends on the yaw (the ground plate turns with it). Painter order and visible faces are cached per yaw.
 function order(){if(ordYaw===sceneYaw)return;ordYaw=sceneYaw;var c=Math.cos(sceneYaw),s=Math.sin(sceneYaw);VF=[];
 NORM.forEach(function(n,f){var xr=n[0]*c-n[1]*s,yr=n[0]*s+n[1]*c;if(xr+yr>.001)VF.push([f,xr-yr<0?'l':'r']);});
-ord=[];var i;for(i=0;i<N;i++)ord.push({d:pj((i-(N-1)/2)*P,0,0)[2],k:0,i:i});
-D.palms.forEach(function(pm,j){ord.push({d:pj(pm.x,pm.y,0)[2],k:1,i:j});});ord.sort(function(a,b){return a.d-b.d;});}
+ord=[];var i;for(i=0;i<N;i++)ord.push({d:pj((i-(N-1)/2)*P,0,0)[2],i:i});
+ord.sort(function(a,b){return a.d-b.d;});}
 // a unit square (u,v) mapped onto the parallelogram (a; a+u; a+v): a face, a ground plate or a tower top is one fillRect
 function tf(x,ux,uy,vx,vy,ox,oy){x.setTransform(dpr*ux,dpr*uy,dpr*vx,dpr*vy,dpr*ox,dpr*oy);}
 function path(x,q){x.beginPath();q.forEach(function(p,i){if(i)x.lineTo(p[0],p[1]);else x.moveTo(p[0],p[1]);});x.closePath();}
 function bbox(q){var a=1e9,b=1e9,c=-1e9,e=-1e9;q.forEach(function(p){a=Math.min(a,p[0]);b=Math.min(b,p[1]);c=Math.max(c,p[0]);e=Math.max(e,p[1]);});return[a,b,c,e];}
-function drawGround(x){var q=[[-HX,-HY],[HX,-HY],[HX,HY],[-HX,HY]],
-rim=q.map(function(c){return pj(c[0]+(c[0]>0?.5:-.5),c[1]+(c[1]>0?.5:-.5),0);}),gq=q.map(function(c){return pj(c[0],c[1],0);});
-x.setTransform(dpr,0,0,dpr,0,0);path(x,rim);x.strokeStyle=col.t.foam;x.lineWidth=4;x.lineJoin='round';x.setLineDash([sc,sc*1.5]);x.stroke();x.setLineDash([]);
-tf(x,gq[1][0]-gq[0][0],gq[1][1]-gq[0][1],gq[3][0]-gq[0][0],gq[3][1]-gq[0][1],gq[0][0],gq[0][1]);
-x.fillStyle=col.t.sand;x.fillRect(0,0,1,1);
-x.fillStyle=col.t.dune;x.beginPath();D.dunes.forEach(function(u){x.rect((u[0]+HX)/(2*HX),(u[1]+HY)/(2*HY),u[2]/(2*HX),u[3]/(2*HY));});x.fill();
-x.setTransform(dpr,0,0,dpr,0,0);path(x,gq);x.strokeStyle=col.t.dune;x.lineWidth=1;x.stroke();}
-function drawPalm(x,j){var p=palms[j],b=pj(p.x,p.y,0);x.drawImage(p.c,Math.round((b[0]-p.ox)*dpr)/dpr,Math.round((b[1]-p.oy)*dpr)/dpr,p.w,p.h);}
+function drawGround(x){var q=[[-HX,-HY],[HX,-HY],[HX,HY],[-HX,HY]],gq=q.map(function(c){return pj(c[0],c[1],0);});
+x.setTransform(dpr,0,0,dpr,0,0);path(x,gq);x.fillStyle=col.plate;x.fill();x.strokeStyle=col.plateEdge;x.lineWidth=1;x.lineJoin='round';x.stroke();}
 // grid of one face run (z0..z1): the horizontal seams are one dashed stroke down the face, each vertical seam is a thin fillRect
 function grid(x,z0,z1,colour,alpha,us,ex){var dv=.75/Math.max(.5,Math.abs(ex)),dl=.75/LH;x.globalAlpha=alpha;
 if(LH>=2.2){x.strokeStyle=colour;x.lineWidth=1;x.setLineDash([dl,1-dl]);x.beginPath();x.moveTo(.5,z0-dl/2);x.lineTo(.5,z1+dl*.6);x.stroke();x.setLineDash([]);}
@@ -1384,32 +1293,29 @@ L.push({o:o,t:t,c:c,low:low,y0:y0,x:px,w:w,nm:nm,l2:l2});});
 x.beginPath();L.forEach(function(e){x.moveTo(e.o.x,e.o.y-3);
 if(e.low)x.lineTo(Math.min(Math.max(e.c,e.x+4),e.x+e.w-4),e.y0+36);else{x.lineTo(e.c,bandBottom+(compact?4:8));x.lineTo(e.c,e.y0-(compact?20:11));}});
 x.strokeStyle=col.ink;x.lineWidth=1;x.stroke();
-L.forEach(function(e){var t=e.t;labelHits.push({x:e.x,y:e.y0-12,w:e.w,h:compact?26:short?34:48,i:e.o.i});
+L.forEach(function(e){var t=e.t,bh=compact?26:short?34:48;x.fillStyle=col.surface;x.fillRect(e.x-4,e.y0-13,e.w+8,bh);labelHits.push({x:e.x,y:e.y0-12,w:e.w,h:compact?26:short?34:48,i:e.o.i});
 if(compact){x.font=F4;txt(x,String(t.open),e.x,e.y0,col.ink);return;}
 x.font=F1;txt(x,e.nm,e.x,e.y0,col.ink);x.font=F2;txt(x,e.l2,e.x,e.y0+16,col.ink);
 if(short)return;x.font=F3;var pl='+'+sh(t.add);txt(x,pl,e.x,e.y0+31,col.good);txt(x,'−'+sh(t['del']),e.x+tw(x,F3,pl+' '),e.y0+31,col.bad);});}
 function buildScene(){sceneDirty=false;sceneYaw=yaw;hits=[];order();
 var x=lx;x.setTransform(1,0,0,1,0,0);x.clearRect(0,0,yl.width,yl.height);
-CY=fitY(ext(sceneYaw,K,LH));
 drawGround(x);
-ord.forEach(function(it){if(it.k)drawPalm(x,it.i);else drawTower(x,it.i);});
+ord.forEach(function(it){drawTower(x,it.i);});
 drawLabels(x);x.setTransform(1,0,0,1,0,0);x.globalAlpha=1;}
-// ---- composite: the only thing a normal frame does. Waves are the light animation pass.
-function composite(){g.setTransform(1,0,0,1,0,0);g.drawImage(bg,0,0);
-for(var j=0;j<wy.length;j++){var o=Math.floor(((-phase*(5+j*2)*(j%2?-1:1)*dpr)%Wd+Wd)%Wd);g.drawImage(wv,o,j*rh,Wd,rh,0,wy[j],Wd,rh);}
-g.drawImage(yl,0,0);
+// ---- composite: the only thing a normal frame does. The canvas is cleared, so the page gradient shows through.
+function composite(){g.setTransform(1,0,0,1,0,0);g.clearRect(0,0,cv.width,cv.height);g.drawImage(yl,0,0);
 if(hover){hits.forEach(function(h){if(h.t!==hover.t||h.l!==hover.l)return;var cc=col.st[T[h.t].layers[h.l].k];
 g.setTransform(h.m[0],h.m[1],h.m[2],h.m[3],h.m[4],h.m[5]);g.fillStyle=cc.ghost?cc.gh:cc['h'+h.s];g.fillRect(h.r[0],h.r[1],h.r[2],h.r[3]);});g.setTransform(1,0,0,1,0,0);}}
 function shown(){return vis&&!d.hidden;}
-function animating(){return !reduce;}
+// only the idle pan animates: it runs until the first user input and pauses while the pointer is over the map
+function animating(){return auto&&!reduce&&!inside&&!drag;}
 function sched(){if(!raf&&shown())raf=requestAnimationFrame(frame);}
 function frame(ts){raf=0;
 if(!shown()){last=0;return;}
 if(ts-lastDraw<MS){raf=requestAnimationFrame(frame);return;}
 var dt=last?Math.min(100,ts-last):0;last=ts;lastDraw=ts;
 if(rz){rz=false;layout();}
-if(!reduce){phase=ts/1000;if(spin&&!inside&&!drag){acc+=dt*RATE;if(acc>=Q){yaw+=Math.floor(acc/Q)*Q;acc%=Q;}}}
-if(baseDirty)buildBase();
+if(animating()){ph+=dt*2*Math.PI/PERIOD;yaw=clampYaw(Y0+Math.round(Math.sin(ph)*ARC*IDLE/Q)*Q);}
 if(sceneDirty||sceneYaw!==yaw)buildScene();
 composite();
 if(animating())sched();else last=0;}
@@ -1426,19 +1332,19 @@ var ch=(f?f.t:-1)!==(hover?hover.t:-1)||(f?f.l:-1)!==(hover?hover.l:-1);hover=f?
 if(f&&tip){var t=T[f.t],ly=t.layers[f.l];tip.textContent=t.name+' · '+ly.label.toLowerCase()+' · '+ly.n+' PR'+(ly.n===1?'':'s');tip.hidden=false;place(e);}
 else if(lab&&tip){tip.textContent=lab.name+' · '+lab.open+' open · '+lab.unreviewed+' unreviewed';tip.hidden=false;place(e);}
 else if(tip)tip.hidden=true;if(ch)sched();}
-cv.addEventListener('pointerdown',function(e){drag={x:e.clientX};spin=false;if(cv.setPointerCapture)try{cv.setPointerCapture(e.pointerId);}catch(x){}});
-cv.addEventListener('pointermove',function(e){inside=true;if(drag){yaw+=(e.clientX-drag.x)*.01;drag.x=e.clientX;hover=null;if(tip)tip.hidden=true;sched();}else pick(e);});
+cv.addEventListener('pointerdown',function(e){drag={x:e.clientX};auto=false;if(cv.setPointerCapture)try{cv.setPointerCapture(e.pointerId);}catch(x){}});
+cv.addEventListener('pointermove',function(e){inside=true;if(drag){yaw=clampYaw(yaw+(e.clientX-drag.x)*.01);drag.x=e.clientX;hover=null;if(tip)tip.hidden=true;sched();}else pick(e);});
 function up(){drag=null;sched();}
 cv.addEventListener('pointerup',up);cv.addEventListener('pointercancel',up);
 cv.addEventListener('pointerenter',function(){inside=true;});
 cv.addEventListener('pointerleave',function(){inside=false;hover=null;if(tip)tip.hidden=true;sched();});
-cv.addEventListener('keydown',function(e){var k=e.key==='ArrowLeft'?-1:e.key==='ArrowRight'?1:0;if(!k)return;e.preventDefault();spin=false;yaw+=k*.12;sched();});
+cv.addEventListener('keydown',function(e){var k=e.key==='ArrowLeft'?-1:e.key==='ArrowRight'?1:0;if(!k)return;e.preventDefault();auto=false;yaw=clampYaw(yaw+k*.12);sched();});
 // the size is re-read in the next frame, so a burst of resize events costs one layout
 function resized(){rz=true;sched();}
 if(window.ResizeObserver)new ResizeObserver(resized).observe(stage);else addEventListener('resize',resized);
 if(window.IntersectionObserver)new IntersectionObserver(function(es){vis=es[es.length-1].isIntersecting;if(vis)sched();}).observe(cv);
 d.addEventListener('visibilitychange',function(){if(!d.hidden)sched();});
-function recolor(){readColors();baseDirty=true;sceneDirty=true;sched();}
+function recolor(){readColors();sceneDirty=true;sched();}
 if(window.MutationObserver)new MutationObserver(recolor).observe(d.documentElement,{attributes:true,attributeFilter:['data-theme']});
 if(window.matchMedia)try{matchMedia('(prefers-color-scheme: dark)').addEventListener('change',recolor);}catch(e){}
 if(d.fonts&&d.fonts.ready)d.fonts.ready.then(function(){mc={};sceneDirty=true;sched();});
