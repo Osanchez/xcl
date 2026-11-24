@@ -1,0 +1,69 @@
+name: Archive upstream (from fork)
+
+on:
+  schedule:
+    - cron: '5 * * * *'
+  workflow_dispatch:
+    inputs:
+      bundle:
+        description: 'Also create a bundle and publish it as a release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    if: github.repository == 'Osanchez/xcl'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the push token
+        env:
+          ARCHIVE_TOKEN: ${{ secrets.ARCHIVE_TOKEN }}
+        run: |
+          if [ -z "$ARCHIVE_TOKEN" ]; then
+            echo "::error::secret ARCHIVE_TOKEN is empty; add a fine-grained PAT with Contents and Workflows read/write on Osanchez/xcl-archive"
+            exit 1
+          fi
+
+      - name: Archive
+        env:
+          ARCHIVE_TOKEN: ${{ secrets.ARCHIVE_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          BUNDLE_INPUT: ${{ github.event.inputs.bundle }}
+        run: |
+          export ARCHIVE_URL="https://x-access-token:${ARCHIVE_TOKEN}@github.com/Osanchez/xcl-archive.git"
+          export BUNDLE_DIR="$RUNNER_TEMP"
+          export BUNDLE=0
+          if [ "$BUNDLE_INPUT" = "true" ]; then
+            BUNDLE=1
+          elif [ "$EVENT_NAME" = "schedule" ] && [ "$(date -u +%u)" = "1" ] && [ "$(date -u +%H)" = "03" ]; then
+            BUNDLE=1
+          fi
+          ./scripts/dev/archive.sh
+
+      - name: Publish bundle
+        env:
+          GH_TOKEN: ${{ secrets.ARCHIVE_TOKEN }}
+        run: |
+          file="$(ls "$RUNNER_TEMP"/xcl-*.bundle 2>/dev/null | head -n 1 || true)"
+          if [ -z "$file" ]; then
+            echo "No bundle produced"
+            exit 0
+          fi
+          day="$(basename "$file" .bundle)"
+          day="${day#xcl-}"
+          tag="bundle-$day"
+          if gh release view -R Osanchez/xcl-archive "$tag" >/dev/null 2>&1; then
+            gh release upload -R Osanchez/xcl-archive "$tag" "$file" --clobber
+          else
+            gh release create -R Osanchez/xcl-archive "$tag" "$file" --title "XCL bundle $day" \
+              --notes "Git bundle of the archived upstream refs, created $day (UTC). Restore: git clone $(basename "$file") xcl"
+          fi
