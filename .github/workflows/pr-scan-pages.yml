@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -23,10 +23,51 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Fetch the PR history
+        id: history_fetch
+        continue-on-error: true
+        run: |
+          set -u
+          H="$RUNNER_TEMP/pr-history"
+          if git fetch --depth=1 origin pr-history; then
+            git worktree add --detach "$H" FETCH_HEAD
+          else
+            echo "No pr-history branch yet: starting an empty orphan branch"
+            git worktree add --detach "$H" HEAD
+            git -C "$H" checkout --orphan pr-history
+            git -C "$H" rm -rf --quiet . || true
+          fi
       - name: Build the PR report
-        run: python3 scripts/dev/pr-scan.py report --out _site
+        run: |
+          H="$RUNNER_TEMP/pr-history"
+          if [ -d "$H" ]; then
+            python3 scripts/dev/pr-scan.py report --out _site --history "$H/history.jsonl" || python3 scripts/dev/pr-scan.py report --out _site
+          else
+            python3 scripts/dev/pr-scan.py report --out _site
+          fi
         env:
           GH_TOKEN: ${{ github.token }}
+      - name: Push the PR history
+        continue-on-error: true
+        run: |
+          H="$RUNNER_TEMP/pr-history"
+          [ -f "$H/history.jsonl" ] || { echo "no history file, nothing to push"; exit 0; }
+          cd "$H"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add history.jsonl
+          if git diff --cached --quiet; then echo "history unchanged"; exit 0; fi
+          git commit -q -m "History: snapshot $(date -u +%Y-%m-%dT%H:%MZ)"
+          if ! git push origin HEAD:pr-history; then
+            echo "push rejected: re-fetching and retrying once"
+            cp history.jsonl "$RUNNER_TEMP/history.mine"
+            git fetch --depth=1 origin pr-history
+            git reset --hard FETCH_HEAD
+            cp "$RUNNER_TEMP/history.mine" history.jsonl
+            git add history.jsonl
+            git commit -q -m "History: snapshot $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push origin HEAD:pr-history
+          fi
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site

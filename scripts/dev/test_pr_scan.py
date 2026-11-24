@@ -2,6 +2,7 @@
 """Tests for pr-scan.py (pure functions only; no network). Run: python3 -I scripts/dev/test_pr_scan.py -v"""
 import datetime as dt
 import importlib.util
+import json
 import os
 import unittest
 
@@ -210,9 +211,163 @@ class RenderTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;", out)
         self.assertNotIn("<r>", out)
         self.assertIn("prefers-color-scheme:dark", out)
+        self.assertNotIn("<script src", out)
         md = ps.render_md(an, "o/r", NOW)
         self.assertNotIn("<script>", md)
         self.assertNotIn("javascript:", md)
+
+
+def snap(ts, prs, **kw):
+    d = {"ts": ts, "open": len(prs), "unreviewed": 1, "draft": 0, "looksDone": 0, "clusters": 0,
+         "areas": {"VFS": len(prs)}, "prs": sorted(prs)}
+    d.update(kw)
+    return d
+
+
+def t(h):
+    return (NOW - dt.timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class HistoryTests(unittest.TestCase):
+    def test_snapshot_fields(self):
+        an = ps.build_analysis([pr(2, "VFS: a", ["crates/xcl/src/vfs/a.rs"], isDraft=True), pr(1, "VFS: b", ["crates/xcl/src/vfs/b.rs"])], NOW)
+        s = ps.snapshot(an, NOW)
+        self.assertEqual((s["open"], s["draft"], s["prs"], s["areas"]), (2, 1, [1, 2], {"VFS": 2}))
+        self.assertEqual(s["ts"], "2026-11-23T12:00:00Z")
+
+    def test_append_30_minute_rule(self):
+        h = [snap("2026-11-23T11:45:00Z", [1])]
+        self.assertEqual(len(ps.append_snapshot(h, snap("2026-11-23T12:00:00Z", [1]))), 1)
+        self.assertEqual(len(ps.append_snapshot(h, snap("2026-11-23T12:15:00Z", [1]))), 2)
+        self.assertEqual(len(ps.append_snapshot(h, snap("2026-11-23T11:00:00Z", [1]))), 1)  # clock went back
+        self.assertEqual(len(ps.append_snapshot([], snap("2026-11-23T12:00:00Z", [1]))), 1)
+
+    def test_prune_90_days(self):
+        h = [snap(t(24 * 91), [1]), snap(t(24 * 89), [1]), snap(t(1), [1])]
+        self.assertEqual(len(ps.prune_history(h, NOW)), 2)
+
+    def test_parse_tolerates_bad_lines(self):
+        text = "\n".join(["not json", "", "[1,2]", '{"ts":"yesterday"}', '{"open":3}', json.dumps(snap(t(2), [1, 2])),
+                          '{"ts":"%s","open":"x","prs":"y","areas":5}' % t(1)])
+        h = ps.parse_history(text)
+        self.assertEqual([s["ts"] for s in h], [t(2), t(1)])
+        self.assertEqual((h[1]["open"], h[1]["prs"], h[1]["areas"]), (0, None, {}))
+        self.assertEqual(ps.parse_history(None), [])
+        self.assertEqual(ps.read_history("/nonexistent/history.jsonl"), [])
+
+    def test_roundtrip(self):
+        h = [snap(t(3), [1, 2]), snap(t(2), [2, 3])]
+        self.assertEqual(ps.parse_history(ps.history_text(h)), h)
+
+    def test_new_and_closed(self):
+        self.assertEqual(ps.new_and_closed([1, 2, 3], [2, 3, 4, 5]), (2, 1))
+        self.assertEqual(ps.new_and_closed([], []), (0, 0))
+
+    def test_daily_summary(self):
+        h = [snap("2026-11-20T10:00:00Z", [1, 2]), snap("2026-11-20T11:00:00Z", [1, 2, 3]),
+             snap("2026-11-21T00:00:00Z", [2, 3, 4, 5]), dict(snap("2026-11-21T01:00:00Z", [2, 3, 4, 5]), prs=None)]
+        d = ps.daily_summary(h)
+        self.assertEqual([(x["day"], x["open"], x["new"], x["closed"]) for x in d],
+                         [("2026-11-20", 3, 1, 0), ("2026-11-21", 4, 2, 1)])
+
+    def test_change_24h(self):
+        h = [snap(t(30), [1], open=10), snap(t(25), [1], open=12), snap(t(2), [1], open=20)]
+        self.assertEqual(ps.change_24h(h, "open", 15, NOW), 3)
+        self.assertIsNone(ps.change_24h([snap(t(2), [1])], "open", 5, NOW))
+
+    def test_downsample(self):
+        self.assertEqual(ps.downsample([1, 2, 3], 5), [1, 2, 3])
+        v = ps.downsample(list(range(100)), 10)
+        self.assertEqual((len(v), v[0], v[-1]), (10, 0, 99))
+
+
+class ChartTests(unittest.TestCase):
+    def series(self, n):
+        return [{"name": "open", "cls": "s-open", "points": [(NOW - dt.timedelta(hours=n - i), 10 + i) for i in range(n)]}]
+
+    def test_line_chart_points(self):
+        self.assertIn("No data yet", ps.svg_line_chart(self.series(0), "x"))
+        one = ps.svg_line_chart(self.series(1), "x")
+        self.assertIn("<circle", one)
+        self.assertNotIn("<polyline", one)
+        many = ps.svg_line_chart(self.series(200), "x")
+        self.assertIn("<polyline", many)
+        self.assertIn("<title>", many)
+        self.assertEqual(many.count("<svg"), 1)
+
+    def test_bars(self):
+        self.assertIn("No data yet", ps.svg_bars([], "x"))
+        rows = [{"day": "2026-11-%02d" % d, "new": d % 3, "closed": 0} for d in range(1, 15)]
+        out = ps.svg_bars(rows, "x")
+        self.assertEqual(out.count("<rect"), 28)
+        self.assertIn("opened", out)
+        self.assertIn("<rect", ps.svg_bars([{"day": "2026-11-01", "new": 0, "closed": 0}], "x"))
+
+    def test_sparkline_and_ticks(self):
+        for vals in ([], [3], [3, 3, 3], [1, 5, 2]):
+            self.assertIn("<svg", ps.sparkline(vals))
+        self.assertNotIn("<polyline", ps.sparkline([3]))
+        step, top = ps.nice_ticks(0)
+        self.assertGreaterEqual(top, 1)
+        step, top = ps.nice_ticks(37)
+        self.assertEqual(top % step, 0)
+        self.assertGreaterEqual(top, 37)
+
+    def test_chart_title_escaped(self):
+        self.assertNotIn("<img", ps.svg_line_chart(self.series(3), "<img src=x>"))
+
+
+class PageTests(unittest.TestCase):
+    def an(self):
+        return ps.build_analysis([pr(1, "VFS: a", ["crates/xcl/src/vfs/a.rs"]),
+                                  pr(2, "VFS: a", ["crates/xcl/src/vfs/a.rs"], author="x/y\"<z>")], NOW)
+
+    def test_trends_hidden_without_history(self):
+        out = ps.render_html(self.an(), "o/r", NOW, [snap(t(1), [1])])
+        self.assertNotIn("<h2>Trends", out)
+        self.assertNotIn("Trends", ps.render_md(self.an(), "o/r", NOW))
+        self.assertIn("Possible duplicate work", out)
+        self.assertIn("Ready to merge", out)
+
+    def test_trends_shown_with_history(self):
+        h = [snap(t(48), [1]), snap(t(24), [1, 2]), snap(t(1), [2, 3, 4])]
+        out = ps.render_html(self.an(), "o/r", NOW, h)
+        self.assertIn("<h2>Trends", out)
+        self.assertIn("/ 24 h", out)
+        md = ps.render_md(self.an(), "o/r", NOW, h)
+        self.assertIn("## Trends", md)
+        self.assertIn("| 2026-11-21 |", md)
+
+    def test_avatar_and_author_escaped(self):
+        out = ps.render_html(self.an(), "o/r", NOW)
+        self.assertNotIn('"<z>', out)
+        self.assertIn("avatars.githubusercontent.com/x%2Fy%22%3Cz%3E?s=40", out)
+        self.assertIn('loading="lazy"', out)
+
+    def test_only_font_stylesheet_external(self):
+        out = ps.render_html(self.an(), "o/r", NOW)
+        self.assertEqual(out.count("<link rel=stylesheet"), 1)
+        self.assertNotIn("<script src", out)
+
+
+class ClusterLabelTests(unittest.TestCase):
+    def m(self, *areas):
+        return [{"primary": a, "additions": ln, "deletions": 0} for a, ln in areas]
+
+    def test_majority(self):
+        self.assertEqual(ps.cluster_label(self.m(("kernelx", 1), ("kernelx", 1), ("Memory", 50))), ("3 PRs, mostly kernelx", "kernelx"))
+
+    def test_half_is_not_majority(self):
+        label, area = ps.cluster_label(self.m(("VFS", 1), ("VFS", 1), ("TLS", 1), ("Memory", 1)))
+        self.assertEqual((label, area), ("4 PRs across VFS, Memory and TLS", "VFS"))
+
+    def test_tie_breaks_by_lines_then_name(self):
+        self.assertEqual(ps.cluster_label(self.m(("B", 1), ("A", 5)))[0], "2 PRs across A and B")
+        self.assertEqual(ps.cluster_label(self.m(("B", 5), ("A", 5)))[1], "A")
+
+    def test_mixed_names_top_three_only(self):
+        label, area = ps.cluster_label(self.m(("A", 1), ("A", 1), ("B", 1), ("B", 1), ("C", 1), ("D", 1), ("E", 1)))
+        self.assertEqual((label, area), ("7 PRs across A, B and C", "A"))
 
 
 if __name__ == "__main__":

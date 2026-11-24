@@ -202,3 +202,89 @@ User choices: hourly sync as a GitHub Action on the fork (not launchd); SessionS
   - `THIRD_PARTY.md` → Docs
   - `tests/data/` → Tests/e2e
   - "Other" stays only for paths outside these.
+
+## 2026-11-24: Takedown-resistant archive (approved by the user)
+
+### Goal
+Keep every version of ivall/xcl even if upstream or the whole fork network is taken down.
+
+### Design
+- New **private, non-fork** repo `Osanchez/xcl-archive`, outside the fork network. Its default branch `meta` holds `archive.sh`, `.github/workflows/archive.yml` and a README.
+- The workflow lives in the archive repo itself, so it keeps running if the fork disappears. Triggers: cron `5 * * * *` (hourly) and workflow_dispatch.
+- Fetched from https://github.com/ivall/xcl (public, no token):
+  - `refs/heads/*` → archive `refs/heads/upstream/<name>`
+  - `refs/tags/*` → `refs/tags/<name>`
+  - `refs/pull/*/head` → `refs/heads/pr/<N>`, every PR, open or closed
+- Also fetched: the fork's `main` and `dev` from https://github.com/Osanchez/xcl → `refs/heads/fork/<name>`. A missing remote does not fail the run.
+- Never delete:
+  - no prune; refs that vanish upstream stay;
+  - if a ref's new tip does not descend from the archived tip, the old tip is first pushed to `refs/heads/rewritten/<UTC yyyymmdd-HHMM>/<name>`, and then the ref is updated;
+  - tags that are moved get the same treatment (`refs/tags/rewritten/<date>/<tag>`).
+- Weekly (Mondays, or `workflow_dispatch` input `bundle=true`): `git bundle create xcl-<yyyymmdd>.bundle --all` of the fetched upstream refs, uploaded as release `bundle-<yyyymmdd>` in the archive repo. Old releases are kept.
+- Push auth: secret `ARCHIVE_TOKEN`, the user's fine-grained PAT, extended to xcl-archive with Contents and Workflows write. `GITHUB_TOKEN` cannot push history that touches `.github/workflows`. Releases use `GITHUB_TOKEN` (`contents: write`).
+- If upstream is unreachable, the run logs a warning and exits 0, so the schedule is not disabled for failing. The archive is untouched.
+- Cost: a private repo uses Actions minutes, about 1 min per hourly run, roughly 720–1500 of the free 2000 min/month.
+- Source of truth: the archive repo's `meta` branch. A local clone sits at ../xcl-archive.
+
+### Work unit
+- U14 archive: `archive.sh`, `archive.yml` and `README.md` in ../xcl-archive.
+- Check: bash -n; scenario tests against local bare repos (first run; an incremental run; a rewritten branch preserved under rewritten/; a deleted upstream branch kept; a moved tag preserved; bundle created and `git bundle verify` passes; upstream unreachable → exit 0); YAML parse.
+
+## 2026-11-24: PR scan page redesign with trends (approved by the user)
+
+### Page (rendered by scripts/dev/pr-scan.py `report`)
+- One self-contained `index.html`: inline CSS and a small inline JS. The only external resources are the avatar images from `https://avatars.githubusercontent.com/<login>?s=40`, lazy-loaded with an alt fallback.
+- Light and dark via CSS variables, with `prefers-color-scheme` honoured. Phone width (≥360px) has a 16px gutter and no horizontal page scroll; wide tables get their own horizontal scroll.
+- Sections, in order:
+  1. **Header**: repo, "updated N min ago", plus an absolute UTC time.
+  2. **Summary tiles**: open, unreviewed, looks done, possible duplicates (clusters), drafts. Each tile shows its 24 h change once history exists.
+  3. **Trends** (when ≥2 snapshots): inline SVG line chart of open and unreviewed over the last 14 days; a "new vs closed per day" bar chart from consecutive snapshots' PR-number sets.
+  4. **By area**: horizontal stacked bars per area (draft / waiting for review / reviewed / looks done), with counts and a 7-day sparkline per area from history.
+  5. **Possible duplicate work**: one card per cluster, largest first. A card shows the member PRs (number, title, author, state pills), shared non-hot files as chips, and the match reason with its score.
+  6. **Ready to merge** ("looks done"): table of PR, area, age, CI and size, oldest first.
+  7. **Hot files**: path, count, a heat bar and PR links.
+  8. **All PRs by area**: collapsible `<details>` per area. Rows show avatar, #number, title, pills (CI ok/fail/pending, review state, draft, looks done, stale), age, +/− lines and file count.
+- **Filters** (JS, progressive enhancement; with JS off everything is shown): a text search over title, number, author and paths; area chips; state toggles (draft, unreviewed, looks done). Filter state lives in the URL hash.
+- All PR-provided text is HTML-escaped. No external JS or CSS.
+
+### History
+- The workflow keeps an orphan branch `pr-history` in the fork with `history.jsonl`. Each line has `ts` (UTC ISO), `open`, `unreviewed`, `draft`, `looksDone`, `clusters`, `areas` (area → open count) and `prs` (sorted open PR numbers).
+- `pr-scan.py report --history FILE`:
+  - reads the existing lines (tolerating a missing file or bad lines);
+  - appends the current snapshot, but only if the last line is ≥30 minutes older;
+  - keeps at most 90 days (drops older lines);
+  - renders the trends from the file.
+- pr-scan-pages.yml:
+  - `permissions: contents: write` is added;
+  - before the report, it fetches `origin pr-history` into a temp worktree, or starts an empty orphan branch;
+  - after the report, it commits `history.jsonl` as github-actions[bot] and pushes with plain `git push origin HEAD:pr-history`, no force;
+  - a push conflict is retried once after a re-fetch. History failures never block the Pages deploy.
+- Safe with `GITHUB_TOKEN`: the branch has no workflow files.
+
+### Checks
+- unittest for:
+  - history append, the 30-minute rule, 90-day pruning and bad-line tolerance;
+  - new and closed counts from PR-number sets;
+  - SVG chart generation with 0, 1 and many points;
+  - escaping.
+- A real report run with a synthetic 14-day history file.
+- Screenshots via `qlmanage -t -s 1400` of the generated HTML (light). Also a phone-width render if possible, viewed by the orchestrator.
+- YAML parse.
+
+### Visual direction (user request, 2026-11-24): inspired by gta6pc.meth.dev
+- Inspiration only; none of their code or assets are copied. The look:
+  - flat editorial dashboard: square corners, no shadows or gradients;
+  - sections separated by 1px rules, and a 2px ink rule under the header bar;
+  - Roboto for body text (15px/1.45) and bold Roboto Condensed for headings (h1 20px, h2 16px), big numbers (hero 72px) and stat values (20px); `font-variant-numeric: tabular-nums` throughout.
+- Tokens:
+  - light: page #fff, ink #10141c, soft #566070, rule #d9dee6, wash #eef1f5, accent #1546e0, partial #e8770c;
+  - dark: page #0e1219, ink #eef2f8, soft #a2adbc, rule #2a3240, wash #1a212c, accent #8ca8ff, partial #ffab5c.
+  - Category colours per area, light/dark pairs: #d81f82/#ff7fc0, #c96a12/#ffb057, #14839f/#5fd0ea, #4f7f16/#b4e06a, #7b6a78/#cdb9c8. Further areas get extra colours tuned to the same lightness.
+- Layout:
+  - header row: title on the left; on the right a "live" pulsing square dot with "updated N min ago" and a light/dark/auto theme button that remembers the choice in localStorage, wrapped in try/catch;
+  - a hero with one large condensed number (open PRs) and a short note line (unreviewed, looks done, possible duplicates);
+  - a stat strip of label-over-value pairs;
+  - on desktop (≥1100px), a two-column grid: duplicates and trends on the left; areas and ready-to-merge on the right. A single column on phones.
+- Section heads: h2 on the left, muted meta text on the right (counts, time ranges).
+- Lists are ruled rows, not cards. Duplicate clusters are ruled blocks with a left colour bar in the area colour.
+- Fonts: Google Fonts stylesheet `family=Roboto+Condensed:wght@700&family=Roboto:wght@400;500;700&display=swap`, with system fallbacks. This is the only external CSS allowed; it overrides "no external CSS" above.
