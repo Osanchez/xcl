@@ -343,3 +343,28 @@ Keep every version of ivall/xcl even if upstream or the whole fork network is ta
   - a few procedural palm trees made of voxel trunks and pixel fronds, placed by a fixed seed so every render is the same.
   - The scene's colours are theme tokens (`--sky-1..3`, `--sun`, `--sand`, `--dune`, `--water`, `--deep`, `--foam`, `--trunk`, `--frond`), with light and dark sets.
 - The SVG fallback shows the same scene statically. The page chrome keeps the existing tokens.
+
+### Fit-to-viewport, consolidated filters, renderer performance (user request, 2026-11-24)
+- **Filters:** the chip row becomes one compact toolbar in the top bar, or directly under it.
+  - Controls: a search input; an Area `<select>` (All areas, the top 6, Everything else, then every other area under an optgroup); and a 4-way segmented state control (All · Unreviewed · Ready · Draft).
+  - State stays in the URL hash. With JS off the toolbar is hidden and everything is shown.
+- **Fit the viewport (desktop and tablet, viewport ≥ 900px wide):**
+  - The page is exactly `100dvh`, and `body` never scrolls.
+  - The grid rows and columns are fractions of the viewport. The top bar and the meta strip take their content height, and the rest is split between panels.
+  - Type and spacing use `clamp()` with vw/vh terms, so a smaller window scales them down instead of scrolling.
+  - **The 3D scene panel never scrolls.** Its canvas sizes to the panel's box, using a ResizeObserver with debounced rAF, and the scene re-fits to it.
+  - The trends charts go in their own panel, or a tab, that is sized to fit. SVG charts get viewBox plus `preserveAspectRatio` to fill their box.
+  - Only lists that are genuinely long scroll, and only inside their own panel: the duplicates feed, All PRs and the standings when there are more rows than fit. Those panels get thin, styled scrollbars.
+  - Below 900px the page scrolls normally in one column, and the scene height is `min(60vh, 420px)`.
+- **Renderer performance:**
+  - Static layers go on an offscreen canvas, rebuilt only on resize, theme change or yaw change: sky, sun, ground, dunes and palms.
+  - Each tower's state layer is drawn as 3 face polygons plus one batched path of grid lines, instead of a path per voxel.
+  - Fills are batched by colour.
+  - Painter's-order sorting happens once per yaw change.
+  - Animation runs only while needed, capped at 30 fps: wave and foam bands are drawn as cheap rects on a separate light pass.
+  - Drawing pauses when the canvas is off-screen (IntersectionObserver) or the tab is hidden.
+  - The idle spin is slow, and under reduced motion there is none.
+  - `devicePixelRatio` is capped at 2.
+  - Hover hit-testing uses the cached projected polygons per tower and layer, and doesn't redraw unless the hovered layer changes.
+  - No shadowBlur and no filters.
+- **Target:** per-frame draw calls cut by at least 5× compared with the current renderer, measured with the jsc mock-canvas op counter before and after.

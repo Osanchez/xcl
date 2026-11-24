@@ -4,6 +4,7 @@ import datetime as dt
 import importlib.util
 import json
 import os
+import re
 import unittest
 
 _spec = importlib.util.spec_from_file_location("pr_scan", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pr-scan.py"))
@@ -456,8 +457,143 @@ class TopAreaTests(unittest.TestCase):
         self.assertEqual(st.count('<li class="st">'), 7)
         self.assertIn("Everything else", st)
         self.assertIn("2 areas: A6, A7", st)
-        chips = out.split('aria-label="Area filters"')[1].split("</div>")[0]
-        self.assertEqual(chips.count('data-area='), 8)
+        sel = out.split('<select id="area">')[1].split("</select>")[0]
+        for i in range(8):
+            self.assertIn(">A%d (" % i, sel)
+        self.assertNotIn('class="chip"', out)
+
+
+class ToolbarTests(unittest.TestCase):
+    def page(self, counts):
+        return ps.render_html(analysis_of(counts), "o/r", NOW)
+
+    def select(self, out):
+        return out.split('<select id="area">')[1].split("</select>")[0]
+
+    def test_select_lists_every_area_once(self):
+        counts = {"A%d" % i: 10 - i for i in range(9)}
+        out = self.page(counts)
+        sel = self.select(out)
+        self.assertTrue(sel.startswith('<option value="">All areas</option>'))
+        for a in counts:
+            self.assertEqual(sel.count('value="%s"' % ps.slug(a)), 1, a)
+        self.assertEqual(sel.count("<option "), 1 + 6 + 1 + 3)  # All, top 6, Everything else, the 3 inside it
+        self.assertIn('value="%s" data-members="%s"' % (ps.slug(ps.ELSE_NAME), ",".join(ps.slug(a) for a in ("A6", "A7", "A8"))), sel)
+        grp = sel.split("<optgroup")[1]
+        self.assertEqual(grp.count("<option "), 3)
+        self.assertLess(sel.index('value="%s"' % ps.slug("A5")), sel.index(ps.slug(ps.ELSE_NAME)))
+
+    def test_select_without_rollup(self):
+        sel = self.select(self.page({"A": 2, "B": 1}))
+        self.assertEqual(sel.count("<option "), 3)
+        self.assertNotIn("optgroup", sel)
+        self.assertNotIn(ps.ELSE_NAME, sel)
+
+    def test_select_escapes_area_names(self):
+        an = analysis_of({"A": 2})
+        an["areas"]["<b>x</b>"] = an["areas"].pop("A")
+        out = ps.render_html(an, "o/r", NOW)
+        self.assertNotIn("<b>x</b>", out.split('<select id="area">')[1].split("</select>")[0])
+
+    def test_segmented_state_control(self):
+        out = self.page({"A": 2})
+        seg = out.split('class="seg"')[1].split("</div>")[0]
+        self.assertEqual(re.findall(r">([^<]+)</button>", seg), ["All", "Unreviewed", "Ready", "Draft"])
+        self.assertEqual(seg.count('aria-pressed="true"'), 1)
+        self.assertEqual(out.count('id="q"'), 1)
+
+    def test_toolbar_hidden_without_js_and_one_row(self):
+        out = self.page({"A": 2})
+        self.assertIn(".toolbar{display:none", out)
+        self.assertIn(".js .toolbar{display:flex}", out)
+        self.assertEqual(out.count('id="filters"'), 1)
+        self.assertLess(out.index('id="filters"'), out.index('class="top-right"'))  # inside the top bar
+
+    def test_hash_state_keys(self):
+        for key in ("q=", "area=", "state=", "tab="):
+            self.assertIn(key, ps.JS)
+        self.assertIn("'unrev','done','draft'", ps.JS)  # old draft=1 / unrev=1 / done=1 links still parse
+
+
+class FitTests(unittest.TestCase):
+    def desktop(self):
+        css = ps.CSS + ps.SCENE_CSS
+        a = css.index("@media (min-width:900px){\n:root")
+        return css[a:css.index("\n}\n", a)]
+
+    def test_body_never_scrolls_on_desktop(self):
+        d = self.desktop()
+        self.assertIn("html,body{height:100%;overflow:hidden}", d)
+        self.assertIn("height:100dvh", d)
+        self.assertNotIn("min-height:660px", ps.CSS + ps.SCENE_CSS)
+
+    def test_scene_panel_never_scrolls(self):
+        self.assertNotIn("overflow:auto", ps.SCENE_CSS)
+        self.assertNotIn("overflow-y:auto", ps.SCENE_CSS)
+        self.assertNotIn("overflow:scroll", ps.SCENE_CSS)
+        self.assertIn(".a-city,.a-trends,.a-road,.a-standings,.a-feed{overflow:hidden", self.desktop())
+
+    def test_only_long_lists_scroll(self):
+        css = ps.CSS + ps.SCENE_CSS
+        scrolling = set()
+        for rule in css.replace("}", "}\n").splitlines():
+            if "overflow:auto" in rule or "overflow-y:auto" in rule:
+                scrolling.add(rule.split("{")[0])
+        for sel in scrolling:
+            self.assertTrue(all(x in (".st-list", ".feed-body") for x in sel.split(",")), sel)
+
+    def test_mobile_scene_height_and_single_column(self):
+        self.assertIn(".stage{position:relative;flex:none;width:100%;height:min(60vh,420px)}", ps.SCENE_CSS)
+        base = ps.CSS.split("@media (min-width:900px)")[0]
+        self.assertIn("grid-template-columns:minmax(0,1fr)", base)
+
+    def test_fluid_sizes_use_clamp_with_viewport_units(self):
+        d = self.desktop()
+        self.assertIn("clamp(", d)
+        self.assertRegex(d, r"clamp\([^)]*v[wh]")
+
+    def test_charts_fill_their_box(self):
+        out = ps.render_html(analysis_of({"A": 2}), "o/r", NOW, [snap(t(48), [1]), snap(t(24), [1, 2]), snap(t(1), [2, 3, 4])])
+        self.assertEqual(out.count('class="chart-box"'), 2)
+        self.assertIn('preserveAspectRatio="xMidYMid meet"', out)
+        self.assertIn('viewBox="0 0 %d %d"' % (ps.CHART_W, ps.CHART_H), out)
+        self.assertIn(".chart-box .chart{position:absolute", self.desktop())
+
+    def test_trends_have_their_own_panel(self):
+        out = ps.render_html(analysis_of({"A": 2}), "o/r", NOW)
+        self.assertEqual(out.count('class="a-trends"'), 1)
+        self.assertNotIn("Trends", out.split('class="a-city"')[1].split("</section>")[0])
+
+    def test_scrollbars_are_thin(self):
+        self.assertIn("scrollbar-width:thin", ps.CSS)
+        self.assertIn("::-webkit-scrollbar{width:8px}", ps.CSS)
+
+
+class RendererSourceTests(unittest.TestCase):
+    """The canvas renderer cannot run here; these check the rules of the spec that show in its source."""
+    def test_no_expensive_canvas_features(self):
+        for bad in ("shadowBlur", "filter", "getImageData", "willReadFrequently"):
+            self.assertNotIn(bad, ps.SCENE_JS)
+
+    def test_dpr_cap_and_fps_cap(self):
+        self.assertIn("Math.min(2,window.devicePixelRatio||1)", ps.SCENE_JS)
+        self.assertIn("MS=30", ps.SCENE_JS)
+
+    def test_pauses_when_hidden_or_off_screen(self):
+        self.assertIn("IntersectionObserver", ps.SCENE_JS)
+        self.assertIn("visibilitychange", ps.SCENE_JS)
+        self.assertIn("function shown(){return vis&&!d.hidden;}", ps.SCENE_JS)
+
+    def test_resize_observer_and_cached_layers(self):
+        self.assertIn("new ResizeObserver(resized)", ps.SCENE_JS)
+        self.assertIn("function buildBase()", ps.SCENE_JS)
+        self.assertIn("function buildScene()", ps.SCENE_JS)
+        self.assertIn("function composite()", ps.SCENE_JS)
+        self.assertIn("ordYaw===sceneYaw", ps.SCENE_JS)  # painter order is sorted once per yaw
+
+    def test_reduced_motion_stops_the_spin(self):
+        self.assertIn("prefers-reduced-motion: reduce", ps.SCENE_JS)
+        self.assertIn("var spin=!reduce", ps.SCENE_JS)
 
 
 class SceneTests(unittest.TestCase):
