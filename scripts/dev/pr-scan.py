@@ -26,8 +26,11 @@ DEFAULT_OUT = "reports/latest"
 FILE_LIMIT = 100
 STALE_DAYS = 7
 MERGED_DAYS = 30
+CLOSED_DAYS = 7          # PRs closed (merged or not) in this window are fetched and shown
 FILE_JACCARD = 0.5
 TITLE_JACCARD = 0.6
+CLUSTER_MAX = 12         # a larger connected component is re-split with stricter thresholds
+JACCARD_STEP, JACCARD_CAP = 0.1, 0.9
 HOT_MIN_PRS = 4
 HOT_FRACTION = 0.05
 
@@ -59,7 +62,6 @@ AREA_TABLE = [
     (re.compile(SRC), "Runtime"),
 ]
 OTHER = "Other"
-OTHER_LABEL = "Other (unmapped paths)"
 # Areas shown together as one tower / standings row; a PR's group comes from its primary area.
 AREA_GROUPS = [("Core runtime", ("kernelx", "xcl run", "Runtime", "VFS", "TLS", "PE loader", "Memory")),
                ("Tooling", ("Scripts", "CI", "README", "Docs"))]
@@ -90,7 +92,7 @@ def group_of(area):
 
 
 def area_label(area):
-    return OTHER_LABEL if area == OTHER else area
+    return area
 
 
 def title_prefix_area(title):
@@ -152,30 +154,22 @@ def hot_files(prs, min_prs=HOT_MIN_PRS, fraction=HOT_FRACTION):
     return {path: sorted(nums) for path, nums in touched.items() if len(nums) > limit}
 
 
-def link_reason(a, b, hot=frozenset()):
+def link_reason(a, b, hot=frozenset(), fj=FILE_JACCARD, tj=TITLE_JACCARD):
     """Why two PRs are linked, or None. Dicts need 'file_set' (set of paths) and 'title'.
     Hot files are left out of the file Jaccard, and a file link needs a shared non-hot file."""
     fa, fb = a["file_set"] - hot, b["file_set"] - hot
     fs = jaccard(fa, fb) if fa & fb else 0.0
-    if fs >= FILE_JACCARD:
+    if fs >= fj:
         return {"kind": "shared files", "score": round(fs, 2)}
     ts = jaccard(title_tokens(a["title"]), title_tokens(b["title"]))
-    if ts >= TITLE_JACCARD:
+    if ts >= tj:
         return {"kind": "similar title", "score": round(ts, 2)}
     return None
 
 
-def clusters(prs, hot=frozenset()):
-    """Connected components (size >= 2) of the link graph, with the links that explain them.
-
-    prs: dicts with number, title, files (list of {path,...}). Returns a list of
-    {"members": [numbers], "links": [{"a","b","kind","score"}]}, largest first."""
-    items = []
-    for p in prs:
-        q = dict(p)
-        q["file_set"] = frozenset(f["path"] for f in p.get("files", []))
-        items.append(q)
-    parent = list(range(len(items)))
+def _components(items, idx, hot, fj, tj):
+    """[(member indexes, [(i, j, reason)])] of the connected components (size >= 2) of the link graph over items[idx]."""
+    parent = {i: i for i in idx}
 
     def find(i):
         while parent[i] != i:
@@ -184,23 +178,47 @@ def clusters(prs, hot=frozenset()):
         return i
 
     links = []
-    for i in range(len(items)):
-        for j in range(i + 1, len(items)):
-            r = link_reason(items[i], items[j], hot)
+    for x, i in enumerate(idx):
+        for j in idx[x + 1:]:
+            r = link_reason(items[i], items[j], hot, fj, tj)
             if r:
                 links.append((i, j, r))
                 parent[find(i)] = find(j)
     groups = {}
-    for i in range(len(items)):
+    for i in idx:
         groups.setdefault(find(i), []).append(i)
+    return [(g, [l for l in links if find(l[0]) == root]) for root, g in groups.items() if len(g) >= 2]
+
+
+def _split(items, idx, hot, fj, tj, max_size):
     out = []
-    for root, idx in groups.items():
-        if len(idx) < 2:
-            continue
+    for g, links in _components(items, idx, hot, fj, tj):
+        if len(g) > max_size and (fj < JACCARD_CAP or tj < JACCARD_CAP):
+            out += _split(items, g, hot, min(JACCARD_CAP, round(fj + JACCARD_STEP, 2)),
+                          min(JACCARD_CAP, round(tj + JACCARD_STEP, 2)), max_size)
+        else:
+            out.append((g, links))
+    return out
+
+
+def clusters(prs, hot=frozenset(), max_size=CLUSTER_MAX):
+    """Connected components (size >= 2) of the link graph, with the links that explain them.
+
+    A component with more than max_size members is re-split inside itself by raising the file and title Jaccard
+    thresholds by JACCARD_STEP per step (up to JACCARD_CAP) until every part has max_size members or fewer or the cap
+    is reached; parts left with one member are dropped.
+    prs: dicts with number, title, files (list of {path,...}). Returns a list of
+    {"members": [numbers], "links": [{"a","b","kind","score"}]}, largest first."""
+    items = []
+    for p in prs:
+        q = dict(p)
+        q["file_set"] = frozenset(f["path"] for f in p.get("files", []))
+        items.append(q)
+    out = []
+    for g, links in _split(items, list(range(len(items))), hot, FILE_JACCARD, TITLE_JACCARD, max_size):
         out.append({
-            "members": sorted(items[i]["number"] for i in idx),
-            "links": [{"a": items[i]["number"], "b": items[j]["number"], **r}
-                      for i, j, r in links if find(i) == root],
+            "members": sorted(items[i]["number"] for i in g),
+            "links": [{"a": items[i]["number"], "b": items[j]["number"], **r} for i, j, r in links],
         })
     out.sort(key=lambda c: (-len(c["members"]), c["members"]))
     return out
@@ -246,19 +264,59 @@ def enrich(pr, now):
     return out
 
 
-def build_analysis(prs, now):
+def closed_time(pr):
+    """When a closed or merged PR ended: mergedAt, else closedAt (None when neither is known)."""
+    return pr.get("mergedAt") or pr.get("closedAt")
+
+
+def closed_window(prs, now, days=CLOSED_DAYS):
+    """The closed or merged PRs that ended in the last `days` days, newest first (ties by number). Open PRs and PRs
+    without an end time are left out."""
+    since = now - dt.timedelta(days=days)
+    out = [p for p in prs if p.get("state") in ("MERGED", "CLOSED") and closed_time(p) and parse_time(closed_time(p)) >= since]
+    return sorted(out, key=lambda p: (-parse_time(closed_time(p)).timestamp(), p["number"]))
+
+
+def enrich_closed(pr, now):
+    out = enrich(pr, now)
+    out["merged"] = bool(pr.get("mergedAt"))
+    out["closedAgeDays"] = age_days(closed_time(pr), now)
+    return out
+
+
+def mark_superseded(cls, by_num):
+    """Clusters over open and closed PRs, for display: a cluster with no open member is dropped; one with a merged member
+    gets "merged" (those numbers, sorted) and "superseded": True. by_num: enriched PRs (closed ones carry "merged")."""
+    out = []
+    for c in cls:
+        ms = [by_num[n] for n in c["members"]]
+        if not any(p.get("state", "OPEN") == "OPEN" for p in ms):
+            continue
+        merged = sorted(p["number"] for p in ms if p.get("merged"))
+        out.append(dict(c, merged=merged, superseded=bool(merged)))
+    return out
+
+
+def build_analysis(prs, now, closed=None):
+    """closed: normalised PRs closed recently (merged or not), or None when they could not be fetched."""
     prs = [enrich(p, now) for p in prs]
     per_area = {}
     for p in prs:
         per_area.setdefault(p["primary"], []).append(p)
     hot = hot_files(prs)
     hot_set = frozenset(hot)
+    cl = None if closed is None else [enrich_closed(p, now) for p in closed_window(closed, now)]
+    everyone = prs + (cl or [])
+    hot_all = frozenset(hot_files(everyone))  # clustering runs over open and closed PRs, so hot files do too
     area_clusters = {a: clusters(ps, hot_set) for a, ps in per_area.items() if len(ps) > 1}
     area_clusters = {a: c for a, c in area_clusters.items() if c}
     return {
         "prs": prs,
         "areas": per_area,
-        "clusters": clusters(prs, hot_set),
+        "closed": cl,
+        "mergedPrs": None if cl is None else [p for p in cl if p["merged"]],
+        "clusters": mark_superseded(clusters(everyone, hot_all), {p["number"]: p for p in everyone}),
+        "clusterHot": sorted(hot_all),
         "hotFiles": [{"file": f, "count": len(n), "prs": n}
                      for f, n in sorted(hot.items(), key=lambda kv: (-len(kv[1]), kv[0]))],
         "hotThreshold": hot_threshold(len(prs)),
@@ -482,6 +540,10 @@ def state_pills(p):
     return "".join(out)
 
 
+def closed_tag(p):
+    return pill("merged", "merged") if p.get("merged") else pill("closed")
+
+
 def delta_text(d):
     if d is None:
         return '<span class="delta">no 24 h data yet</span>'
@@ -635,9 +697,9 @@ _LIGHT_SCENE = "".join("--%s:%s;" % (n, a) for n, a, _ in GRADIENT_TOKENS)
 _DARK_SCENE = "".join("--%s:%s;" % (n, b) for n, _, b in GRADIENT_TOKENS)
 _LIGHT_CAT, _DARK_CAT = category_css()
 _DARK_TOKENS = ("--page:#0e1219;--ink:#eef2f8;--soft:#a2adbc;--rule:#2a3240;--wash:#1a212c;--accent:#8ca8ff;--partial:#ffab5c;--partial-text:#ffab5c;"
-                "--empty:#39424f;--tip:#eef2f8;--tip-text:#0e1219;--tip-soft:#3a4454;--good:#b4e06a;--bad:#ff8a80;" + _DARK_SCENE + _DARK_CAT)
+                "--empty:#39424f;--tip:#eef2f8;--tip-text:#0e1219;--tip-soft:#3a4454;--good:#b4e06a;--bad:#ff8a80;--merged:#c9a3ff;" + _DARK_SCENE + _DARK_CAT)
 CSS = (":root{color-scheme:light dark;--page:#fff;--ink:#10141c;--soft:#566070;--rule:#d9dee6;--wash:#eef1f5;--accent:#1546e0;"
-       "--partial:#e8770c;--partial-text:#a94f00;--empty:#c9cfd9;--tip:#10141c;--tip-text:#fff;--tip-soft:#d7dce4;--good:#456b12;--bad:#c4261d;"
+       "--partial:#e8770c;--partial-text:#a94f00;--merged:#7a45d6;--empty:#c9cfd9;--tip:#10141c;--tip-text:#fff;--tip-soft:#d7dce4;--good:#456b12;--bad:#c4261d;"
        + _LIGHT_SCENE + _LIGHT_CAT + "}\n"
        "@media (prefers-color-scheme:dark){:root:not([data-theme=light]){" + _DARK_TOKENS + "}}\n"
        ":root[data-theme=dark]{color-scheme:dark;" + _DARK_TOKENS + "}\n:root[data-theme=light]{color-scheme:light}\n") + """
@@ -693,7 +755,7 @@ h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:
 .chart .dot{stroke:none}.b-new{fill:var(--accent)}.b-closed{fill:var(--good)}
 .legend{display:flex;flex-wrap:wrap;gap:2px 14px;font-size:13px;line-height:1.3;color:var(--soft)}
 .legend li{display:flex;align-items:center;gap:6px}.sw{display:inline-block;width:8px;height:8px}
-.sw.s-open,.sw.b-new,.sw.k-rev{background:var(--accent)}.sw.s-unrev,.sw.k-wait{background:var(--partial)}.sw.b-closed,.sw.k-done{background:var(--good)}.sw.k-draft{background:var(--soft)}
+.sw.s-open,.sw.b-new,.sw.k-rev{background:var(--accent)}.sw.s-unrev,.sw.k-wait{background:var(--partial)}.sw.b-closed,.sw.k-done{background:var(--good)}.sw.k-draft{background:var(--soft)}.sw.k-merged{background:var(--merged)}
 .empty{margin:8px 0 0}
 .empty-block{margin:8px 0 4px;padding:20px 0;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);color:var(--soft);font:700 16px/1.2 "Roboto Condensed",Arial,sans-serif;text-transform:uppercase;letter-spacing:.04em}
 .road{display:grid;grid-template-columns:repeat(5,minmax(max-content,1fr));gap:3px;flex:1;min-height:92px}
@@ -701,7 +763,7 @@ h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:
 .step b{font-size:22px;line-height:1}.step>span{font-size:12px;font-weight:500;white-space:nowrap}.step small{color:var(--soft);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .step.on{border-bottom-color:var(--sc)}
 .pips{display:flex;gap:2px}.pips i{display:block;flex:1;max-width:9px;height:7px;background:var(--empty)}.pips i.on{background:var(--sc)}
-.st-axis,.st{display:grid;grid-template-columns:22px minmax(128px,1fr) minmax(40px,72px) 68px;gap:0 8px;align-items:center}
+.st-axis,.st{display:grid;grid-template-columns:22px minmax(128px,1fr) minmax(24px,72px) 68px;gap:0 8px;align-items:center}
 .st-axis{position:sticky;top:0;z-index:1;padding:0 4px 4px 2px;background:var(--page);color:var(--soft);font-size:13px;line-height:1.2}
 .st-axis span:last-child{text-align:right}
 .st-list{overflow-y:auto;min-height:0;flex:1;max-height:420px}
@@ -717,10 +779,10 @@ h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:
 .ptype{display:inline-flex;align-items:center;gap:6px;color:var(--ink);font-weight:500;min-width:0}
 .ptype{max-width:100%}.ptype .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.ptype i{display:block;flex:none;width:8px;height:8px;background:var(--ac)}
 .track{display:block;height:12px;background:var(--wash)}.fill{display:flex;height:100%}.fill i{display:block;min-width:2px}
-.fill .draft{background:var(--soft)}.fill .wait{background:var(--partial)}.fill .rev{background:var(--accent)}.fill .done{background:var(--good)}
+.fill .draft{background:var(--soft)}.fill .wait{background:var(--partial)}.fill .rev{background:var(--accent)}.fill .done{background:var(--good)}.fill .merged{background:var(--merged)}
 .where{display:grid;justify-items:end;gap:2px;color:var(--soft)}.where b{font:700 16px/1 "Roboto Condensed",Arial,sans-serif;color:var(--ink)}
 .spark{display:block;width:100%;height:20px}.spline{vector-effect:non-scaling-stroke;fill:none;stroke:var(--soft);stroke-width:1.5;stroke-linejoin:round}.nodata{font-size:12px;color:var(--soft);white-space:nowrap}
-.tabs{display:none;gap:14px}.js .tabs{display:flex}
+.tabs{display:none;gap:14px;flex-wrap:wrap;min-width:0}.js .tabs{display:flex}
 .tabs button{padding:0 0 2px;border:0;border-bottom:2px solid transparent;background:none;color:var(--soft);font:700 16px/1.2 "Roboto Condensed",Arial,sans-serif;cursor:pointer;border-radius:0}
 .tabs button:hover{color:var(--ink)}.tabs button[aria-pressed=true]{border-bottom-color:var(--partial);color:var(--ink)}
 .feed-body{overflow:auto;min-height:0;flex:1;max-height:640px}
@@ -735,7 +797,7 @@ h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:
 .av{width:20px;height:20px;background:var(--wash);color:transparent;overflow:hidden;flex:none}
 .pill{display:inline-flex;align-items:center;gap:4px;font-size:13px;line-height:1.3;white-space:nowrap;font-weight:500;color:var(--soft)}
 .pill:before{content:"";width:7px;height:7px;background:currentColor;flex:none}
-.pill.ok{color:var(--good)}.pill.bad{color:var(--bad)}.pill.warn{color:var(--partial-text)}.pill.accent{color:var(--accent)}
+.pill.ok{color:var(--good)}.pill.bad{color:var(--bad)}.pill.warn{color:var(--partial-text)}.pill.accent{color:var(--accent)}.pill.merged{color:var(--merged)}
 .add{color:var(--good)}.del{color:var(--bad)}
 .dup{padding:0 0 12px 12px;margin-bottom:12px;border-left:4px solid var(--ac);border-bottom:1px solid var(--rule)}
 .dup .chead{display:flex;flex-wrap:wrap;justify-content:space-between;gap:2px 12px;align-items:baseline}
@@ -785,7 +847,7 @@ h1{font-size:clamp(15px,1.5vw,20px)}h2{font-size:clamp(13px,calc(var(--fs) + 1px
 .road{flex:none;min-height:0;grid-template-columns:repeat(5,minmax(0,1fr))}
 .step{flex-direction:row;flex-wrap:wrap;align-items:baseline;justify-content:flex-start;gap:0 8px;padding:clamp(3px,.7vh,7px) 6px;overflow:hidden}.step .pips{display:none}.step b{font-size:clamp(15px,2.7vh,22px)}
 .step>span{font-size:var(--fs-s);white-space:normal}
-.st-axis,.st{grid-template-columns:clamp(14px,1.6vw,22px) minmax(60px,1fr) minmax(28px,.7fr) clamp(46px,5vw,68px)}
+.st-axis,.st{grid-template-columns:clamp(14px,1.6vw,22px) minmax(118px,1.6fr) minmax(24px,.4fr) clamp(46px,5vw,68px)}
 .st{min-height:clamp(34px,5vh,44px);padding-top:clamp(3px,.6vh,6px);padding-bottom:clamp(3px,.6vh,6px)}
 .rank{font-size:clamp(13px,var(--fs),16px)}.who b{font-size:var(--fs)}
 .st-list,.feed-body{max-height:none;overflow-y:auto}
@@ -831,7 +893,7 @@ tabs.forEach(function(b){b.addEventListener('click',function(){showTab(b.getAttr
 var F=d.getElementById('filters');
 var rows=[].slice.call(d.querySelectorAll('.pr')),groups=[].slice.call(d.querySelectorAll('details.area')),
 q=d.getElementById('q'),sel=d.getElementById('area'),res=d.getElementById('result'),segs=F?[].slice.call(F.querySelectorAll('.seg button')):[];
-var st={q:'',area:'',state:''},STATES=['unrev','done','draft'];
+var st={q:'',area:'',state:''},STATES=['unrev','done','draft','closed'];
 function dec(s){try{return decodeURIComponent(s.replace(/\\+/g,' '))}catch(e){return ''}}
 function opt(v){if(!sel||!v)return null;for(var i=0;i<sel.options.length;i++)if(sel.options[i].value===v)return sel.options[i];return null;}
 function parse(){st={q:'',area:'',state:''};var tt='';
@@ -845,15 +907,18 @@ if(st.state)p.push('state='+st.state);if(tab!=='dup')p.push('tab='+tab);
 history.replaceState(null,'',p.length?'#'+p.join('&'):location.pathname+location.search);}
 function areaOk(r){if(!st.area)return true;var a=r.getAttribute('data-area'),o=opt(st.area),m=o&&o.getAttribute('data-members');
 return m?(','+m+',').indexOf(','+a+',')>=0:a===st.area;}
-function apply(){var t=st.q.toLowerCase().trim(),f=on(),shown=0;
-rows.forEach(function(r){var ok=(!t||r.getAttribute('data-q').indexOf(t)>=0)&&areaOk(r)&&(!st.state||r.getAttribute('data-'+st.state)==='1');
+function isCl(r){return r.getAttribute('data-closed')==='1';}
+function apply(){var t=st.q.toLowerCase().trim(),f=on(),shown=0,wc=st.state==='closed',pool=0;
+rows.forEach(function(r){var k=isCl(r)===wc;if(k)pool++;
+var ok=k&&(!t||r.getAttribute('data-q').indexOf(t)>=0)&&areaOk(r)&&(!st.state||wc||r.getAttribute('data-'+st.state)==='1');
 r.hidden=!ok;if(ok)shown++;});
-groups.forEach(function(g){var n=g.querySelectorAll('.pr:not([hidden])').length,c=g.querySelector('.cnt'),tot=g.querySelectorAll('.pr').length;
+groups.forEach(function(g){var n=g.querySelectorAll('.pr:not([hidden])').length,c=g.querySelector('.cnt'),tot=0;
+[].forEach.call(g.querySelectorAll('.pr'),function(r){if(isCl(r)===wc)tot++;});
 g.hidden=n===0;if(f)g.open=n>0;if(c)c.textContent=f?n+' of '+tot:String(tot);});
 segs.forEach(function(b){b.setAttribute('aria-pressed',String(b.getAttribute('data-state')===st.state));});
-if(res)res.textContent=f?shown+' of '+rows.length:'';
-var allp=d.querySelector('.panel[data-panel=all]');if(allp&&f)allp.setAttribute('data-meta','Showing '+shown+' of '+rows.length);
-else if(allp)allp.setAttribute('data-meta',rows.length+' pull requests');
+if(res)res.textContent=f?shown+' of '+pool:'';
+var allp=d.querySelector('.panel[data-panel=all]');if(allp&&f)allp.setAttribute('data-meta','Showing '+shown+' of '+pool);
+else if(allp)allp.setAttribute('data-meta',pool+' pull requests');
 showTab(tab);}
 function sync(){if(q)q.value=st.q;if(sel)sel.value=st.area;apply();}
 function changed(){if(on())tab='all';write();apply();}
@@ -918,7 +983,9 @@ def cat_style(area):
 # ---- top areas and the effort map
 
 TOP_AREAS = 7
-ELSE_NAME = "Everything else"
+ELSE_NAME = "Other"     # the rolled-up tower and row; the unmapped-path area is labelled the same
+ROLLUP_SLUG = "group-other"   # select value of the rolled-up entry: "area-other" is the unmapped-path area
+MERGED_LABEL = "Merged in %d d" % CLOSED_DAYS
 SCENE_CAP = 40          # tallest tower in layers; above it the layers are scaled
 SCENE_W, SCENE_H = 720, 520   # viewBox of the static SVG
 SCENE_YAW = -22.0       # degrees, fixed angle of the SVG and centre of the canvas pan
@@ -931,64 +998,89 @@ SCENE_MX, SCENE_MY = 2.2, 1.8     # ground plate margin around the tower row, in
 SCENE_GHOST = ("wait", "draft")   # layers not reviewed yet are drawn as ghost voxels
 SCENE_ROWS = (16, 70)   # first text baseline of the upper and lower label rows
 SCENE_BAND_BOTTOM = 106  # bottom of the lower label row
+SCENE_LINE = 15         # extra height of the callouts for the "merged / closed" line (when closed PRs are known)
 CHART_W, CHART_H = 280, 150   # viewBox of the trend charts: close to their usual box, so the text keeps its size
-SCENE_STATES = [("done", "Looks done", "--good"), ("rev", "Reviewed", "--accent"),
+SCENE_STATES = [("merged", MERGED_LABEL, "--merged"), ("done", "Looks done", "--good"), ("rev", "Reviewed", "--accent"),
                 ("wait", "Waiting for review", "--partial"), ("draft", "Draft", "--soft")]
 
 
+def entry_slug(e):
+    return ROLLUP_SLUG if e.get("rollup") else slug(e["name"])
+
+
 def top_areas(an, n=TOP_AREAS):
-    """The n groups or ungrouped areas with the most open PRs (ties by name) as [{"name", "prs", "members"}], plus one
-    rolled-up "Everything else" entry (members = the areas in it, sorted like the area ranking) when there are more
-    than n. members is None for an ungrouped area and the member areas that have open PRs for a group."""
-    by_key = {}
-    for a in an["areas"]:
+    """The n groups or ungrouped areas with the most open PRs (ties by merged, closed, then name) as
+    [{"name", "prs", "merged", "closed", "members"}], plus one rolled-up "Other" entry (rollup True, members = the areas
+    in it, sorted like the area ranking) when there are more than n. prs = open PRs; merged and closed = PRs merged and
+    closed without a merge in the last CLOSED_DAYS days (an["closed"], empty when unknown). members is None for an
+    ungrouped area and the member areas that have open or closed PRs for a group."""
+    closed = an.get("closed") or []
+    by_key, m_of, c_of = {}, {}, {}
+    seen = set(an["areas"]) | {p["primary"] for p in closed}
+    for a in seen:
         by_key.setdefault(group_of(a), []).append(a)
+    for p in closed:
+        (m_of if p.get("merged") else c_of).setdefault(p["primary"], []).append(p)
     grouped = {name for name, _ in AREA_GROUPS}
-    rank = lambda a: (-len(an["areas"][a]), a)
+    rank = lambda a: (-len(an["areas"].get(a, [])), -len(m_of.get(a, [])), -len(c_of.get(a, [])), a)
     entries = []
     for key, areas in by_key.items():
         areas = sorted(areas, key=rank)
-        entries.append({"name": key, "prs": [p for a in areas for p in an["areas"][a]],
+        entries.append({"name": key, "prs": [p for a in areas for p in an["areas"].get(a, [])],
+                        "merged": [p for a in areas for p in m_of.get(a, [])], "closed": [p for a in areas for p in c_of.get(a, [])],
                         "members": areas if key in grouped else None})
-    entries.sort(key=lambda e: (-len(e["prs"]), e["name"]))
-    out, rest = entries[:n], entries[n:]
+    entries.sort(key=lambda e: (-len(e["prs"]), -len(e["merged"]), -len(e["closed"]), e["name"]))
+    # the unmapped-path area is never a tower of its own: it always rolls into "Other"
+    unmapped = [e for e in entries if e["name"] == OTHER]
+    entries = [e for e in entries if e["name"] != OTHER]
+    out, rest = entries[:n], entries[n:] + unmapped
     if rest:
         members = sorted((a for e in rest for a in (e["members"] or [e["name"]])), key=rank)
-        out.append({"name": ELSE_NAME, "prs": [p for e in rest for p in e["prs"]], "members": members})
+        out.append({"name": ELSE_NAME, "rollup": True, "prs": [p for e in rest for p in e["prs"]],
+                    "merged": [p for e in rest for p in e["merged"]], "closed": [p for e in rest for p in e["closed"]],
+                    "members": members})
     return out
 
 
 def effort_scene(an, n=TOP_AREAS, cap=SCENE_CAP):
-    """Tower data for the effort map: one tower per top_areas entry, layers bottom to top (looks done, reviewed,
-    waiting, draft), h = voxel layers of a run. Above cap layers for the tallest tower, h is scaled by cap/tallest
-    (every non-empty run keeps at least one layer) and per = open PRs per layer is stated in the caption."""
+    """Tower data for the effort map: one tower per top_areas entry, layers bottom to top (merged in the last
+    CLOSED_DAYS days, looks done, reviewed, waiting, draft), h = voxel layers of a run. Above cap layers for the tallest
+    tower, h is scaled by cap/tallest (every non-empty run keeps at least one layer) and per = PRs per layer is stated in
+    the caption. Closed PRs that were not merged are counted in the callout (closed) but not stacked. hasClosed is False
+    when the closed PRs could not be fetched."""
     entries = top_areas(an, n)
-    tallest = max([len(e["prs"]) for e in entries] or [0])
+    has_closed = an.get("closed") is not None
+    tallest = max([len(e["prs"]) + len(e["merged"]) for e in entries] or [0])
     factor = cap / tallest if tallest > cap else 1.0
     towers = []
     for e in entries:
         ps = e["prs"]
         layers = []
         for k, label, _ in SCENE_STATES:
-            c = sum(bucket(p) == k for p in ps)
+            c = len(e["merged"]) if k == "merged" else sum(bucket(p) == k for p in ps)
             if c:
                 layers.append({"k": k, "label": label, "n": c, "ghost": k in SCENE_GHOST,
                                "h": c if factor == 1.0 else max(1, round(c * factor))})
         towers.append({"name": area_label(e["name"]), "members": e["members"] or [], "open": len(ps),
+                       "merged": len(e["merged"]), "closed": len(e["closed"]),
                        "unreviewed": sum(bool(p["unreviewed"]) for p in ps),
                        "add": sum(p.get("additions", 0) for p in ps), "del": sum(p.get("deletions", 0) for p in ps),
                        "layers": layers, "height": sum(ly["h"] for ly in layers)})
     per = tallest / cap if factor != 1.0 else 1.0
+    noun = "PR" if any(t["merged"] for t in towers) else "open PR"
     if not towers:
         caption = ""
     elif factor == 1.0:
-        caption = "One layer is one open PR."
+        caption = "One layer is one %s." % noun
     else:
-        caption = "One layer is about %s open PRs: the layers are scaled so the tallest tower fits in %d." % (
-            ("%.1f" % per).rstrip("0").rstrip("."), cap)
+        caption = "One layer is about %s %ss: the layers are scaled so the tallest tower fits in %d." % (
+            ("%.1f" % per).rstrip("0").rstrip("."), noun, cap)
     if caption:
-        caption += " Solid layers have moved forward (looks done, reviewed); outlined ghost layers still wait for review or are drafts."
-    return {"towers": towers, "scale": factor, "per": per, "cap": cap, "caption": caption}
+        caption += " Solid layers have moved forward (%slooks done, reviewed); outlined ghost layers still wait for review or are drafts." % (
+            "merged, " if has_closed else "")
+        if has_closed:
+            caption += " The violet base is the PRs merged in the last %d days; closed PRs that were not merged are not stacked." % CLOSED_DAYS
+    return {"towers": towers, "scale": factor, "per": per, "cap": cap, "caption": caption, "hasClosed": has_closed}
 
 
 def scene_plate(n):
@@ -1009,13 +1101,21 @@ def clamp_yaw(deg, yaw=SCENE_YAW, arc=SCENE_ARC):
 
 def scene_summary(scene):
     ts = scene["towers"]
+    hc = scene.get("hasClosed")
     return "Effort map, open pull requests per area: " + "; ".join(
-        "%s %d open, %d unreviewed" % (t["name"], t["open"], t["unreviewed"]) for t in ts) + "."
+        "%s %d open, %d unreviewed%s" % (t["name"], t["open"], t["unreviewed"],
+                                          ", " + merged_line(t) if hc else "") for t in ts) + "."
+
+
+def merged_line(t, short=False):
+    """The callout line for the closed PRs of a tower, e.g. "3 merged \u00b7 2 closed (7 d)"."""
+    return "%d merged \u00b7 %d closed%s" % (t["merged"], t["closed"], "" if short else " (%d d)" % CLOSED_DAYS)
 
 
 def scene_json(scene):
     """Inline JSON for the canvas renderer; every '<' is escaped so nothing can close the script block."""
-    data = {"towers": scene["towers"], "per": scene["per"], "caption": scene["caption"],
+    data = {"towers": scene["towers"], "per": scene["per"], "caption": scene["caption"], "hasClosed": bool(scene.get("hasClosed")),
+            "days": CLOSED_DAYS,
             "states": [{"k": k, "label": lb, "v": v, "ghost": k in SCENE_GHOST} for k, lb, v in SCENE_STATES],
             "geom": {"w": TOWER_CELLS, "pitch": TOWER_PITCH, "sx": SCENE_SX, "py": SCENE_PY, "yaw": SCENE_YAW,
                      "arc": SCENE_ARC, "idle": SCENE_IDLE, "zoom": SCENE_ZOOM, "gx": scene_plate(len(scene["towers"]))[0],
@@ -1065,7 +1165,9 @@ def scene_svg(scene):
     xs = [(i - (n - 1) / 2.0) * TOWER_PITCH for i in range(n)]
     gx, gy = scene_plate(n)
     maxl = max([t["height"] for t in ts] or [0])
-    pad, band_bottom = 12, SCENE_BAND_BOTTOM
+    extra = SCENE_LINE if scene.get("hasClosed") else 0
+    rows = (SCENE_ROWS[0], SCENE_ROWS[1] + extra)
+    pad, band_bottom = 12, SCENE_BAND_BOTTOM + extra
     ground = [(-gx, -gy), (gx, -gy), (gx, gy), (-gx, gy)]
 
     def bbox(k, lh):
@@ -1159,23 +1261,30 @@ def scene_svg(scene):
         l2_s = "%d open \u00b7 %d unrev." % (t["open"], t["unreviewed"])
         if len(l2) * 6.4 > room:
             l2 = l2_s
-        w = max(len(shown) * 7.8, len(l2) * 6.4)
-        y0 = SCENE_ROWS[1] if low else SCENE_ROWS[0]
+        l4 = ""
+        if extra:
+            l4 = merged_line(t)
+            if len(l4) * 6.4 > room:
+                l4 = merged_line(t, True)
+        w = max(len(shown) * 7.8, len(l2) * 6.4, len(l4) * 6.4)
+        y0 = rows[1] if low else rows[0]
         x = min(max(ra, cs[i] - 18), rb - w) if low else ra
         x = max(ra, x) if low else x
         tx, ty = tops[i]
         if low:
             xe = min(max(cs[i], x + 4), x + w - 4)
-            pts = "%.1f,%.1f %.1f,%d" % (tx, ty - 3, xe, y0 + 36)
+            pts = "%.1f,%.1f %.1f,%d" % (tx, ty - 3, xe, y0 + 36 + extra)
         else:
             pts = "%.1f,%.1f %.1f,%d %.1f,%d" % (tx, ty - 3, cs[i], band_bottom + 8, cs[i], y0 - 11)
-        o.append('<g class="callout"><title>%s</title><polyline points="%s"/><rect class="co-bg" x="%.1f" y="%d" width="%.1f" height="48"/>' % (
-            esc("%s: %d open, %d unreviewed" % (name, t["open"], t["unreviewed"])), pts, x - 4, y0 - 13, w + 8))
+        o.append('<g class="callout"><title>%s</title><polyline points="%s"/><rect class="co-bg" x="%.1f" y="%d" width="%.1f" height="%d"/>' % (
+            esc("%s: %d open, %d unreviewed%s" % (name, t["open"], t["unreviewed"], ", " + merged_line(t) if extra else "")),
+            pts, x - 4, y0 - 13, w + 8, 48 + extra))
         o.append('<text x="%.1f" y="%d"><tspan class="co-nm" x="%.1f">%s</tspan>'
                  '<tspan class="co-n" x="%.1f" dy="16"><tspan class="co-num">%d</tspan><tspan class="co-w"> open</tspan>'
                  '<tspan class="co-sub">%s</tspan></tspan>'
-                 '<tspan class="co-sub" x="%.1f" dy="15"><tspan class="add">+%s</tspan> <tspan class="del">\u2212%s</tspan></tspan></text></g>' % (
-                     x, y0, x, esc(shown), x, t["open"], esc(l2[len("%d open" % t["open"]):]), x, _short(t["add"]), _short(t["del"])))
+                 '<tspan class="co-sub" x="%.1f" dy="15"><tspan class="add">+%s</tspan> <tspan class="del">\u2212%s</tspan></tspan>%s</text></g>' % (
+                     x, y0, x, esc(shown), x, t["open"], esc(l2[len("%d open" % t["open"]):]), x, _short(t["add"]), _short(t["del"]),
+                     '<tspan class="co-sub" x="%.1f" dy="15">%s</tspan>' % (x, esc(l4)) if l4 else ""))
     o.append("</g></svg>")
     return "".join(o)
 
@@ -1189,7 +1298,7 @@ SCENE_CSS = """
 .scene-foot{display:flex;flex-wrap:wrap;align-items:center;gap:2px 14px;margin-top:4px}
 .plate{fill:var(--ink);fill-opacity:.07;stroke:var(--ink);stroke-opacity:.2;stroke-width:1;stroke-linejoin:round}
 .co-bg{fill:var(--surface)}
-.vx{--c:var(--ink)}.v-done{--c:var(--good)}.v-rev{--c:var(--accent)}.v-wait{--c:var(--partial)}.v-draft{--c:var(--soft)}
+.vx{--c:var(--ink)}.v-done{--c:var(--good)}.v-rev{--c:var(--accent)}.v-wait{--c:var(--partial)}.v-draft{--c:var(--soft)}.v-merged{--c:var(--merged)}
 .vx{fill:var(--c);stroke:none}
 .f-t{fill:color-mix(in srgb,var(--c) 68%,#fff)}.f-l{fill:var(--c)}.f-r{fill:color-mix(in srgb,var(--c) 66%,#000)}
 .vx.ghost{fill:var(--c);fill-opacity:.16;stroke:var(--c);stroke-width:1;stroke-linejoin:round}
@@ -1219,7 +1328,7 @@ var d=document,stage=d.getElementById('stage'),dEl=d.getElementById('scene-data'
 if(!stage||!dEl)return;
 var svg=stage.querySelector('svg'),data;
 try{data=JSON.parse(dEl.textContent);}catch(e){return;}
-var T=data.towers||[],N=T.length,S=data.states||[],G=data.geom||{};
+var T=data.towers||[],N=T.length,S=data.states||[],G=data.geom||{},HC=!!data.hasClosed,DAYS=data.days||7,EX=0;
 if(!N||!svg)return;
 var cv=d.createElement('canvas'),g=cv.getContext&&cv.getContext('2d');
 if(!g)return;
@@ -1264,7 +1373,7 @@ var r=stage.getBoundingClientRect(),w=Math.max(200,Math.round(r.width)),h=Math.m
 if(K&&w===W&&h===H&&dp===dpr)return false;
 W=w;H=h;dpr=dp;
 [cv,yl].forEach(function(c){c.width=Math.round(W*dpr);c.height=Math.round(H*dpr);});
-compact=W<=360||(W<=540&&innerWidth<900);short=!compact&&H<300;bandTop=4;bandBottom=bandTop+(compact?28:short?40:102);
+compact=W<=360||(W<=540&&innerWidth<900);short=!compact&&H<300;bandTop=4;EX=HC&&!compact&&!short?15:0;bandBottom=bandTop+(compact?28:short?40:102)+EX;
 var mh=0,a,e;for(a=0;a<Math.PI;a+=Math.PI/36){e=ext(a,1,0,true);mh=Math.max(mh,Math.abs(e[0]),Math.abs(e[1]));}
 var avail=H-bandBottom-18;K=(W-16)/(2*mh);
 for(;;){LH=K*.9;while(LH>K*.25){e=extArc(K,LH);if(e[3]-e[2]<=avail)break;LH*=.97;}if(LH>K*.25||K<3)break;K*=.97;}
@@ -1312,19 +1421,21 @@ var tops=T.map(function(t,i){var p=pj((i-(N-1)/2)*P,0,t.height);return{i:i,x:p[0
 var swd=(W-16)/N,cs=tops.map(function(o,k){return 8+(k+.5)*swd;}),L=[];
 tops.forEach(function(o,k){var t=T[o.i],c=cs[k],low=!compact&&!short&&(N-1-k)%2===0,ra,rb;
 if(compact||short){ra=c+5;rb=k+1<N?c+swd-6:W-8;}else if(low){ra=k>=1?cs[k-1]+5:8;rb=k+1<N?cs[k+1]-6:W-8;}else{ra=c+5;rb=k+2<N?cs[k+2]-6:W-8;}
-var y0=bandTop+(compact?22:low?66:12),px=ra,w=0,nm=t.name,l2,l3;
+var y0=bandTop+(compact?22:low?66+EX:12),px=ra,w=0,nm=t.name,l2,l3,l4='';
 if(compact){w=tw(x,F4,String(t.open));}
 else{nm=fitText(x,F1,t.name,rb-ra);w=tw(x,F1,nm);l2=t.open+' open · '+t.unreviewed+' unreviewed';if(tw(x,F2,l2)>rb-ra)l2=t.open+' open · '+t.unreviewed+' unrev.';
-l2=fitText(x,F2,l2,rb-ra);w=Math.max(w,tw(x,F2,l2));if(!short){l3='+'+sh(t.add)+' −'+sh(t['del']);w=Math.max(w,tw(x,F2,l3));}}
+l2=fitText(x,F2,l2,rb-ra);w=Math.max(w,tw(x,F2,l2));if(!short){l3='+'+sh(t.add)+' −'+sh(t['del']);w=Math.max(w,tw(x,F2,l3));}
+if(EX){l4=t.merged+' merged · '+t.closed+' closed (' +DAYS+' d)';if(tw(x,F3,l4)>rb-ra)l4=t.merged+' merged · '+t.closed+' closed';l4=fitText(x,F3,l4,rb-ra);w=Math.max(w,tw(x,F3,l4));}}
 if(low)px=Math.max(ra,Math.min(c-18,rb-w));
-L.push({o:o,t:t,c:c,low:low,y0:y0,x:px,w:w,nm:nm,l2:l2});});
+L.push({o:o,t:t,c:c,low:low,y0:y0,x:px,w:w,nm:nm,l2:l2,l4:l4});});
 x.beginPath();L.forEach(function(e){x.moveTo(e.o.x,e.o.y-3);
-if(e.low)x.lineTo(Math.min(Math.max(e.c,e.x+4),e.x+e.w-4),e.y0+36);else{x.lineTo(e.c,bandBottom+(compact?4:8));x.lineTo(e.c,e.y0-(compact?20:11));}});
+if(e.low)x.lineTo(Math.min(Math.max(e.c,e.x+4),e.x+e.w-4),e.y0+36+EX);else{x.lineTo(e.c,bandBottom+(compact?4:8));x.lineTo(e.c,e.y0-(compact?20:11));}});
 x.strokeStyle=col.ink;x.lineWidth=1;x.stroke();
-L.forEach(function(e){var t=e.t,bh=compact?26:short?34:48;x.fillStyle=col.surface;x.fillRect(e.x-4,e.y0-13,e.w+8,bh);labelHits.push({x:e.x,y:e.y0-12,w:e.w,h:compact?26:short?34:48,i:e.o.i});
+L.forEach(function(e){var t=e.t,bh=compact?26:short?34:48+EX;x.fillStyle=col.surface;x.fillRect(e.x-4,e.y0-13,e.w+8,bh);labelHits.push({x:e.x,y:e.y0-12,w:e.w,h:bh,i:e.o.i});
 if(compact){x.font=F4;txt(x,String(t.open),e.x,e.y0,col.ink);return;}
 x.font=F1;txt(x,e.nm,e.x,e.y0,col.ink);x.font=F2;txt(x,e.l2,e.x,e.y0+16,col.ink);
-if(short)return;x.font=F3;var pl='+'+sh(t.add);txt(x,pl,e.x,e.y0+31,col.good);txt(x,'−'+sh(t['del']),e.x+tw(x,F3,pl+' '),e.y0+31,col.bad);});}
+if(short)return;x.font=F3;var pl='+'+sh(t.add);txt(x,pl,e.x,e.y0+31,col.good);txt(x,'−'+sh(t['del']),e.x+tw(x,F3,pl+' '),e.y0+31,col.bad);
+if(e.l4)txt(x,e.l4,e.x,e.y0+46,col.ink);});}
 function buildScene(){sceneDirty=false;sceneYaw=yaw;hits=[];order();
 var x=lx;x.setTransform(1,0,0,1,0,0);x.clearRect(0,0,yl.width,yl.height);
 drawGround(x);
@@ -1358,7 +1469,7 @@ for(i=hits.length-1;i>=0;i--){var h=hits[i],b=h.bb;if(p[0]<b[0]||p[0]>b[2]||p[1]
 var lab=null;if(!f)for(var j=0;j<labelHits.length;j++){var L=labelHits[j];if(p[0]>=L.x&&p[0]<=L.x+L.w&&p[1]>=L.y&&p[1]<=L.y+L.h){lab=T[L.i];break;}}
 var ch=(f?f.t:-1)!==(hover?hover.t:-1)||(f?f.l:-1)!==(hover?hover.l:-1);hover=f?{t:f.t,l:f.l}:null;
 if(f&&tip){var t=T[f.t],ly=t.layers[f.l];tip.textContent=t.name+' · '+ly.label.toLowerCase()+' · '+ly.n+' PR'+(ly.n===1?'':'s');tip.hidden=false;place(e);}
-else if(lab&&tip){tip.textContent=lab.name+' · '+lab.open+' open · '+lab.unreviewed+' unreviewed';tip.hidden=false;place(e);}
+else if(lab&&tip){tip.textContent=lab.name+' · '+lab.open+' open · '+lab.unreviewed+' unreviewed'+(HC?' · '+lab.merged+' merged · '+lab.closed+' closed ('+DAYS+' d)':'');tip.hidden=false;place(e);}
 else if(tip)tip.hidden=true;if(ch)sched();}
 cv.addEventListener('pointerdown',function(e){drag={x:e.clientX};auto=false;if(cv.setPointerCapture)try{cv.setPointerCapture(e.pointerId);}catch(x){}});
 cv.addEventListener('pointermove',function(e){inside=true;if(drag){yaw=clampYaw(yaw+(e.clientX-drag.x)*.01);drag.x=e.clientX;hover=null;if(tip)tip.hidden=true;sched();}else pick(e);});
@@ -1384,9 +1495,11 @@ readColors();layout();sched();
 def render_html(an, repo, now, hist=None):
     hist = hist or []
     prs = an["prs"]
-    by_num = {p["number"]: p for p in prs}
-    hot_set = {h["file"] for h in an["hotFiles"]}
-    areas = sorted(an["areas"], key=lambda a: (-len(an["areas"][a]), a))
+    closed = an.get("closed")
+    has_closed = closed is not None
+    by_num = {p["number"]: p for p in prs + (closed or [])}
+    hot_set = set(an["clusterHot"]) if "clusterHot" in an else {h["file"] for h in an["hotFiles"]}
+    areas = sorted(set(an["areas"]) | {p["primary"] for p in closed or []}, key=lambda a: (-len(an["areas"].get(a, [])), a))
     top = top_areas(an)
     scene = effort_scene(an)
     n_open, n_un, n_dr = len(prs), sum(p["unreviewed"] for p in prs), sum(bool(p["isDraft"]) for p in prs)
@@ -1410,15 +1523,15 @@ def render_html(an, repo, now, hist=None):
             area_opts.append('<option value="%s">%s (%d)</option>' % (esc(slug(e["name"])), esc(area_label(e["name"])), len(e["prs"])))
             continue
         area_opts.append('<optgroup label="%s"><option value="%s" data-members="%s">All %s (%d)</option>%s</optgroup>' % (
-            esc(e["name"]), esc(slug(e["name"])), esc(",".join(slug(m) for m in e["members"])), esc(e["name"]), len(e["prs"]),
-            "".join('<option value="%s">%s (%d)</option>' % (esc(slug(m)), esc(area_label(m)), len(an["areas"][m])) for m in e["members"])))
+            esc(e["name"]), esc(entry_slug(e)), esc(",".join(slug(m) for m in e["members"])), esc(e["name"]), len(e["prs"]),
+            "".join('<option value="%s">%s (%d)</option>' % (esc(slug(m)), esc(area_label(m)), len(an["areas"].get(m, []))) for m in e["members"])))
     toolbar = ('<div class="toolbar" id="filters" role="search"><label class="vh" for="q">Search pull requests</label>'
                '<input id="q" type="search" placeholder="Search title, number, author or path" autocomplete="off">'
                '<label class="vh" for="area">Area</label><select id="area">%s</select>'
                '<div class="seg" role="group" aria-label="State">%s</div><span class="result" id="result" role="status"></span></div>' % (
                    "".join(area_opts),
                    "".join('<button type="button" data-state="%s" aria-pressed="%s">%s</button>' % (k, "true" if not k else "false", n)
-                           for k, n in (("", "All"), ("unrev", "Unreviewed"), ("done", "Ready"), ("draft", "Draft")))))
+                           for k, n in (("", "All"), ("unrev", "Unreviewed"), ("done", "Ready"), ("draft", "Draft"), ("closed", "Closed")))))
     o.append("<!doctype html><html lang=en><head><meta charset=utf-8>"
              "<meta name=viewport content='width=device-width,initial-scale=1'>"
              "<title>PR scan: %s</title>"
@@ -1441,10 +1554,10 @@ def render_html(an, repo, now, hist=None):
         cap = "Effort map. One tower per area, layer by PR. " + scene["caption"]
         o.append('<div class="stage" id="stage">%s</div><div class="scene-foot">%s<p class="scene-cap" title="%s"><b>Effort map.</b> One tower per area, layer by PR. %s</p></div>'
                  '<ol class="scene-key">%s</ol><script type="application/json" id="scene-data">%s</script>' % (
-                     scene_svg(scene), legend([(n, "k-" + k) for k, n, _ in SCENE_STATES]), esc(cap), esc(scene["caption"]),
-                     "".join('<li>%s<small>%d open</small></li>' % (
+                     scene_svg(scene), legend([(n, "k-" + k) for k, n, _ in SCENE_STATES if has_closed or k != "merged"]), esc(cap), esc(scene["caption"]),
+                     "".join('<li>%s<small>%d open%s</small></li>' % (
                          ptype(t["name"]) if not t["members"] else '<span class="ptype" style="--ac:var(--soft)"><i></i><span class="nm">%s</span></span>' % esc(t["name"]),
-                         t["open"]) for t in scene["towers"]), scene_json(scene)))
+                         t["open"], " &middot; %d merged" % t["merged"] if has_closed else "") for t in scene["towers"]), scene_json(scene)))
     else:
         o.append('<p class="empty-block">No data yet</p><p class="sec-note">The effort map needs at least one open pull request.</p>')
     o.append("</div></section>")
@@ -1477,34 +1590,40 @@ def render_html(an, repo, now, hist=None):
 
     # ---- standings: areas ranked by open PRs
     spark_hist = window(hist, now, SPARK_DAYS)
-    biggest = max([len(e["prs"]) for e in top] or [1])
+    biggest = max([len(e["prs"]) + len(e["merged"]) for e in top] or [1])
     o.append('<section class="a-standings" aria-label="Areas"><div class="head"><h2>By area</h2><span>top %d by open PRs, line = %dd</span></div>'
              '<div style="margin-bottom:8px">%s</div><div class="st-list"><div class="st-axis" aria-hidden="true"><span>#</span><span>Area</span>'
-             '<span>State mix</span><span>Open</span></div><ol>' % (TOP_AREAS, SPARK_DAYS, legend([(n, "k-" + k) for k, n in BUCKETS])))
+             '<span>State mix</span><span>Open</span></div><ol>' % (TOP_AREAS, SPARK_DAYS, legend([(n, "k-" + k) for k, n in BUCKETS] + ([(MERGED_LABEL, "k-merged")] if has_closed else []))))
     for i, e in enumerate(top, 1):
         a, ps, members = e["name"], e["prs"], e["members"]
         cnt = {k: sum(bucket(p) == k for p in ps) for k, _ in BUCKETS}
+        nm = len(e["merged"])
         segs = "".join('<i class="%s" style="flex:%d" data-tip="%s" title="%s"></i>' % (
-            k, cnt[k], esc("%s: %d" % (n, cnt[k])), esc("%s: %d" % (n, cnt[k]))) for k, n in BUCKETS if cnt[k])
+            k, c, esc("%s: %d" % (n, c)), esc("%s: %d" % (n, c))) for k, n, c in
+            [(k, n, cnt[k]) for k, n in BUCKETS] + [("merged", MERGED_LABEL, nm)] if c)
         ma = members or [a]
         series = downsample([sum(s["areas"].get(m, 0) for m in ma) for s in spark_hist if s["open"] == 0 or s["areas"]], 48)
         who = (ptype(a, link=True) if not members else '<span class="ptype" style="--ac:var(--soft)" title="%s"><i></i><span class="nm">%s</span></span>' % (
             esc(", ".join(area_label(m) for m in members)), esc(a)))
         sub = (" · ".join("%d %s" % (cnt[k], n.lower()) for k, n in BUCKETS if cnt[k]) if not members else
-               "%d areas: %s" % (len(members), ", ".join(area_label(m) for m in members)))
+               "%d area%s: %s" % (len(members), "" if len(members) == 1 else "s", ", ".join(area_label(m) for m in members)))
+        if has_closed:
+            sub += (" · " if sub else "") + "%d merged" % nm
         o.append('<li class="st"><span class="rank">%d</span><div class="who"><b>%s</b><small title="%s">%s</small></div>'
                  '<span class="track"><span class="fill" style="width:%.1f%%">%s</span></span>'
                  '<div class="where"><b>%d</b>%s</div></li>' % (
                      i, who, esc(sub), esc(sub),
-                     100.0 * len(ps) / biggest, segs, len(ps),
+                     100.0 * (len(ps) + nm) / biggest, segs, len(ps),
                      sparkline(series, "%s: open PRs over %d days" % (a, SPARK_DAYS))))
     o.append("</ol></div></section>")
 
     # ---- feed: tabs
     done = sorted([p for p in prs if p["looksDone"]], key=lambda p: (-p["ageDays"], p["number"]))
     metas = {"dup": "%d group%s" % (n_clusters, "" if n_clusters == 1 else "s"), "ready": "%d, oldest first" % len(done),
-             "hot": "%d file%s" % (len(an["hotFiles"]), "" if len(an["hotFiles"]) == 1 else "s"), "all": "%d pull requests" % n_open}
-    titles = [("dup", "Duplicates"), ("ready", "Ready to merge"), ("hot", "Hot files"), ("all", "All PRs")]
+             "hot": "%d file%s" % (len(an["hotFiles"]), "" if len(an["hotFiles"]) == 1 else "s"), "all": "%d pull requests" % n_open,
+             "closed": ("%d merged, %d closed, last %d days" % (len(an["mergedPrs"]), len(closed) - len(an["mergedPrs"]), CLOSED_DAYS)
+                        if has_closed else "no data yet")}
+    titles = [("dup", "Duplicates"), ("ready", "Ready to merge"), ("hot", "Hot files"), ("all", "All PRs"), ("closed", "Closed")]
     o.append('<section class="a-feed" aria-label="Pull request lists"><div class="head"><div class="tabs">%s</div><span id="tabmeta"></span></div><div class="feed-body" id="feed">' % "".join(
         '<button type="button" data-tab="%s" aria-pressed="%s">%s</button>' % (k, "true" if k == "dup" else "false", n) for k, n in titles))
 
@@ -1528,12 +1647,15 @@ def render_html(an, repo, now, hist=None):
         members = "".join(
             '<div class="row"><div class="lead">%s</div><div><div class="ttl">%s</div>'
             '<div class="sys"><span>by %s</span>%s</div></div></div>' % (
-                avatar(by_num[n]["author"]), pr_line(by_num[n]), esc(by_num[n]["author"]), state_pills(by_num[n]))
+                avatar(by_num[n]["author"]), pr_line(by_num[n]), esc(by_num[n]["author"]),
+                closed_tag(by_num[n]) if by_num[n].get("state", "OPEN") != "OPEN" else state_pills(by_num[n]))
             for n in c["members"])
+        sup = ('<p class="small sup">Possibly superseded: %s</p>' % ", ".join(
+            "%s merged" % plink(n) for n in c["merged"])) if c["superseded"] else ""
         label, label_area = cluster_label([by_num[n] for n in c["members"]])
-        dup.append('<div class="dup" style="%s"><div class="chead"><h3>%s</h3><span class="small">%s</span></div>%s%s'
+        dup.append('<div class="dup" style="%s"><div class="chead"><h3>%s</h3><span class="small">%s</span></div>%s%s%s'
                    '<p class="small">Why: %s</p></div>' % (
-                       cat_style(label_area), esc(label), esc(", ".join("#%d" % n for n in c["members"])), members,
+                       cat_style(label_area), esc(label), esc(", ".join("#%d" % n for n in c["members"])), sup, members,
                        '<div class="chips-f">%s</div>' % chips if chips else "", esc(cluster_why(c))))
     ready = ['<p class="empty-block">None</p>'] if not done else [
         '<div class="row"><div class="lead"><b>%dd</b>old</div><div><div class="ttl">%s</div><div class="sys">%s%s'
@@ -1547,25 +1669,44 @@ def render_html(an, repo, now, hist=None):
             " ".join(plink(n) for n in h["prs"][:12]) + (" +%d more" % (len(h["prs"]) - 12) if len(h["prs"]) > 12 else ""))
         for h in an["hotFiles"]]
     allp = []
+    closed_by_area = {}
+    for p in closed or []:
+        closed_by_area.setdefault(p["primary"], []).append(p)
     for a in areas:
-        ps = sorted(an["areas"][a], key=lambda p: p["number"])
+        ps = sorted(an["areas"].get(a, []), key=lambda p: p["number"])
         rows = []
         for p in ps:
             also = [x for x in p["areas"] if x != p["primary"]]
             q = " ".join([str(p["number"]), "#%d" % p["number"], p["title"], p["author"]] + [f["path"] for f in p.get("files", [])]).lower()
             rows.append(
-                '<div class="row pr" data-area="%s" data-draft="%d" data-unrev="%d" data-done="%d" data-q="%s"><div class="lead">%s</div>'
+                '<div class="row pr" data-area="%s" data-closed="0" data-draft="%d" data-unrev="%d" data-done="%d" data-q="%s"><div class="lead">%s</div>'
                 '<div><div class="ttl">%s%s</div><div class="sys">%s<span>%dd</span>'
                 '<span><span class="add">+%d</span> <span class="del">&minus;%d</span></span><span>%s files</span></div></div></div>' % (
                     esc(slug(a)), bool(p["isDraft"]), p["unreviewed"], p["looksDone"], esc(q), avatar(p["author"]),
                     pr_line(p), ' <span class="small">(also %s)</span>' % esc(", ".join(area_label(x) for x in also)) if also else "",
                     state_pills(p), p["ageDays"], p["additions"], p["deletions"], esc(pr_files_note(p))))
-        allp.append('<details class="area" id="%s"><summary>%s <span class="cnt">%d</span></summary>%s</details>' % (
-            esc(slug(a)), ptype(a), len(ps), "".join(rows)))
+        for p in closed_by_area.get(a, []):
+            q = " ".join([str(p["number"]), "#%d" % p["number"], p["title"], p["author"]] + [f["path"] for f in p.get("files", [])]).lower()
+            rows.append(
+                '<div class="row pr" hidden data-area="%s" data-closed="1" data-draft="0" data-unrev="0" data-done="0" data-q="%s">'
+                '<div class="lead"><b>%dd</b>ago</div><div><div class="ttl">%s</div><div class="sys">%s%s<span>by %s</span></div></div></div>' % (
+                    esc(slug(a)), esc(q), p["closedAgeDays"], pr_line(p), closed_tag(p), ptype(p["primary"]), esc(p["author"])))
+        allp.append('<details class="area" id="%s"%s><summary>%s <span class="cnt">%d</span></summary>%s</details>' % (
+            esc(slug(a)), "" if ps else " hidden", ptype(a), len(ps), "".join(rows)))
+    if not has_closed:
+        closed_rows = ['<p class="empty-block">No data yet</p>']
+    elif not closed:
+        closed_rows = ['<p class="empty-block">None in the last %d days</p>' % CLOSED_DAYS]
+    else:
+        closed_rows = [
+            '<div class="row cl"><div class="lead"><b>%dd</b>ago</div><div><div class="ttl">%s</div><div class="sys">%s%s<span>by %s</span></div></div></div>' % (
+                p["closedAgeDays"], pr_line(p), closed_tag(p), ptype(p["primary"]), esc(p["author"]))
+            for p in closed]
     o.append(panel("dup", "".join(dup), "Linked by changed files (Jaccard &ge; %.1f) or title words (Jaccard &ge; %.1f). Hot files are ignored." % (FILE_JACCARD, TITLE_JACCARD)))
     o.append(panel("ready", "".join(ready), "Not draft, CI green, and unreviewed or approved."))
     o.append(panel("hot", "".join(hot), "Touched by more than %g open PRs: conflict hotspots, left out of the duplicate groups." % an["hotThreshold"]))
     o.append(panel("all", "".join(allp)))
+    o.append(panel("closed", "".join(closed_rows), "Pull requests closed in the last %d days, newest first. Merged ones form the violet base of the effort map." % CLOSED_DAYS))
     o.append("</div></section>")
 
     # ---- meta strip
@@ -1586,7 +1727,7 @@ def render_html(an, repo, now, hist=None):
 def render_md(an, repo, now, hist=None):
     hist = hist or []
     prs = an["prs"]
-    by_num = {p["number"]: p for p in prs}
+    by_num = {p["number"]: p for p in prs + (an.get("closed") or [])}
 
     def plink(p):
         return "[#%d](%s)" % (p["number"], safe_url(p["url"]))
@@ -1628,7 +1769,9 @@ def render_md(an, repo, now, hist=None):
         o += ["None.", ""]
     for c in an["clusters"]:
         o += ["- " + ", ".join(plink(by_num[n]) for n in c["members"]) + " : " + md_esc(cluster_why(c))]
-        o += ["  - %s %s (%s)" % (plink(by_num[n]), md_esc(by_num[n]["title"]), md_esc(by_num[n]["primary"])) for n in c["members"]]
+        o += ["  - %s %s (%s)%s" % (plink(by_num[n]), md_esc(by_num[n]["title"]), md_esc(by_num[n]["primary"]),
+                              " [merged]" if by_num[n].get("merged") else " [closed]" if by_num[n].get("state", "OPEN") != "OPEN" else "")
+              for n in c["members"]]
     o += ["", "## Ready to merge", ""]
     done = sorted([p for p in prs if p["looksDone"]], key=lambda p: (-p["ageDays"], p["number"]))
     o += (head + [prow(p) for p in done]) if done else ["None."]
@@ -1652,7 +1795,7 @@ def render_md(an, repo, now, hist=None):
 # ---------------------------------------------------------------- I/O (queries only)
 
 PR_FIELDS = """
-number title url body isDraft createdAt updatedAt state mergedAt reviewDecision
+number title url body isDraft createdAt updatedAt state mergedAt closedAt reviewDecision
 author { login }
 labels(first: 20) { nodes { name } }
 additions deletions
@@ -1708,7 +1851,7 @@ def normalize(n):
         "number": n["number"], "title": n["title"], "url": n["url"], "body": n.get("body") or "",
         "author": (n.get("author") or {}).get("login") or "ghost",
         "isDraft": bool(n.get("isDraft")), "state": "MERGED" if n.get("mergedAt") else n.get("state", "OPEN"),
-        "createdAt": n["createdAt"], "updatedAt": n["updatedAt"], "mergedAt": n.get("mergedAt"),
+        "createdAt": n["createdAt"], "updatedAt": n["updatedAt"], "mergedAt": n.get("mergedAt"), "closedAt": n.get("closedAt"),
         "reviewDecision": n.get("reviewDecision"), "reviews": (n.get("reviews") or {}).get("totalCount", 0),
         "labels": [l["name"] for l in (n.get("labels") or {}).get("nodes") or []],
         "additions": n.get("additions", 0), "deletions": n.get("deletions", 0),
@@ -1739,11 +1882,27 @@ def fetch_open(repo):
     return fetch_paged(OPEN_QUERY, {"owner": owner, "name": name}, lambda d: d["repository"]["pullRequests"])
 
 
-def fetch_merged(repo, now):
-    since = (now - dt.timedelta(days=MERGED_DAYS)).strftime("%Y-%m-%d")
-    q = "repo:%s is:pr is:merged merged:>=%s" % (repo, since)
+def fetch_search(repo, qualifiers):
+    """Every PR of the repo matching the search qualifiers (paged search API), normalised."""
     split_repo(repo)
-    return fetch_paged(SEARCH_QUERY, {"q": q}, lambda d: d["search"])
+    return fetch_paged(SEARCH_QUERY, {"q": "repo:%s is:pr %s" % (repo, qualifiers)}, lambda d: d["search"])
+
+
+def since_date(now, days):
+    return (now - dt.timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def fetch_merged(repo, now):
+    return fetch_search(repo, "is:merged merged:>=%s" % since_date(now, MERGED_DAYS))
+
+
+def fetch_closed(repo, now):
+    """PRs closed (merged or not) in the last CLOSED_DAYS days, or None when the query fails (shown as "No data yet")."""
+    try:
+        return closed_window(fetch_search(repo, "is:closed closed:>=%s" % since_date(now, CLOSED_DAYS)), now)
+    except (SystemExit, Exception) as e:
+        print("pr-scan: closed-PR query failed: %s" % e, file=sys.stderr)
+        return None
 
 
 def write(path, text):
@@ -1755,11 +1914,15 @@ def public_pr(p):
     return {k: v for k, v in p.items() if k != "body"}
 
 
+def merged_in_last(prs, now, hours):
+    since = now - dt.timedelta(hours=hours)
+    return sum(1 for p in prs if p.get("mergedAt") and parse_time(p["mergedAt"]) >= since)
+
+
 def merged_last_24h(repo, now):
     """Number of PRs merged in the last 24 h, or None when the query fails (shown as "no data yet")."""
     try:
-        since = now - dt.timedelta(hours=24)
-        return sum(1 for p in fetch_merged(repo, now) if p.get("mergedAt") and parse_time(p["mergedAt"]) >= since)
+        return merged_in_last(fetch_merged(repo, now), now, 24)
     except (SystemExit, Exception) as e:
         print("pr-scan: merged-PR query failed: %s" % e, file=sys.stderr)
         return None
@@ -1767,8 +1930,9 @@ def merged_last_24h(repo, now):
 
 def cmd_report(args):
     now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-    an = build_analysis(fetch_open(args.repo), now)
-    an["merged24"] = merged_last_24h(args.repo, now)
+    closed = fetch_closed(args.repo, now)
+    an = build_analysis(fetch_open(args.repo), now, closed)
+    an["merged24"] = merged_last_24h(args.repo, now) if closed is None else merged_in_last(closed, now, 24)
     os.makedirs(args.out, exist_ok=True)
     hist = []
     if args.history:
@@ -1783,16 +1947,21 @@ def cmd_report(args):
         "repo": args.repo, "generatedAt": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "prs": [public_pr(p) for p in an["prs"]], "clusters": an["clusters"], "areaClusters": an["areaClusters"],
         "hotFiles": an["hotFiles"], "hotThreshold": an["hotThreshold"],
+        "closed": None if an["closed"] is None else [public_pr(p) for p in an["closed"]],
     }
     write(os.path.join(args.out, "prs.json"), json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     summary = {
         "repo": args.repo, "open": len(an["prs"]), "out": args.out, "clusters": len(an["clusters"]),
         "areas": {a: len(ps) for a, ps in sorted(an["areas"].items())},
+        "merged": None if an["closed"] is None else len(an["mergedPrs"]),
+        "closedUnmerged": None if an["closed"] is None else len(an["closed"]) - len(an["mergedPrs"]),
     }
     if args.json:
         print(json.dumps(summary, indent=2))
     else:
         print("%s: %d open PRs, %d overlap clusters, written to %s" % (args.repo, summary["open"], summary["clusters"], args.out))
+        if summary["merged"] is not None:
+            print("last %d days: %d merged, %d closed without a merge" % (CLOSED_DAYS, summary["merged"], summary["closedUnmerged"]))
         for a, n in sorted(summary["areas"].items(), key=lambda kv: (-kv[1], kv[0])):
             print("  %-14s %d" % (a, n))
     return 0

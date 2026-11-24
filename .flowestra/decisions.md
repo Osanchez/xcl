@@ -404,3 +404,21 @@ Keep every version of ivall/xcl even if upstream or the whole fork network is ta
 - The sunset gradient is for the dark theme only, which keeps its current stops and surface.
 - This applies both to the explicit light choice on the theme button and to "auto" when the OS is in light mode.
 - The contrast tests are updated: light text is checked against white.
+
+### Closed PRs and "Other" naming (user request, 2026-11-24)
+- **Closed PRs:**
+  - The report also fetches every PR closed in the last 7 days, merged or not, through the search API (`repo:ivall/xcl is:pr is:closed closed:>=DATE`), paged, with the same fields plus `state`, `mergedAt` and `closedAt`.
+  - Areas and groups are computed the same way as for open PRs.
+  - Constant `CLOSED_DAYS = 7`.
+- **Where closed PRs show:**
+  1. **Effort map:** each tower gets a solid base layer, "merged in 7 d", in a new token colour `--merged` (violet, light and dark pair, AA-checked). Closed-unmerged PRs are not stacked. The callout adds "N merged · M closed (7 d)", and the caption explains the layer.
+  2. **Standings:** the state-mix track gets a merged segment, and the row text adds the merged count.
+  3. A **new "Closed" tab** in the feed, listing the PRs closed in the last 7 days, newest first. Each row has a `merged` or `closed` tag, the closed age, the area and the author.
+  4. The **state switch** gains "Closed": All · Unreviewed · Ready · Draft · Closed. Closed filters the All PRs list to closed PRs, and All shows open PRs only.
+  5. **Duplicates:** clustering runs over open and closed PRs together. A cluster that contains a merged PR is marked "possibly superseded: #N merged", and its merged members are listed with the merged tag. Clusters made only of closed PRs are dropped.
+  6. **Road to merged** keeps "Merged 24 h".
+- **Naming:**
+  - The rolled-up tower and row "Everything else" is renamed **"Other"**.
+  - The unmapped-path area is also labelled **"Other"**, with no "(unmapped paths)" suffix, everywhere: towers, the select, lists and markdown.
+  - In the Area select, the rolled-up optgroup is "Other" with "All Other (n)", then its member areas. The unmapped area appears in it as "Other".
+- Snapshots and history are unchanged: they count open PRs only.

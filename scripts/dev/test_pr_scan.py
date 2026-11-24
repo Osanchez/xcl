@@ -354,7 +354,7 @@ class PageTests(unittest.TestCase):
         out = ps.render_html(self.an(), "o/r", NOW, same_day)
         self.assertIn("<polyline class=\"line", out)
         self.assertNotIn("<rect class=\"b-new", out)
-        self.assertEqual(out.count("No data yet"), 1)
+        self.assertEqual(out.count("No data yet"), 2)  # the bars, and the Closed tab (no closed-PR data in this analysis)
         two = [snap("2026-11-22T23:00:00Z", [1]), snap("2026-11-23T09:00:00Z", [1, 2])]
         self.assertIn("<rect class=\"b-new", ps.render_html(self.an(), "o/r", NOW, two))
 
@@ -386,11 +386,11 @@ class PageTests(unittest.TestCase):
 
     def test_panels_all_present_without_js(self):
         out = ps.render_html(self.an(), "o/r", NOW)
-        for k in ("dup", "ready", "hot", "all"):
+        for k in ("dup", "ready", "hot", "all", "closed"):
             self.assertEqual(out.count('data-panel="%s"' % k), 1)
         self.assertNotIn('class="panel" hidden', out)
         self.assertIn(".js .tabs{display:flex}", out)  # tab buttons only exist with JS
-        self.assertEqual(out.count('<div class="panel"'), 4)
+        self.assertEqual(out.count('<div class="panel"'), 5)
 
     def test_road_merged_step(self):
         an = self.an()
@@ -455,7 +455,8 @@ class TopAreaTests(unittest.TestCase):
         out = ps.render_html(an, "o/r", NOW)
         st = out.split('class="a-standings"')[1].split("</section>")[0]
         self.assertEqual(st.count('<li class="st">'), 8)
-        self.assertIn("Everything else", st)
+        self.assertIn('<span class="nm">Other</span>', st)
+        self.assertNotIn("Everything else", out)
         self.assertIn("2 areas: A7, A8", st)
         sel = out.split('<select id="area">')[1].split("</select>")[0]
         for i in range(9):
@@ -506,11 +507,11 @@ class GroupTests(unittest.TestCase):
         self.assertNotIn("Tooling", [e["name"] for e in t])
 
     def test_other_label(self):
-        self.assertEqual(ps.area_label("Other"), "Other (unmapped paths)")
+        self.assertEqual(ps.area_label("Other"), "Other")
         self.assertEqual(ps.area_label("VFS"), "VFS")
         out = ps.render_html(analysis_of({"Other": 2, "A": 1}), "o/r", NOW)
-        self.assertIn("Other (unmapped paths)", out)
-        self.assertNotIn(">Other<", out)
+        self.assertIn(">Other<", out)
+        self.assertNotIn("unmapped paths", out)
 
     def test_select_optgroups_and_member_filter(self):
         out = ps.render_html(analysis_of({"Recompiler": 9, "kernelx": 4, "VFS": 3, "Scripts": 2}), "o/r", NOW)
@@ -541,11 +542,12 @@ class ToolbarTests(unittest.TestCase):
         self.assertTrue(sel.startswith('<option value="">All areas</option>'))
         for a in counts:
             self.assertEqual(sel.count('value="%s"' % ps.slug(a)), 1, a)
-        self.assertEqual(sel.count("<option "), 1 + 7 + 1 + 3)  # All, top 7, "All Everything else", the 3 inside it
-        self.assertIn('value="%s" data-members="%s"' % (ps.slug(ps.ELSE_NAME), ",".join(ps.slug(a) for a in ("A7", "A8", "A9"))), sel)
+        self.assertEqual(sel.count("<option "), 1 + 7 + 1 + 3)  # All, top 7, "All Other", the 3 inside it
+        self.assertIn('<optgroup label="Other"><option value="%s" data-members="%s">All Other (12)</option>' % (
+            ps.ROLLUP_SLUG, ",".join(ps.slug(a) for a in ("A7", "A8", "A9"))), sel)
         grp = sel.split("<optgroup")[1]
         self.assertEqual(grp.count("<option "), 4)
-        self.assertLess(sel.index('value="%s"' % ps.slug("A6")), sel.index(ps.slug(ps.ELSE_NAME)))
+        self.assertLess(sel.index('value="%s"' % ps.slug("A6")), sel.index(ps.ROLLUP_SLUG))
 
     def test_select_without_rollup(self):
         sel = self.select(self.page({"A": 2, "B": 1}))
@@ -562,7 +564,7 @@ class ToolbarTests(unittest.TestCase):
     def test_segmented_state_control(self):
         out = self.page({"A": 2})
         seg = out.split('class="seg"')[1].split("</div>")[0]
-        self.assertEqual(re.findall(r">([^<]+)</button>", seg), ["All", "Unreviewed", "Ready", "Draft"])
+        self.assertEqual(re.findall(r">([^<]+)</button>", seg), ["All", "Unreviewed", "Ready", "Draft", "Closed"])
         self.assertEqual(seg.count('aria-pressed="true"'), 1)
         self.assertEqual(out.count('id="q"'), 1)
 
@@ -576,7 +578,7 @@ class ToolbarTests(unittest.TestCase):
     def test_hash_state_keys(self):
         for key in ("q=", "area=", "state=", "tab="):
             self.assertIn(key, ps.JS)
-        self.assertIn("'unrev','done','draft'", ps.JS)  # old draft=1 / unrev=1 / done=1 links still parse
+        self.assertIn("'unrev','done','draft','closed'", ps.JS)  # old draft=1 / unrev=1 / done=1 links still parse
 
 
 class FitTests(unittest.TestCase):
@@ -741,7 +743,8 @@ class SceneTests(unittest.TestCase):
         ly = {x["k"]: x["ghost"] for x in sc["towers"][0]["layers"]}
         self.assertEqual(ly, {"done": False, "rev": False, "wait": True, "draft": True})
         data = json.loads(ps.scene_json(sc))
-        self.assertEqual({s_["k"]: s_["ghost"] for s_ in data["states"]}, {"done": False, "rev": False, "wait": True, "draft": True})
+        self.assertEqual({s_["k"]: s_["ghost"] for s_ in data["states"]},
+                         {"merged": False, "done": False, "rev": False, "wait": True, "draft": True})
         svg = ps.scene_svg(sc)
         for k, ghost in (("done", False), ("rev", False), ("wait", True), ("draft", True)):
             polys = [x for x in svg.split("<polygon") if 'class="vx v-%s ' % k in x]
@@ -859,6 +862,301 @@ class ClusterLabelTests(unittest.TestCase):
     def test_mixed_names_top_three_only(self):
         label, area = ps.cluster_label(self.m(("A", 1), ("A", 1), ("B", 1), ("B", 1), ("C", 1), ("D", 1), ("E", 1)))
         self.assertEqual((label, area), ("7 PRs across A, B and C", "A"))
+
+
+class ClosedTests(unittest.TestCase):
+    VFS = ["crates/xcl/src/vfs/shared.rs"]
+
+    def cpr(self, number, merged, days_ago=1, title="VFS: shared", files=None, **kw):
+        end = (NOW - dt.timedelta(days=days_ago)).strftime(ps.TS_FMT)
+        d = pr(number, title, self.VFS if files is None else files, state="MERGED" if merged else "CLOSED",
+               closedAt=end, mergedAt=end if merged else None)
+        d.update(kw)
+        return d
+
+    def an(self, closed, opens=()):
+        return ps.build_analysis(list(opens), NOW, closed)
+
+    def test_normalize_merged_vs_closed(self):
+        base = {"number": 5, "title": "t", "url": "u", "createdAt": "2026-11-01T00:00:00Z", "updatedAt": "2026-11-02T00:00:00Z",
+                "closedAt": "2026-11-20T00:00:00Z"}
+        m = ps.normalize(dict(base, state="CLOSED", mergedAt="2026-11-20T00:00:00Z"))
+        c = ps.normalize(dict(base, state="CLOSED", mergedAt=None))
+        self.assertEqual((m["state"], m["mergedAt"], m["closedAt"]), ("MERGED", "2026-11-20T00:00:00Z", "2026-11-20T00:00:00Z"))
+        self.assertEqual((c["state"], c["mergedAt"], c["closedAt"]), ("CLOSED", None, "2026-11-20T00:00:00Z"))
+        self.assertEqual(ps.normalize(dict(base, state="OPEN"))["state"], "OPEN")
+        self.assertIn("closedAt", ps.PR_FIELDS)
+
+    def test_closed_window(self):
+        prs = [self.cpr(1, True, 1), self.cpr(2, False, 0), self.cpr(3, True, 7), self.cpr(4, False, 8), pr(5, state="OPEN"),
+               self.cpr(6, True, 1)]
+        out = ps.closed_window(prs, NOW)
+        self.assertEqual([p["number"] for p in out], [2, 1, 6, 3])  # newest first, ties by number; 8 d old and open dropped
+        self.assertEqual(ps.CLOSED_DAYS, 7)
+        self.assertEqual(ps.closed_window([], NOW), [])
+
+    def test_analysis_counts(self):
+        an = self.an([self.cpr(1, True), self.cpr(2, False), self.cpr(3, True, 30)])
+        self.assertEqual([p["number"] for p in an["closed"]], [1, 2])
+        self.assertEqual([p["number"] for p in an["mergedPrs"]], [1])
+        self.assertTrue(an["closed"][0]["merged"])
+        self.assertFalse(an["closed"][1]["merged"])
+        self.assertIsNone(self.an(None)["closed"])
+        self.assertIsNone(self.an(None)["mergedPrs"])
+
+    def test_query_and_failure(self):
+        seen = []
+        orig = ps.fetch_paged
+        try:
+            ps.fetch_paged = lambda q, v, g: seen.append(v["q"]) or []
+            self.assertEqual(ps.fetch_closed("o/r", NOW), [])
+            def boom(*a):
+                raise SystemExit("nope")
+            ps.fetch_paged = boom
+            self.assertIsNone(ps.fetch_closed("o/r", NOW))
+        finally:
+            ps.fetch_paged = orig
+        self.assertEqual(seen, ["repo:o/r is:pr is:closed closed:>=2026-11-16"])
+
+    def test_scene_merged_base_layer(self):
+        opens = [pr(1, "VFS: a", ["crates/xcl/src/vfs/a.rs"], isDraft=True)]
+        an = self.an([self.cpr(2, True), self.cpr(3, True), self.cpr(4, False)], opens)
+        sc = ps.effort_scene(an)
+        t = sc["towers"][0]
+        self.assertEqual(t["name"], "Core runtime")
+        self.assertEqual([(ly["k"], ly["n"]) for ly in t["layers"]], [("merged", 2), ("draft", 1)])  # merged at the bottom
+        self.assertFalse(t["layers"][0]["ghost"])
+        self.assertEqual((t["open"], t["merged"], t["closed"], t["height"]), (1, 2, 1, 3))  # closed-unmerged is not stacked
+        self.assertTrue(sc["hasClosed"])
+        self.assertIn("violet base", sc["caption"])
+        self.assertTrue(sc["caption"].startswith("One layer is one PR."))
+        svg = ps.scene_svg(sc)
+        self.assertIn("2 merged \u00b7 1 closed (7 d)", svg)
+        self.assertIn('class="vx v-merged ', svg)
+        data = json.loads(ps.scene_json(sc))
+        self.assertTrue(data["hasClosed"])
+        self.assertEqual(data["states"][0]["k"], "merged")
+        self.assertEqual(data["states"][0]["v"], "--merged")
+
+    def test_scene_scaling_counts_merged(self):
+        an = self.an([self.cpr(100 + i, True) for i in range(60)], [pr(i, "VFS: a", ["crates/xcl/src/vfs/a%d.rs" % i]) for i in range(1, 41)])
+        t = ps.effort_scene(an)["towers"][0]
+        self.assertEqual(t["height"], 40)
+        self.assertEqual(sum(ly["n"] for ly in t["layers"]), 100)
+
+    def test_scene_without_closed_data_is_unchanged(self):
+        sc = ps.effort_scene(ps.build_analysis([pr(1, "VFS: a", ["crates/xcl/src/vfs/a.rs"])], NOW))
+        self.assertFalse(sc["hasClosed"])
+        self.assertEqual([ly["k"] for ly in sc["towers"][0]["layers"]], ["done"])
+        self.assertNotIn("merged", ps.scene_svg(sc))
+        self.assertNotIn("violet", sc["caption"])
+
+    def test_merged_per_tower_and_rollup(self):
+        counts = {"A%d" % i: 3 for i in range(8)}
+        an = analysis_of(counts)
+        an["closed"] = [dict(pr(900 + i, "x", state="MERGED"), primary=a, merged=True, areas=[a])
+                        for i, a in enumerate(["A0", "A0", "A7", "Gone"])]
+        an["closed"].append(dict(pr(990, "x", state="CLOSED"), primary="A7", merged=False, areas=["A7"]))
+        an["mergedPrs"] = [p for p in an["closed"] if p["merged"]]
+        top = {e["name"]: e for e in ps.top_areas(an)}
+        self.assertEqual(len(top["A0"]["merged"]), 2)
+        self.assertEqual((len(top["A7"]["merged"]), len(top["A7"]["closed"])), (1, 1))  # ranks by merged after open
+        self.assertEqual((len(top["Other"]["merged"]), len(top["Other"]["closed"])), (1, 0))  # the merged-only area rolls up
+        self.assertEqual(sum(len(e["merged"]) for e in top.values()), 4)  # no merged PR is lost
+
+    def test_closed_tab_markup(self):
+        an = self.an([self.cpr(10, True, 3, "VFS: old <b>x</b>", author="al<i>"), self.cpr(11, False, 1, "TLS: new", ["crates/xcl/src/tls/a.rs"])])
+        out = ps.render_html(an, "o/r", NOW)
+        panel = out.split('data-panel="closed"')[1].split("</section>")[0]
+        self.assertIn('data-tab="closed" aria-pressed="false">Closed</button>', out)
+        self.assertIn('data-meta="1 merged, 1 closed, last 7 days"', out)
+        self.assertLess(panel.index("#11"), panel.index("#10"))  # newest first
+        self.assertEqual(panel.count('<div class="row cl">'), 2)
+        self.assertIn('<span class="pill merged">merged</span>', panel)
+        self.assertIn('<span class="pill muted">closed</span>', panel)
+        self.assertIn("<b>3d</b>ago", panel)
+        self.assertIn("by al&lt;i&gt;", panel)
+        self.assertNotIn("<b>x</b>", out)
+        self.assertIn("TLS", panel)
+
+    def test_closed_empty_and_no_data(self):
+        out = ps.render_html(self.an([]), "o/r", NOW)
+        self.assertIn("None in the last 7 days", out)
+        self.assertIn('data-meta="0 merged, 0 closed, last 7 days"', out)
+        out = ps.render_html(self.an(None), "o/r", NOW)
+        panel = out.split('data-panel="closed"')[1].split("</section>")[0]
+        self.assertIn("No data yet", panel)
+        self.assertIn('data-meta="no data yet"', out)
+        self.assertNotIn('class="vx v-merged', out)
+        self.assertNotIn('<i class="merged"', out)
+        self.assertNotIn("sw k-merged", out)
+
+    def test_closed_state_filter(self):
+        an = self.an([self.cpr(10, True)], [pr(1, "VFS: a", ["crates/xcl/src/vfs/a.rs"])])
+        out = ps.render_html(an, "o/r", NOW)
+        seg = out.split('class="seg"')[1].split("</div>")[0]
+        self.assertIn('data-state="closed"', seg)
+        self.assertLess(seg.index('data-state="draft"'), seg.index('data-state="closed"'))
+        self.assertIn("STATES=['unrev','done','draft','closed']", ps.JS)
+        self.assertIn("data-closed", ps.JS)
+        self.assertIn("wc=st.state==='closed'", ps.JS)
+        self.assertEqual(out.count('class="row pr" data-area="area-vfs" data-closed="0"'), 1)
+        self.assertEqual(out.count('class="row pr" hidden data-area="area-vfs" data-closed="1"'), 1)  # hidden until Closed is chosen
+
+    def test_closed_only_area_group_hidden(self):
+        out = ps.render_html(self.an([self.cpr(10, True, files=["crates/xcl/src/tls/a.rs"], title="TLS: a")]), "o/r", NOW)
+        self.assertIn('<details class="area" id="area-tls" hidden>', out)
+
+    def test_standings_merged_segment(self):
+        an = self.an([self.cpr(10, True), self.cpr(11, True)], [pr(1, "VFS: a", ["crates/xcl/src/vfs/a.rs"])])
+        st = ps.render_html(an, "o/r", NOW).split('class="a-standings"')[1].split("</section>")[0]
+        self.assertIn('<i class="merged" style="flex:2" data-tip="Merged in 7 d: 2"', st)
+        self.assertIn("2 merged", st)
+        self.assertIn("Merged in 7 d</li>", st)
+        self.assertIn("<b>1</b>", st)  # the open count stays the number
+
+    def test_superseded_marking(self):
+        opens = [pr(1, "VFS: shared", self.VFS)]
+        an = self.an([self.cpr(2, True)], opens)
+        self.assertEqual(len(an["clusters"]), 1)
+        c = an["clusters"][0]
+        self.assertEqual((c["members"], c["merged"], c["superseded"]), ([1, 2], [2], True))
+        out = ps.render_html(an, "o/r", NOW)
+        dup = out.split('data-panel="dup"')[1].split('data-panel="ready"')[0]
+        self.assertIn("Possibly superseded: ", dup)
+        self.assertIn("#2</a> merged", dup)
+        self.assertIn('<span class="pill merged">merged</span>', dup)  # the merged member is listed with the tag
+        md = ps.render_md(an, "o/r", NOW)  # closed members are in the markdown cluster list too
+        self.assertIn("[merged]", md)
+
+    def test_closed_unmerged_member_is_not_superseded(self):
+        an = self.an([self.cpr(2, False)], [pr(1, "VFS: shared", self.VFS)])
+        c = an["clusters"][0]
+        self.assertEqual((c["members"], c["merged"], c["superseded"]), ([1, 2], [], False))
+        self.assertNotIn("Possibly superseded", ps.render_html(an, "o/r", NOW))
+
+    def test_closed_only_clusters_dropped(self):
+        an = self.an([self.cpr(2, True), self.cpr(3, False), self.cpr(4, True)])
+        self.assertEqual(an["clusters"], [])
+        out = ps.render_html(an, "o/r", NOW)
+        self.assertIn("None found", out)
+        self.assertEqual(ps.mark_superseded([{"members": [2, 3], "links": []}], {2: {"state": "MERGED", "merged": True}, 3: {"state": "CLOSED"}}), [])
+
+    def test_open_only_clusters_unchanged(self):
+        an = ps.build_analysis([pr(1, "VFS: shared", self.VFS), pr(2, "VFS: shared", self.VFS)], NOW)
+        self.assertEqual(an["clusters"][0]["members"], [1, 2])
+        self.assertFalse(an["clusters"][0]["superseded"])
+
+    def test_snapshot_counts_open_only(self):
+        an = self.an([self.cpr(10, True)], [pr(1, "VFS: a", ["crates/xcl/src/vfs/a.rs"])])
+        snap_ = ps.snapshot(an, NOW)
+        self.assertEqual((snap_["open"], snap_["prs"], snap_["areas"]), (1, [1], {"VFS": 1}))
+
+    def test_merged_colour_tokens_are_aa(self):
+        def lum(h):
+            c = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+            c = [x / 12.92 if x <= .03928 else ((x + .055) / 1.055) ** 2.4 for x in c]
+            return .2126 * c[0] + .7152 * c[1] + .0722 * c[2]
+        def ratio(a, b):
+            a, b = sorted((lum(a), lum(b)), reverse=True)
+            return (a + .05) / (b + .05)
+        light = re.search(r"--merged:(#[0-9a-f]{6});", ps.CSS.split("prefers-color-scheme")[0]).group(1)
+        dark = re.search(r"--merged:(#[0-9a-f]{6});", ps.CSS.split("prefers-color-scheme")[1]).group(1)
+        self.assertGreaterEqual(ratio(light, "#ffffff"), 4.5)
+        self.assertGreaterEqual(ratio(dark, "#0e1219"), 4.5)
+        self.assertGreaterEqual(ratio(dark, "#1a212c"), 4.5)
+        self.assertIn(".v-merged{--c:var(--merged)}", ps.CSS + ps.SCENE_CSS)
+
+    def test_other_naming_everywhere(self):
+        counts = {"A%d" % i: 12 - i for i in range(8)}
+        counts["Other"] = 1
+        an = analysis_of(counts)
+        an["closed"] = [dict(pr(900, "Other: x", state="CLOSED"), primary="Other", merged=False, areas=["Other"], closedAgeDays=1)]
+        an["mergedPrs"] = []
+        out = ps.render_html(an, "o/r", NOW)
+        md = ps.render_md(an, "o/r", NOW)
+        for text in (out, md, ps.scene_svg(ps.effort_scene(an)), ps.scene_json(ps.effort_scene(an))):
+            self.assertNotIn("Everything else", text)
+            self.assertNotIn("unmapped paths", text)
+            self.assertNotIn("(unmapped", text)
+        sel = out.split('<select id="area">')[1].split("</select>")[0]
+        self.assertIn('<optgroup label="Other">', sel)
+        self.assertIn(">All Other (", sel)
+        self.assertEqual(sel.count('value="area-other"'), 1)  # the unmapped area, in the rollup
+        self.assertEqual(sel.count('value="%s"' % ps.ROLLUP_SLUG), 1)  # the rollup has its own value
+        self.assertIn("| [Other](#area-other) |", md)
+        self.assertEqual(ps.ELSE_NAME, "Other")
+        self.assertEqual(ps.area_label(ps.OTHER), "Other")
+
+
+class ClusterGuardTests(unittest.TestCase):
+    def grp(self, start, n, files):
+        return [pr(start + i, "w%da w%db" % (start + i, start + i), files) for i in range(n)]
+
+    def test_hot_files_use_the_clustered_set(self):
+        hub = "crates/xcl/src/vfs/hub.rs"
+        opens = [pr(i, "o%da o%db" % (i, i), [hub, "crates/xcl/src/vfs/o%d.rs" % i]) for i in range(1, 4)]
+        closed = []
+        for i in range(10, 20):
+            end = (NOW - dt.timedelta(days=1)).strftime(ps.TS_FMT)
+            closed.append(pr(i, "c%da c%db" % (i, i), [hub], state="CLOSED", closedAt=end, mergedAt=None))
+        open_only = ps.build_analysis(opens, NOW)
+        self.assertEqual(open_only["hotFiles"], [])  # 3 open PRs: not above max(4, 5 %)
+        an = ps.build_analysis(opens, NOW, closed)
+        self.assertEqual(an["hotFiles"], [])  # the Hot files tab stays about open PRs
+        self.assertEqual(an["clusterHot"], [hub])  # 13 PRs touch it: above max(4, 5 % of 13)
+        self.assertEqual(an["clusters"], [])  # so the closed PRs do not chain the open ones together
+
+    def test_resplit_oversized_component(self):
+        a = self.grp(100, 8, ["a1", "a2", "a3", "a4"])
+        b = self.grp(200, 8, ["b1", "b2", "b3", "b4"])
+        bridge_a = pr(300, "bridge shared words", ["a1", "a2"])  # 2/4 = 0.5 with group A: links only at the base threshold
+        bridge_b = pr(301, "bridge shared words", ["b1", "b2"])
+        cs = ps.clusters(a + b + [bridge_a, bridge_b])
+        self.assertEqual([c["members"] for c in cs], [list(range(100, 108)), list(range(200, 208)), [300, 301]])
+        # the bridges are no longer glued to the groups; they stay together only through their identical title
+        self.assertEqual(len(ps.clusters(a + b + [bridge_a, bridge_b], max_size=30)), 1)  # within the limit: one component
+        weak_a, weak_b = pr(302, "pp qq rr ss", ["a1", "a2"]), pr(303, "pp qq rr tt", ["b1", "b2"])  # title Jaccard 0.6
+        lone = ps.clusters(a + b + [weak_a, weak_b])
+        self.assertEqual([c["members"] for c in lone], [list(range(100, 108)), list(range(200, 208))])  # single-member parts are dropped
+
+    def test_resplit_stops_at_the_cap(self):
+        same = self.grp(1, 14, ["x1", "x2"])  # identical files stay linked at every threshold
+        cs = ps.clusters(same)
+        self.assertEqual([len(c["members"]) for c in cs], [14])
+
+    def test_small_components_untouched(self):
+        cs = ps.clusters(self.grp(1, 12, ["x1", "x2"]))
+        self.assertEqual([len(c["members"]) for c in cs], [12])
+        self.assertEqual(ps.CLUSTER_MAX, 12)
+
+    def test_snapshot_clusters_have_an_open_pr(self):
+        end = (NOW - dt.timedelta(days=1)).strftime(ps.TS_FMT)
+        closed = [pr(5, "VFS: x", ["crates/xcl/src/vfs/z.rs"], state="MERGED", closedAt=end, mergedAt=end),
+                  pr(6, "VFS: x", ["crates/xcl/src/vfs/z.rs"], state="CLOSED", closedAt=end, mergedAt=None)]
+        an = ps.build_analysis([pr(1, "VFS: y", ["crates/xcl/src/vfs/q.rs"])], NOW, closed)
+        self.assertEqual(ps.snapshot(an, NOW)["clusters"], 0)  # a closed-only cluster is dropped, not counted
+
+
+class OtherTowerTests(unittest.TestCase):
+    def test_unmapped_area_never_its_own_tower(self):
+        for counts in ({"Other": 30, "A": 1}, {"Other": 5}, {"Other": 9, "A": 3, "B": 2}):
+            top = ps.top_areas(analysis_of(counts))
+            others = [e for e in top if e["name"] == "Other"]
+            self.assertEqual(len(others), 1, counts)
+            self.assertTrue(others[0]["rollup"], counts)
+            self.assertIn("Other", others[0]["members"])
+            tw = [t["name"] for t in ps.effort_scene(analysis_of(counts))["towers"]]
+            self.assertEqual(tw.count("Other"), 1, counts)
+
+    def test_rollup_holds_unmapped_and_overflow_areas(self):
+        counts = {"A%d" % i: 20 - i for i in range(8)}
+        counts["Other"] = 50
+        top = ps.top_areas(analysis_of(counts))
+        self.assertEqual([e["name"] for e in top].count("Other"), 1)
+        self.assertEqual(top[-1]["members"], ["Other", "A7"])
+        self.assertEqual(len(top[-1]["prs"]), 50 + 13)
+        self.assertEqual(len(top), 8)
 
 
 if __name__ == "__main__":
