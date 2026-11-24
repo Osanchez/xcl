@@ -452,3 +452,20 @@ Keep every version of ivall/xcl even if upstream or the whole fork network is ta
   - Body and UI text stay Roboto, and Roboto Condensed is dropped where Anton replaces it.
   - The single Google Fonts stylesheet loads Anton plus Roboto 400/500/700, with `display=swap`.
 - **No scene caption:** the "Effort map. One tower per area…" sentence is removed, and so is the scale note. The colour legend stays, and the tooltips still give exact counts.
+
+### Inner spacing pass (user request, 2026-11-24)
+- **Spacing tokens** on an 8 px rhythm, scaled with `clamp()` for small windows: `--sp-1:4px`, `--sp-2:8px`, `--sp-3:12px`, `--sp-4:16px`, `--sp-5:24px`. All paddings and gaps use the tokens; no ad-hoc pixel values remain in the CSS.
+- **Minimum inner padding** (vertical / horizontal):
+  - panels: 16 / 20;
+  - the hero box, stat cells and road tiles: 12 / 16;
+  - list rows in the feed, standings, closed and ready lists: 10 / 12;
+  - page tabs and feed tabs: 8 / 12;
+  - buttons, segmented controls, the select and the search input: 8 / 14 (the input also gets 12 px of left padding before the placeholder);
+  - pills and tags: 2 / 8, plus 6 px between pills;
+  - file chips: 3 / 8;
+  - legend items: 6 px between swatch and label and 16 px between items;
+  - SVG and canvas callout boxes: at least 8 / 10 between text and box edge, and the text stays clear of the leader line.
+- **Scroll panels:** `scrollbar-gutter: stable` plus at least 8 px of right padding, so text never touches the scrollbar.
+- **Text never touches** a border, rule or colour bar. The duplicate group's left colour bar gets 14 px of space before its text.
+- Line-height is at least 1.35 for body text in lists.
+- The viewport fit stays: when space is tight, fonts and gaps shrink through `clamp()` before padding falls below the minimums above.

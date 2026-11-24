@@ -582,6 +582,137 @@ class ToolbarTests(unittest.TestCase):
         self.assertIn("'unrev','done','draft','closed'", ps.JS)  # old draft=1 / unrev=1 / done=1 links still parse
 
 
+class SpacingTests(unittest.TestCase):
+    """Inner spacing: tokens on an 8 px rhythm and the minimum padding of each element type, parsed from the CSS constants."""
+    CSS = ps.CSS + ps.SCENE_CSS
+    TOK = dict(re.findall(r"--([\w-]+):([^;}]+)", CSS))
+
+    def px(self, v):
+        """Smallest value of a CSS length in px: resolves var(), calc(a +/- b) and clamp(min, ...) (the lower bound)."""
+        v = v.strip()
+        m = re.fullmatch(r"var\(--([\w-]+)\)", v)
+        if m:
+            return self.px(self.TOK[m.group(1)])
+        m = re.fullmatch(r"(?:clamp|max)\((.*)\)", v)
+        if m:
+            depth, cur, parts = 0, "", []
+            for ch in m.group(1):
+                depth += (ch == "(") - (ch == ")")
+                if ch == "," and not depth:
+                    parts.append(cur)
+                    cur = ""
+                else:
+                    cur += ch
+            parts.append(cur)
+            return self.px(parts[0])
+        m = re.fullmatch(r"calc\((.*)\)", v)
+        if m:
+            a, op, b = re.fullmatch(r"(.+?) ([+-]) (.+)", m.group(1)).groups()
+            return self.px(a) + self.px(b) * (1 if op == "+" else -1)
+        m = re.fullmatch(r"(-?[\d.]+)(px)?", v)
+        self.assertIsNotNone(m, v)
+        return float(m.group(1))
+
+    def split(self, v):
+        out, depth, cur = [], 0, ""
+        for ch in v.strip():
+            depth += (ch == "(") - (ch == ")")
+            if ch == " " and not depth:
+                if cur:
+                    out.append(cur)
+                cur = ""
+            else:
+                cur += ch
+        return out + [cur]
+
+    def pads(self, selector, prop="padding"):
+        """(vertical, horizontal) px of every rule whose selector list contains `selector`, in source order."""
+        res = []
+        for sel, body in re.findall(r"([^{}]+)\{([^{}]*)\}", self.CSS):
+            if selector not in [x.strip() for x in sel.split(",")]:
+                continue
+            for decl in body.split(";"):
+                k, _, v = decl.partition(":")
+                if k.strip() == prop:
+                    w = [self.px(x) for x in self.split(v)]
+                    res.append((w[0], w[1] if len(w) > 1 else w[0]))
+        return res
+
+    def atleast(self, selector, vy, vx):
+        found = self.pads(selector)
+        self.assertTrue(found, selector)
+        for y, x in found:
+            self.assertGreaterEqual(y, vy, "%s vertical padding %s" % (selector, y))
+            self.assertGreaterEqual(x, vx, "%s horizontal padding %s" % (selector, x))
+
+    def test_tokens_on_an_8px_rhythm(self):
+        for k, v in (("sp-1", 4), ("sp-2", 8), ("sp-3", 12), ("sp-4", 16), ("sp-5", 24)):
+            self.assertEqual(self.px("var(--%s)" % k), v)
+
+    def test_panels_16_20(self):
+        for sel in (".a-trends", ".a-road", ".a-standings", ".a-feed", ".a-meta"):
+            self.atleast(sel, 16, 20)
+
+    def test_hero_stat_cells_and_road_tiles_12_16(self):
+        for sel in (".a-city .score-box", ".a-meta .stat", ".step", ".top"):
+            self.atleast(sel, 12, 16)
+
+    def test_list_rows_10_12(self):
+        for sel in (".row", ".st", "details.area>summary", ".st-axis"):
+            self.atleast(sel, 0 if sel == ".st-axis" else 10, 12)
+
+    def test_tabs_8_12(self):
+        for sel in (".ptabs button", ".tabs button"):
+            self.atleast(sel, 8, 12)
+
+    def test_buttons_select_and_input_8_14(self):
+        for sel in (".theme", ".seg button", ".toolbar input", ".toolbar select"):
+            self.atleast(sel, 8, 14)
+
+    def test_pills_and_chips(self):
+        self.atleast(".pill", 2, 8)
+        self.atleast(".fchip", 3, 8)
+        self.assertEqual(self.px("var(--pill-gap)"), 6)
+        self.assertIn(".sys{display:flex;flex-wrap:wrap;align-items:center;gap:var(--sp-1) var(--pill-gap)", self.CSS)
+
+    def test_legend_gaps(self):
+        self.assertIn(".legend{display:flex;flex-wrap:wrap;gap:var(--sp-1) var(--sp-4)", self.CSS)  # 16 px between items
+        self.assertIn(".legend li{display:flex;align-items:center;gap:var(--pill-gap)}", self.CSS)  # 6 px swatch to label
+
+    def test_scroll_panels_keep_text_off_the_scrollbar(self):
+        m = re.search(r"\.st-list,\.feed-body\{scrollbar-gutter:stable;padding-right:([^;}]+)\}", self.CSS)
+        self.assertIsNotNone(m)
+        self.assertGreaterEqual(self.px(m.group(1)), 8)
+
+    def test_duplicate_group_bar_gets_14px(self):
+        self.assertGreaterEqual(self.pads(".dup")[0][1], 0)
+        m = re.search(r"\.dup\{padding:([^;}]+)", self.CSS)
+        self.assertGreaterEqual(self.px(self.split(m.group(1))[3]), 14)
+
+    def test_line_height_of_list_rows(self):
+        self.assertRegex(self.CSS, r"\.row\{[^}]*line-height:1\.35")
+
+    def test_no_text_hugs_an_edge_on_phones(self):
+        self.assertIn("@media (max-width:620px){.top{padding:var(--sp-3) var(--sp-4)}", self.CSS)  # was 7px 0
+
+    def test_callout_padding_constants(self):
+        self.assertGreaterEqual(ps.SCENE_PAD_X, 10)
+        self.assertGreaterEqual(ps.SCENE_PAD_Y, 8)
+        self.assertIn("var PX=%d;" % ps.SCENE_PAD_X, ps.SCENE_JS)
+
+    def test_svg_callout_text_is_inset_from_its_box(self):
+        svg = ps.scene_svg(ps.effort_scene(analysis_of({"Alpha": 3, "Beta": 2, "Gamma": 1})))
+        for g in svg.split('<g class="callout">')[1:]:
+            rect = re.search(r'<rect class="co-bg" x="([\d.-]+)" y="(-?\d+)" width="([\d.]+)" height="(\d+)"', g)
+            text = re.search(r'<text x="([\d.-]+)" y="(\d+)"', g)
+            rx, ry, rw, rh = float(rect.group(1)), int(rect.group(2)), float(rect.group(3)), int(rect.group(4))
+            tx, ty = float(text.group(1)), int(text.group(2))
+            self.assertGreaterEqual(tx - rx, ps.SCENE_PAD_X)
+            self.assertGreaterEqual(ty - 11 - ry, ps.SCENE_PAD_Y)         # Anton 14 px cap height above the first baseline
+            self.assertGreaterEqual(ry + rh - (ty + 31), ps.SCENE_PAD_Y)  # last baseline of the three-line callout + descender
+            self.assertGreaterEqual(ry, 0)
+
+
 class FitTests(unittest.TestCase):
     def desktop(self):
         css = ps.CSS + ps.SCENE_CSS
