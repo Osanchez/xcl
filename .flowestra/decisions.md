@@ -497,3 +497,51 @@ Keep every version of ivall/xcl even if upstream or the whole fork network is ta
   - It follows the time range: changing the range while focused updates the counts and the list.
 - **Data:** the per-range scene data carries, for each tower, the PR numbers per state. Titles come from a single shared `{number: [title, url, author]}` map in the JSON, escaped, so they are not duplicated per range.
 - Performance stays the same: no animation loop at rest, and drawing only during the focus transition or a pan.
+
+## 2026-11-24: Progress tab (approved by the user)
+
+The user asked for a Progress tab like portwatch-vi.xyz: milestone steps with percentages, what the README says, and what is next or being worked on. The user chose an assessed progress file with a README-change alert, plus a scheduled Claude re-assessment, and no PortWatch rating on the page. The portwatch site has no licence, so we use the idea only and write our own ladder and code.
+
+### Ladder (ours)
+- Steps and percentages: Groundwork 15 → Loads 30 → Boots 45 → Menus 60 → In-game 80 → Playable 100.
+  - Each step can be partly reached (0–1). A game's % is the position of its furthest reached step, plus the partial fraction toward the next step.
+  - "Playable" means fully playable, or working as far as the game allows (for example missing online servers); the limit is noted.
+- **Overall:** the % of the furthest game still in progress (not yet Playable), with "N of M games playable" next to it.
+
+### Assessment file: `scripts/dev/progress.json`
+- Fields:
+  - `assessedAt`, `assessedBy` (`manual` or `claude-routine`);
+  - `readmeBlob` (`git rev-parse upstream/main:README.md`) and `handoffBlob`;
+  - a `ladder` array (key, label, pct, description);
+  - `games`: each with name, package, levels {loads, boots, menus, ingame, playable} (0–1), limits, an evidence quote copied verbatim from the README, and a source anchor.
+- Initial values, assessed from README `4d1932d2` on 2026-11-24 (manual):
+  - Minecraft Preview, Unicorn Overlord: all steps 1 ("fully playable").
+  - Fortnite, XDefiant: all steps 1, each with its limit (no online services / servers shut down).
+  - "A newer retail game": loads 1, boots 1, menus 1, ingame 0, playable 0. Evidence: "starts in ~4 s, runs at a steady 30 fps without a crash, shows its menus and goes on past the first one to its settings"; limit "gameplay not reached yet; its minimap mesh pipelines are refused". That puts it at 60%.
+- **Change alert:** at build time, `pr-scan.py` fetches the current upstream README and HANDOFF blob shas (read-only, through `gh api repos/ivall/xcl/contents/...`). If they differ from the file's, the page shows a "README changed since this assessment (date)" banner with a compare link.
+
+### Parsed from upstream at build time (deterministic, no judgement)
+- **README feature tables** under "What works": every table row with a State column becomes a checklist row (feature, state ✅/🚧/other, what it does). It is grouped by `###` section, with a % done per section (done / rows) and overall.
+- **README Games table** is rendered as rows next to the ladder.
+- **README Highlights** bullets are shown as is.
+- **HANDOFF "Next steps (priority)":** the numbered items, each shortened to its first sentence with the full text on expand.
+- **HANDOFF "In progress (unfinished)":** its sub-headings and first lines.
+- **Related open PRs per next-step item:** title-token Jaccard ≥ 0.2, or a shared path mentioned in the item (crate module names, e.g. `gpu::texture` → `crates/xcl/src/gpu/texture.rs`). Up to 5 per item, ranked.
+- **Being worked on now:**
+  - upstream commits on main in the selected range (`gh api repos/ivall/xcl/commits?since=`), up to 30, with subject and author;
+  - the 5 areas with the most PR activity in the range.
+- If a fetch fails, its block says "No data yet". Nothing is invented.
+
+### Page
+- A new page tab, **Progress**, first in the tab order (Progress · Effort · Areas · Trends · Stats). The feed column stays.
+- Layout, top to bottom:
+  - an overall hero: big %, the current step name, "N of M games playable", and the assessed date with the change banner when needed;
+  - a mega ladder bar with step ticks and labels, and a marker per game placed at its %;
+  - per-game rows, each with its own small ladder of filled, partial or empty step cells plus evidence and limits;
+  - README feature checklist sections with % bars;
+  - What's next (HANDOFF) with related PRs;
+  - Being worked on now.
+- The page fits the viewport, and its long blocks scroll inside their panels. It uses the existing tokens, spacing and fonts, in light and dark.
+
+### Scheduled re-assessment
+- A Claude routine is set up with the schedule skill after the page ships. It runs every 6 hours and checks whether the upstream README or HANDOFF blob differs from `progress.json`. If it does, it re-rates the game levels using only README/HANDOFF text and the ladder definitions, updates `progress.json` (`assessedBy: claude-routine`, new blobs, verbatim evidence quotes), commits it to `dev` and pushes. If nothing changed, it does nothing.

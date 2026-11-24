@@ -1002,7 +1002,7 @@ panels.forEach(function(p){var on=p.getAttribute('data-panel')===n;p.hidden=!on;
 tabs.forEach(function(b){b.addEventListener('click',function(){showTab(b.getAttribute('data-tab'));write();});});
 // time range: Python computed one dataset per range (towers, Areas rows, counts, tab texts); list rows are filtered by their timestamps
 var RD=null;try{RD=JSON.parse(d.getElementById('range-data').textContent);}catch(e){}
-var RR=(RD&&RD.ranges)||{},DEF=(RD&&RD.default)||'7d',range=DEF,page='effort',PGS=['effort','areas','trends','stats'],cs=0;
+var DP='progress',RR=(RD&&RD.ranges)||{},DEF=(RD&&RD.default)||'7d',range=DEF,page=DP,PGS=['progress','effort','areas','trends','stats'],cs=0;
 var rseg=qa('#range button'),pbtn=qa('#ptabs button'),pages=qa('.page');
 function inR(e){var c=e.getAttribute('data-closed');return c!==null?+c>=cs:(+e.getAttribute('data-created')>=cs||+e.getAttribute('data-updated')>=cs);}
 function hideAll(sel,r){var n=0;qa(sel,r).forEach(function(e){var k=inR(e);e.hidden=!k;if(k)n++;});return n;}
@@ -1023,6 +1023,7 @@ var s=p.querySelector('.ptitle span');if(s)s.textContent=R.metas[k];});
 if(sel)qa('option',sel).forEach(function(o){var n=R.sel&&R.sel[o.getAttribute('value')],nm=o.getAttribute('data-name');if(nm&&n!=null)o.textContent=nm+' ('+n+')';});
 var sl=d.getElementById('standings');if(sl){sl.innerHTML=R.standings;qa('[data-tip]',sl).forEach(untitle);}
 var rl=d.getElementById('range-line');if(rl)rl.textContent=R.line;
+var wk=d.getElementById('pg-work'),wl=d.getElementById('pg-rl');if(wk&&R.work!=null)wk.innerHTML=R.work;if(wl)wl.textContent=R.rl;
 qa('[data-rstat]').forEach(function(e){var v=R.counts[e.getAttribute('data-rstat')],sp=e.querySelector('span'),b=e.querySelector('b');
 if(sp)sp.textContent=e.getAttribute('data-base')+' ('+R.rl+')';if(b)b.textContent=v==null?'?':v;});
 qa('.legend .k-merged').forEach(function(e){var n=e.parentNode.lastChild;if(n)n.textContent='Merged in '+R.rl;});
@@ -1036,7 +1037,7 @@ q=d.getElementById('q'),sel=d.getElementById('area'),res=d.getElementById('resul
 var st={q:'',area:'',state:''},STATES=['unrev','done','draft','closed'],fcs='';
 function dec(s){try{return decodeURIComponent(s.replace(/\\+/g,' '))}catch(e){return ''}}
 function opt(v){if(!sel||!v)return null;for(var i=0;i<sel.options.length;i++)if(sel.options[i].value===v)return sel.options[i];return null;}
-function parse(){st={q:'',area:'',state:''};var tt='';range=DEF;page='effort';fcs='';
+function parse(){st={q:'',area:'',state:''};var tt='';range=DEF;page=DP;fcs='';
 (location.hash||'').replace(/^#/,'').split('&').forEach(function(kv){var i=kv.indexOf('=');if(i<1)return;
 var k=kv.slice(0,i),v=dec(kv.slice(i+1));if(k==='q'||k==='area')st[k]=v;else if(k==='tab')tt=v;
 else if(k==='range'){if(RR[v])range=v;}else if(k==='focus'){fcs=v;}else if(k==='page'){if(PGS.indexOf(v)>=0)page=v;}
@@ -1044,7 +1045,7 @@ else if(k==='state'){if(STATES.indexOf(v)>=0)st.state=v;}else if(STATES.indexOf(
 if(sel&&st.area&&!opt(st.area))st.area='';return tt;}
 function on(){return !!(st.q.trim()||st.area||st.state);}
 function write(){var p=[];if(st.q)p.push('q='+encodeURIComponent(st.q));if(st.area)p.push('area='+encodeURIComponent(st.area));
-if(st.state)p.push('state='+st.state);if(tab!=='dup')p.push('tab='+tab);if(range!==DEF)p.push('range='+range);if(page!=='effort')p.push('page='+page);if(fcs)p.push('focus='+encodeURIComponent(fcs));
+if(st.state)p.push('state='+st.state);if(tab!=='dup')p.push('tab='+tab);if(range!==DEF)p.push('range='+range);if(page!==DP)p.push('page='+page);if(fcs)p.push('focus='+encodeURIComponent(fcs));
 history.replaceState(null,'',p.length?'#'+p.join('&'):location.pathname+location.search);}
 function areaOk(r){if(!st.area)return true;var a=r.getAttribute('data-area'),o=opt(st.area),m=o&&o.getAttribute('data-members');
 return m?(','+m+',').indexOf(','+a+',')>=0:a===st.area;}
@@ -1928,12 +1929,680 @@ def select_counts(top, view):
 FOCUS_PANEL = ('<aside class="fpanel" id="fpanel" role="region" aria-label="Area detail" hidden><div class="fp-head">'
                '<button type="button" class="fp-back" id="fp-back">Back</button><h3 id="fp-title"></h3></div><div class="fp-body" id="fp-body"></div></aside>')
 
-PAGES = [("effort", "Effort"), ("areas", "Areas"), ("trends", "Trends"), ("stats", "Stats")]
+# ---------------------------------------------------------------- Progress page: ladder math, README / HANDOFF parsing
+
+PROGRESS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "progress.json")
+GAME_STEPS = ("loads", "boots", "menus", "ingame", "playable")
+LADDER_KEYS = ("groundwork",) + GAME_STEPS
+ASSESSORS = ("manual", "claude-routine")
+RELATED_JACCARD = 0.2    # a PR title this similar to a next step (or sharing a source path with it) is related to it
+RELATED_MAX = 5
+COMMITS_SHOWN = 30
+COMMIT_PAGES = 3         # pages of 100 commits fetched for the longest range
+AREAS_SHOWN = 5
+SHORT_MAX = 150
+NO_DATA = "No data yet"
+
+
+def _clamp01(v):
+    try:
+        return min(1.0, max(0.0, float(v)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _ladder_sorted(ladder):
+    return sorted(ladder, key=lambda s: s["pct"])
+
+
+def game_reach(levels, ladder):
+    """(furthest reached step, next step or None, fraction 0..1 of the next one reached) for a game's levels. Groundwork is
+    always reached; a step is reached at level 1; the furthest one counts even if an earlier one is partial."""
+    steps = _ladder_sorted(ladder)
+    cur = 0
+    for i, s in enumerate(steps[1:], 1):
+        if _clamp01(levels.get(s["key"], 0)) >= 1:
+            cur = i
+    nxt = steps[cur + 1] if cur + 1 < len(steps) else None
+    return steps[cur], nxt, (_clamp01(levels.get(nxt["key"], 0)) if nxt else 0.0)
+
+
+def game_pct(levels, ladder):
+    """A game's %: the position of its furthest reached step plus the partial fraction toward the next step."""
+    cur, nxt, frac = game_reach(levels, ladder)
+    return round(cur["pct"] + (frac * (nxt["pct"] - cur["pct"]) if nxt else 0.0), 1)
+
+
+def is_playable(game):
+    return _clamp01(game["levels"].get("playable", 0)) >= 1
+
+
+def overall_progress(games, ladder):
+    """{"pct", "step", "game", "playable", "total"}: the % of the furthest game not yet Playable (its step label and name), 100 and the
+    last step when every game is playable; None without games. "playable" of "total" games are Playable."""
+    if not games:
+        return None
+    steps = _ladder_sorted(ladder)
+    open_games = [g for g in games if not is_playable(g)]
+    n = len(games) - len(open_games)
+    if not open_games:
+        return {"pct": 100.0, "step": steps[-1]["label"], "game": None, "playable": n, "total": len(games)}
+    best = max(open_games, key=lambda g: game_pct(g["levels"], ladder))
+    return {"pct": game_pct(best["levels"], ladder), "step": game_reach(best["levels"], ladder)[0]["label"], "game": best["name"],
+            "playable": n, "total": len(games)}
+
+
+def ladder_markers(games, ladder):
+    """One marker per game on the mega ladder, [{"name", "pct", "row", "playable"}]; games at the same % stack in rows (0 = on the bar)."""
+    out, seen = [], {}
+    for g in sorted(games, key=lambda g: (game_pct(g["levels"], ladder), g["name"])):
+        p = game_pct(g["levels"], ladder)
+        out.append({"name": g["name"], "pct": p, "row": seen.get(p, 0), "playable": is_playable(g)})
+        seen[p] = seen.get(p, 0) + 1
+    return out
+
+
+def fmt_pct(p):
+    return str(int(p)) if float(p) == int(p) else ("%.1f" % p)
+
+
+def validate_progress(d):
+    """The problems of a progress.json value as a list of strings (empty when it is valid)."""
+    err = []
+    if not isinstance(d, dict):
+        return ["not an object"]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(d.get("assessedAt", ""))):
+        err.append("assessedAt must be YYYY-MM-DD")
+    if d.get("assessedBy") not in ASSESSORS:
+        err.append("assessedBy must be one of %s" % ", ".join(ASSESSORS))
+    for k in ("readmeBlob", "handoffBlob"):
+        if not re.fullmatch(r"[0-9a-f]{40}", str(d.get(k, ""))):
+            err.append("%s must be a 40-hex git blob sha" % k)
+    ladder = d.get("ladder")
+    if not isinstance(ladder, list) or [s.get("key") if isinstance(s, dict) else None for s in ladder] != list(LADDER_KEYS):
+        err.append("ladder keys must be %s" % ", ".join(LADDER_KEYS))
+    else:
+        pcts = [s.get("pct") for s in ladder]
+        if not all(isinstance(p, (int, float)) for p in pcts) or pcts != sorted(set(pcts)) or pcts[-1] != 100:
+            err.append("ladder pct must increase and end at 100")
+        for s in ladder:
+            if not isinstance(s.get("label"), str) or not isinstance(s.get("description"), str):
+                err.append("ladder step %s needs label and description" % s.get("key"))
+    games = d.get("games")
+    if not isinstance(games, list) or not games:
+        err.append("games must be a non-empty list")
+        return err
+    for g in games:
+        name = g.get("name") if isinstance(g, dict) else None
+        if not isinstance(g, dict) or not isinstance(name, str) or not name:
+            err.append("every game needs a name")
+            continue
+        for k in ("package", "limits", "evidence", "source"):
+            if not isinstance(g.get(k), str):
+                err.append("%s: %s must be a string" % (name, k))
+        lv = g.get("levels")
+        if not isinstance(lv, dict) or sorted(lv) != sorted(GAME_STEPS) or not all(
+                isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 1 for v in lv.values()):
+            err.append("%s: levels must hold %s as numbers 0..1" % (name, ", ".join(GAME_STEPS)))
+    return err
+
+
+def load_progress(path=PROGRESS_FILE):
+    """progress.json as a dict, or None when it is missing or invalid (the page then says "No data yet")."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError) as e:
+        print("pr-scan: progress file unreadable: %s" % e, file=sys.stderr)
+        return None
+    err = validate_progress(d)
+    if err:
+        print("pr-scan: progress file invalid: %s" % "; ".join(err), file=sys.stderr)
+        return None
+    return d
+
+
+# -- markdown, as plain text only: nothing is rendered as HTML except `code`, and everything is escaped first
+
+def plain_md(s):
+    """A markdown snippet as plain text: links become their text, emphasis markers go; backticks stay (inline_html)."""
+    s = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", str(s))
+    s = re.sub(r"<(https?://[^>\s]+)>", r"\1", s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def inline_html(s):
+    """Plain text of a markdown snippet, HTML-escaped; `inline code` becomes <code>."""
+    return re.sub(r"`([^`]+)`", r"<code>\1</code>", esc(plain_md(s)))
+
+
+def md_cells(line):
+    """The cells of a markdown table row, or None for a line that is not one. `|` inside backticks or after a backslash stays in the cell."""
+    s = line.strip()
+    if not s.startswith("|"):
+        return None
+    cells, cur, tick, i = [], [], False, 1
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s) and s[i + 1] == "|":
+            cur.append("|")
+            i += 2
+            continue
+        if c == "`":
+            tick = not tick
+        if c == "|" and not tick:
+            cells.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    if "".join(cur).strip():
+        cells.append("".join(cur).strip())
+    return cells
+
+
+def md_section(text, title, level=2):
+    """The lines of the section whose heading starts with `title` (a heading of `level` #), up to the next heading of the same or a
+    higher level; fenced code is skipped. [] when there is none."""
+    out, inside, fence = [], False, False
+    for line in str(text).splitlines():
+        if line.lstrip().startswith("```"):
+            fence = not fence
+            if inside:
+                out.append(line)
+            continue
+        m = None if fence else re.match(r"^(#{1,6})\s+(.*?)\s*#*\s*$", line)
+        if m and len(m.group(1)) <= level:
+            if inside:
+                break
+            inside = len(m.group(1)) == level and m.group(2).lower().startswith(title.lower())
+            continue
+        if inside:
+            out.append(line)
+    return out
+
+
+def md_tables(lines):
+    """[(nearest ### heading or "", header cells, [row cells])] for every table in the lines."""
+    out, heading, i = [], "", 0
+    while i < len(lines):
+        m = re.match(r"^#{3,6}\s+(.*?)\s*$", lines[i])
+        if m:
+            heading = plain_md(m.group(1))
+        h = md_cells(lines[i])
+        sep = md_cells(lines[i + 1]) if h and i + 1 < len(lines) else None
+        if h and sep and all(re.fullmatch(r":?-+:?", c) for c in sep):
+            rows, i = [], i + 2
+            while i < len(lines) and md_cells(lines[i]) is not None:
+                rows.append(md_cells(lines[i]))
+                i += 1
+            out.append((heading, h, rows))
+            continue
+        i += 1
+    return out
+
+
+def _col(header, *names):
+    low = [h.lower() for h in header]
+    for n in names:
+        for i, h in enumerate(low):
+            if h == n or h.startswith(n):
+                return i
+    return None
+
+
+def state_kind(cell):
+    return "done" if "✅" in cell else "wip" if "\U0001f6a7" in cell else "other"
+
+
+def parse_features(text):
+    """README "What works": every table row with a State column, grouped by its ### heading, with % done.
+    {"sections": [{"name", "rows": [{"feature", "state", "kind", "what"}], "done", "total", "pct"}], "done", "total", "pct"}; None without rows."""
+    sections = []
+    for heading, header, rows in md_tables(md_section(text, "What works")):
+        si = _col(header, "state")
+        if si is None:
+            continue
+        wi = _col(header, "what")
+        items = []
+        for r in rows:
+            if len(r) <= si or not r[si].strip():
+                continue
+            items.append({"feature": plain_md(r[0]), "state": plain_md(r[si]), "kind": state_kind(r[si]),
+                          "what": plain_md(r[wi]) if wi is not None and wi < len(r) else ""})
+        if items:
+            done = sum(x["kind"] == "done" for x in items)
+            sections.append({"name": heading or "What works", "rows": items, "done": done, "total": len(items),
+                             "pct": round(100 * done / len(items))})
+    if not sections:
+        return None
+    done, total = sum(s["done"] for s in sections), sum(s["total"] for s in sections)
+    return {"sections": sections, "done": done, "total": total, "pct": round(100 * done / total)}
+
+
+def parse_games(text):
+    """README "Games" table as [{"name", "package", "state", "kind", "what", "limits"}] ([] when absent); an en dash limit is empty."""
+    out = []
+    for _, header, rows in md_tables(md_section(text, "Games")):
+        gi, si = _col(header, "game"), _col(header, "state")
+        if gi is None or si is None:
+            continue
+        pi, wi, li = _col(header, "package"), _col(header, "what"), _col(header, "limits")
+        get = lambda r, i: plain_md(r[i]) if i is not None and i < len(r) else ""
+        for r in rows:
+            clean = lambda s: "" if s in ("–", "-", "—") else s
+            out.append({"name": get(r, gi), "package": clean(get(r, pi)), "state": get(r, si), "kind": state_kind(r[si]) if si < len(r) else "other",
+                        "what": get(r, wi), "limits": clean(get(r, li))})
+    return [g for g in out if g["name"]]
+
+
+def parse_highlights(text):
+    """README "Highlights" bullets as plain-text strings (continuation lines joined)."""
+    out = []
+    for line in md_section(text, "Highlights"):
+        m = re.match(r"^\s*[-*]\s+(.*)$", line)
+        if m:
+            out.append(m.group(1))
+        elif out and line.strip() and line[:1].isspace():
+            out[-1] += " " + line.strip()
+    return [plain_md(x) for x in out]
+
+
+def first_sentence(text, limit=SHORT_MAX):
+    """The text up to its first sentence end (a full stop followed by a space, outside backticks and brackets, not after e.g. / i.e.), at most `limit` characters."""
+    depth, tick = 0, False
+    for i, c in enumerate(text):
+        if c == "`":
+            tick = not tick
+        elif not tick and c in "([":
+            depth += 1
+        elif not tick and c in ")]":
+            depth = max(0, depth - 1)
+        elif c == "." and not tick and not depth and (i + 1 == len(text) or text[i + 1] == " "):
+            if not re.search(r"(?:\be\.g|\bi\.e|\betc|\bvs)$", text[:i]):
+                text = text[:i + 1]
+                break
+    if len(text) <= limit:
+        return text
+    cut = text[:limit - 1].rstrip()
+    if cut.count("`") % 2:
+        cut = cut[:cut.rindex("`")].rstrip()  # never end inside an inline-code span
+    return cut + "…"
+
+
+def parse_next_steps(text):
+    """HANDOFF "Next steps (priority)": the numbered items as [{"n", "text", "short"}] (continuation lines joined, short = first sentence)."""
+    items = []
+    for line in md_section(text, "Next steps"):
+        m = re.match(r"^(\d+)\.\s+(.*)$", line)
+        if m:
+            items.append({"n": int(m.group(1)), "text": m.group(2).strip()})
+        elif items and line.strip() and line[:1].isspace():
+            items[-1]["text"] += " " + line.strip()
+    return [{"n": x["n"], "text": x["text"], "short": first_sentence(plain_md(x["text"]))} for x in items]
+
+
+def parse_in_progress(text):
+    """HANDOFF "In progress (unfinished)": [{"heading", "line"}], one per sub-heading with its first line; a section without
+    sub-headings gives one item with an empty heading and its first line; [] when the section is empty or absent."""
+    items, cur = [], None
+    for line in md_section(text, "In progress"):
+        m = re.match(r"^#{3,6}\s+(.*?)\s*$", line)
+        if m:
+            cur = {"heading": plain_md(m.group(1)), "line": ""}
+            items.append(cur)
+        elif line.strip():
+            if cur is None:
+                cur = {"heading": "", "line": ""}
+                items.append(cur)
+            if not cur["line"]:
+                cur["line"] = plain_md(line)
+    return items
+
+
+def module_paths(text):
+    """The source paths a next step names, as ([exact files], [directory prefixes]): `gpu::texture` is crates/xcl/src/gpu/texture.rs or
+    anything under crates/xcl/src/gpu/texture/; a literal `dir/file.rs` matches by suffix."""
+    exact, spans = set(), re.findall(r"`([^`]+)`", text)
+    mods = set()
+    for sp in spans:
+        for m in re.finditer(r"(?<![\w:])([a-z_][a-z0-9_]*(?:::[a-z_][a-z0-9_]*)+)(?![\w:])", sp):
+            mods.add("crates/xcl/src/" + m.group(1).replace("::", "/"))
+        for m in re.finditer(r"(?<![\w/.-])((?:[\w.-]+/)*[\w.-]+\.rs)(?![\w])", sp):
+            exact.add(m.group(1))
+    return exact, mods
+
+
+def related_prs(item, prs, jt=RELATED_JACCARD, limit=RELATED_MAX):
+    """Open PRs related to a next step: the title-word Jaccard against the step's first sentence is at least `jt`, or a changed file is a
+    source path the step names. Ranked by shared paths, then similarity, then newest; up to `limit` of
+    [{"number", "title", "url", "jaccard", "paths"}]."""
+    toks = title_tokens(item["short"])
+    lits, mods = module_paths(item["text"])
+    out = []
+    for p in prs:
+        j = jaccard(title_tokens(p["title"]), toks)
+        shared = sorted({f["path"] for f in p.get("files", []) if any(f["path"] == m + ".rs" or f["path"].startswith(m + "/") for m in mods)
+                         or any(f["path"] == x or f["path"].endswith("/" + x) for x in lits)})
+        if j >= jt or shared:
+            out.append({"number": p["number"], "title": p["title"], "url": p["url"], "jaccard": round(j, 2), "paths": shared})
+    out.sort(key=lambda r: (-len(r["paths"]), -r["jaccard"], -r["number"]))
+    return out[:limit]
+
+
+def parse_commits(arr):
+    """The commit list of the REST API as [{"sha", "subject", "author", "ts", "url"}], newest first as given; broken entries are skipped."""
+    out = []
+    for c in arr if isinstance(arr, list) else []:
+        try:
+            cm = c["commit"]
+            out.append({"sha": str(c["sha"])[:7], "subject": (cm.get("message") or "").split("\n", 1)[0].strip(),
+                        "author": (c.get("author") or {}).get("login") or (cm.get("author") or {}).get("name") or "unknown",
+                        "ts": (cm.get("committer") or cm.get("author") or {})["date"], "url": c.get("html_url") or ""})
+        except (KeyError, TypeError, AttributeError):
+            continue
+    return out
+
+
+def commits_in_range(commits, range_s, now):
+    since = now - dt.timedelta(seconds=range_s)
+    return [c for c in commits if parse_time(c["ts"]) >= since]
+
+
+def active_areas(view, n=AREAS_SHOWN):
+    """The n areas with the most PR activity in a range view (open PRs active in it plus closed or merged ones that ended in it), as
+    [(area, count)], ties by name."""
+    cnt = {}
+    for p in view["prs"] + (view.get("closed") or []):
+        cnt[p["primary"]] = cnt.get(p["primary"], 0) + 1
+    return sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+
+
+def changed_docs(assess, live):
+    """["README", "HANDOFF"] minus the files whose live blob sha equals the assessed one or is unknown (None)."""
+    if not assess:
+        return []
+    return [n for n, k in (("README", "readmeBlob"), ("HANDOFF", "handoffBlob")) if live.get(n) and live[n] != assess.get(k)]
+
+
+def decode_contents(obj):
+    """(blob sha, text or None) from a contents-API JSON object (base64 content)."""
+    import base64
+    sha = obj.get("sha") if isinstance(obj, dict) else None
+    if isinstance(obj, dict) and obj.get("encoding") == "base64" and obj.get("content"):
+        return sha, base64.b64decode(obj["content"]).decode("utf-8", "replace")
+    return sha, None
+
+
+def gh_json(path):
+    r = subprocess.run(["gh", "api", path], capture_output=True, text=True, encoding="utf-8")
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or r.stdout.strip())
+    return json.loads(r.stdout)
+
+
+def fetch_doc(repo, path):
+    """(blob sha, text) of a file on the default branch (read-only `gh api repos/<repo>/contents/<path>`), or (None, None) on failure."""
+    try:
+        sha, text = decode_contents(gh_json("repos/%s/contents/%s" % (repo, path)))
+        if text is None:
+            r = subprocess.run(["gh", "api", "repos/%s/contents/%s" % (repo, path), "-H", "Accept: application/vnd.github.raw"],
+                               capture_output=True, text=True, encoding="utf-8")
+            text = r.stdout if r.returncode == 0 else None
+        return sha, text
+    except (SystemExit, Exception) as e:
+        print("pr-scan: fetching %s failed: %s" % (path, e), file=sys.stderr)
+        return None, None
+
+
+def fetch_commits(repo, now, days=CLOSED_DAYS):
+    """Commits on the default branch of the last `days` days (read-only `gh api repos/<repo>/commits?since=`, 100 per page, up to
+    COMMIT_PAGES pages), or None when the query fails."""
+    since = (now - dt.timedelta(days=days)).strftime(TS_FMT)
+    out = []
+    try:
+        for page in range(1, COMMIT_PAGES + 1):
+            got = gh_json("repos/%s/commits?since=%s&per_page=100&page=%d" % (repo, since, page))
+            out += parse_commits(got)
+            if not isinstance(got, list) or len(got) < 100:
+                break
+        return out
+    except (SystemExit, Exception) as e:
+        print("pr-scan: commit query failed: %s" % e, file=sys.stderr)
+        return None
+
+
+def build_progress(repo, now):
+    """Everything the Progress page shows besides the PR analysis: the assessment file, the live blob shas, the parsed README and HANDOFF
+    and the recent commits. A part that cannot be fetched or parsed is None / empty (the page says "No data yet")."""
+    r_sha, readme = fetch_doc(repo, "README.md")
+    h_sha, handoff = fetch_doc(repo, "HANDOFF.md")
+    return {"assessment": load_progress(), "live": {"README": r_sha, "HANDOFF": h_sha},
+            "features": parse_features(readme) if readme else None, "games": parse_games(readme) if readme else [],
+            "highlights": parse_highlights(readme) if readme else [], "next": parse_next_steps(handoff) if handoff else [],
+            "inprogress": parse_in_progress(handoff) if handoff else None, "commits": fetch_commits(repo, now)}
+
+
+# -- HTML
+
+def banner_html(assess, live, repo):
+    docs = changed_docs(assess, live)
+    if not docs:
+        return ""
+    links = " ".join('<a href="https://github.com/%s/commits/main/%s.md">%s history</a>' % (esc(repo), n, n) for n in docs)
+    return '<p class="pg-banner" role="status">%s changed since this assessment (%s). %s</p>' % (" and ".join(docs), esc(assess["assessedAt"]), links)
+
+
+def _norm_name(s):
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def ladder_bar_html(assess, ov, markers):
+    steps = _ladder_sorted(assess["ladder"])
+    ticks = "".join('<li style="left:%s%%"%s><b>%s</b>%s</li>' % (fmt_pct(s["pct"]), ' class="end"' if s["pct"] >= 100 else "", fmt_pct(s["pct"]), esc(s["label"]))
+                    for s in steps)
+    rows = max([m["row"] for m in markers] + [0]) + 1
+    mk = "".join('<i class="pg-mk %s" style="left:%s%%;bottom:%dpx" role="img" aria-label="%s" data-tip="%s"></i>' % (
+        "ok" if m["playable"] else "wip", fmt_pct(m["pct"]), m["row"] * 11, esc("%s, %s %%" % (m["name"], fmt_pct(m["pct"]))),
+        esc("%s: %s %%" % (m["name"], fmt_pct(m["pct"])))) for m in markers)
+    return ('<div class="pg-bar" style="--rows:%d" role="img" aria-label="Overall %s %%, %s"><div class="pg-marks">%s</div>'
+            '<div class="pg-track"><i style="width:%s%%"></i></div><ol class="pg-ticks">%s</ol></div>' % (
+                rows, fmt_pct(ov["pct"]), esc(ov["step"]), mk, fmt_pct(ov["pct"]), ticks))
+
+
+def game_cells_html(game, ladder):
+    steps = _ladder_sorted(ladder)
+    cells = []
+    for s in steps:
+        lv = 1.0 if s["key"] == "groundwork" else _clamp01(game["levels"].get(s["key"], 0))
+        kind = "full" if lv >= 1 else "part" if lv > 0 else "none"
+        cells.append('<i class="c %s" style="--f:%d%%" data-tip="%s"></i>' % (kind, round(lv * 100), esc("%s (%s %%): %s" % (
+            s["label"], fmt_pct(s["pct"]), "reached" if kind == "full" else "%d %% of the way" % round(lv * 100) if kind == "part" else "not reached"))))
+    return '<div class="pg-cells">%s</div>' % "".join(cells)
+
+
+def progress_games_html(pg, repo):
+    a = pg["assessment"]
+    readme = {_norm_name(g["name"]): g for g in pg["games"]}
+    o, known = [], set()
+    if a:
+        o.append('<div class="pg-cols" aria-hidden="true">%s</div>' % "".join("<span>%s</span>" % esc(s["label"]) for s in _ladder_sorted(a["ladder"])))
+        o.append("<ul class=\"pg-games\">")
+        for g in sorted(a["games"], key=lambda g: (is_playable(g), -game_pct(g["levels"], a["ladder"]))):  # games still in progress first
+            r = readme.get(_norm_name(g["name"]))
+            known.add(_norm_name(g["name"]))
+            pill = ""
+            if r:
+                pill = '<span class="pg-st">%s</span>' % esc(r["state"])
+            o.append('<li class="pg-game"><div class="pg-gh"><b>%s</b><span class="pg-gp">%s %%</span>%s</div>%s'
+                     '<p class="small pg-ev">%s<a href="%s#games" aria-label="README, Games table">README</a></p>%s</li>' % (
+                         esc(g["name"]), fmt_pct(game_pct(g["levels"], a["ladder"])), pill, game_cells_html(g, a["ladder"]),
+                         ("“%s” " % esc(g["evidence"])) if g["evidence"] else "",
+                         "https://github.com/%s/blob/main/README.md" % esc(repo),
+                         '<p class="small pg-lim"><b>Limit</b> %s</p>' % esc(g["limits"]) if g["limits"] else ""))
+        for g in pg["games"]:
+            if _norm_name(g["name"]) not in known:
+                o.append('<li class="pg-game"><div class="pg-gh"><b>%s</b><span class="pg-gp">not assessed yet</span></div><p class="small pg-ev">%s</p></li>' % (
+                    esc(g["name"]), esc(g["what"])))
+        o.append("</ul>")
+    elif pg["games"]:
+        o.append('<p class="empty-block">%s</p><ul class="pg-games">%s</ul>' % (NO_DATA, "".join(
+            '<li class="pg-game"><div class="pg-gh"><b>%s</b>%s</div><p class="small pg-ev">%s</p></li>' % (
+                esc(g["name"]), '<span class="pill">%s</span>' % esc(g["state"]), esc(g["what"])) for g in pg["games"])))
+    else:
+        o.append('<p class="empty-block">%s</p>' % NO_DATA)
+    if pg["highlights"]:
+        o.append('<h3 class="pg-sub">Highlights</h3><ul class="pg-hl">%s</ul>' % "".join("<li>%s</li>" % inline_html(h) for h in pg["highlights"]))
+    return "".join(o)
+
+
+def progress_features_html(feat):
+    if not feat:
+        return '<p class="empty-block">%s</p>' % NO_DATA
+    o = ['<div class="pg-sec all"><span class="nm">All sections</span><span class="pg-meter"><i style="width:%d%%"></i></span><span class="pc">%d %%</span>'
+         '<span class="small">%d of %d</span></div>' % (feat["pct"], feat["pct"], feat["done"], feat["total"])]
+    for s in feat["sections"]:
+        rows = "".join('<li><span class="pg-st">%s</span><b>%s</b><span class="small" data-tip="%s">%s</span></li>' % (
+            esc(r["state"]), esc(r["feature"]), esc(r["what"]),
+            esc(r["what"] if len(r["what"]) <= 110 else r["what"][:109].rstrip() + "…")) for r in s["rows"])
+        o.append('<details class="pg-sec"><summary><span class="nm">%s</span><span class="pg-meter"><i style="width:%d%%"></i></span><span class="pc">%d %%</span>'
+                 '<span class="small">%d of %d</span></summary><ul class="pg-rows">%s</ul></details>' % (
+                     esc(s["name"]), s["pct"], s["pct"], s["done"], s["total"], rows))
+    return "".join(o)
+
+
+def progress_next_html(pg, prs):
+    if not pg["next"]:
+        return '<p class="empty-block">%s</p>' % NO_DATA
+    o = ['<ol class="pg-next">']
+    for it in pg["next"]:
+        rel = related_prs(it, prs)
+        chips = "".join('<a class="fchip" href="%s" data-tip="%s">#%d</a>' % (esc(safe_url(r["url"])), esc(r["title"]), r["number"]) for r in rel)
+        full = plain_md(it["text"])
+        o.append('<li value="%d"><details><summary>%s</summary>%s</details><div class="pg-prs">%s</div></li>' % (
+            it["n"], inline_html(it["short"]), "<p class=\"small\">%s</p>" % inline_html(full) if full != it["short"] else "",
+            chips if chips else '<span class="small">No related open PR</span>'))
+    o.append("</ol>")
+    ip = pg["inprogress"]
+    o.append('<h3 class="pg-sub">In progress (HANDOFF)</h3>')
+    if ip is None:
+        o.append('<p class="small">%s</p>' % NO_DATA)
+    elif not ip:
+        o.append('<p class="small">Nothing listed.</p>')
+    else:
+        o.append('<ul class="pg-hl">%s</ul>' % "".join("<li><b>%s</b> %s</li>" % (esc(x["heading"]), inline_html(x["line"])) if x["heading"]
+                                                      else "<li>%s</li>" % inline_html(x["line"]) for x in ip))
+    return "".join(o)
+
+
+def progress_work_html(commits, view, now, range_s, rl, repo):
+    """The body of "Being worked on now" for one range: upstream commits (up to COMMITS_SHOWN) and the most active areas."""
+    o = []
+    if commits is None:
+        o.append('<p class="empty-block">%s</p>' % NO_DATA)
+    else:
+        cs = commits_in_range(commits, range_s, now)
+        full = len(commits) >= COMMIT_PAGES * 100
+        o.append('<p class="pg-count"><b>%s%d</b> commit%s on main in the last %s</p>' % (
+            "" if len(cs) < len(commits) or not full else "≥", len(cs), "" if len(cs) == 1 else "s", esc(rl)))
+        if cs:
+            o.append('<ul class="pg-commits">%s</ul>' % "".join(
+                '<li><a href="%s">%s</a> %s <span class="small">%s &middot; %s</span></li>' % (
+                    esc(safe_url(c["url"])), esc(c["sha"]), esc(c["subject"]), esc(c["author"]), esc(c["ts"][:10])) for c in cs[:COMMITS_SHOWN]))
+        else:
+            o.append('<p class="small">No commits in the last %s.</p>' % esc(rl))
+    areas = active_areas(view)
+    o.append('<h3 class="pg-sub">Most active areas</h3>')
+    if areas:
+        top = max(n for _, n in areas)
+        o.append('<ul class="pg-areas">%s</ul>' % "".join(
+            '<li>%s<span class="pg-meter"><i style="width:%d%%"></i></span><b>%d</b></li>' % (ptype(a), round(100 * n / top), n) for a, n in areas))
+    else:
+        o.append('<p class="small">No PR activity in the last %s.</p>' % esc(rl))
+    return "".join(o)
+
+
+def progress_hero_html(pg, repo):
+    a = pg["assessment"]
+    if not a:
+        return '<section class="pg-hero a-prog" aria-label="Overall progress"><p class="empty-block">%s</p></section>' % NO_DATA
+    ov = overall_progress(a["games"], a["ladder"])
+    done = "all %d games" % ov["total"] if ov["playable"] == ov["total"] else "%d of %d games" % (ov["playable"], ov["total"])
+    note = ('<p class="score-note"><b>%s</b><span>%s playable</span><span>Assessed %s (%s)</span></p>' % (
+        esc(ov["step"]) if ov["game"] else "Everything playable", done, esc(a["assessedAt"]), esc(a["assessedBy"])))
+    return ('<section class="pg-hero a-prog" aria-label="Overall progress"><div class="pg-score"><div class="score">%s<small>%%</small></div>%s</div>%s%s</section>' % (
+        fmt_pct(ov["pct"]), note, ladder_bar_html(a, ov, ladder_markers(a["games"], a["ladder"])), banner_html(a, pg["live"], repo)))
+
+
+PROGRESS_CSS = """
+.pg{display:flex;flex-direction:column;gap:var(--sp-2);min-width:0;min-height:0}
+.pg-hero,.pg-panel{background:var(--surface);border:1px solid var(--edge);min-width:0;min-height:0}
+.pg-hero{display:grid;grid-template-columns:minmax(0,1fr);gap:var(--sp-3) var(--sp-5);align-items:end;padding:var(--sp-3) var(--pan-x)}
+.pg-hero>.empty-block{grid-column:1/-1}
+.pg-score{display:flex;align-items:flex-end;gap:var(--sp-2) var(--sp-4);flex-wrap:wrap}.pg-score .score-box,.pg-score .score-note{margin:0}
+.pg-banner{grid-column:1/-1;padding:var(--sp-2) var(--sp-3);border-left:4px solid var(--partial);background:var(--wash);color:var(--ink);font-size:13px;line-height:1.35}
+.pg-bar{position:relative;min-width:0;padding-bottom:calc(var(--sp-5) + var(--sp-1))}
+.pg-marks{position:relative;height:calc(var(--rows)*11px + 6px);margin-bottom:var(--sp-1)}
+.pg-mk{position:absolute;display:block;width:9px;height:9px;margin-left:-5px;border:1px solid var(--page)}
+.pg-mk.ok{background:var(--good)}.pg-mk.wip{background:var(--partial)}
+.pg-track{position:relative;height:14px;background:var(--wash)}.pg-track i{display:block;height:100%;background:var(--accent)}
+.pg-ticks{position:absolute;left:0;right:0;top:calc(var(--rows)*11px + 6px + var(--sp-1) + 14px)}
+.pg-ticks li{position:absolute;top:0;transform:translateX(-50%);padding-top:calc(var(--sp-2) + 2px);text-align:center;font-size:12px;line-height:1.2;color:var(--soft);white-space:nowrap}
+.pg-ticks li:before{content:"";position:absolute;left:50%;top:0;height:var(--sp-2);border-left:1px solid var(--ink)}
+.pg-ticks li b{display:block;font:400 13px/1.2 Anton,Impact,sans-serif;color:var(--ink)}
+.pg-ticks li.end{transform:translateX(-100%);text-align:right}.pg-ticks li.end:before{left:auto;right:0}
+.pg-grid{display:grid;grid-template-columns:minmax(0,1fr);gap:var(--sp-2);min-height:0}
+.pg-panel{display:flex;flex-direction:column;padding:var(--sp-3) var(--pan-x)}
+.pg-body{overflow:auto;min-height:0;max-height:380px;flex:1;scrollbar-gutter:stable;scrollbar-width:thin;scrollbar-color:var(--rule) transparent}
+.pg-sub{font:400 15px/1.2 Anton,Impact,sans-serif;letter-spacing:.03em;margin:var(--sp-3) 0 var(--sp-1)}
+.pg-cols{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:var(--sp-1);position:sticky;top:0;z-index:1;background:var(--surface);padding-bottom:var(--sp-1);font-size:11px;line-height:1.2;color:var(--soft);text-align:center}
+.pg-cols span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pg-game{padding:var(--row-y) 0;border-top:1px solid var(--rule)}
+.pg-gh{display:flex;align-items:baseline;gap:var(--sp-2);min-width:0}.pg-gh b{font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.pg-gp{margin-left:auto;font:400 16px/1 Anton,Impact,sans-serif;white-space:nowrap}.pg-st{font-size:13px;line-height:1.3;white-space:nowrap}
+.pg-cells{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:var(--sp-1);margin:var(--sp-1) 0}
+.pg-cells .c{display:block;height:8px;background:var(--empty)}.pg-cells .c.full{background:var(--good)}.pg-cells .c.part{background:linear-gradient(90deg,var(--partial) var(--f),var(--empty) var(--f))}
+.pg-ev,.pg-lim{margin:0;overflow-wrap:anywhere}.pg-ev a{margin-left:var(--sp-1)}.pg-lim b{color:var(--partial-text);font-weight:500}
+.pg-hl{padding-left:var(--sp-4);list-style:disc;font-size:13px;line-height:1.4}.pg-hl li+li{margin-top:var(--sp-1)}
+.pg-sec{display:grid;grid-template-columns:minmax(0,1fr) minmax(40px,1fr) 40px auto;gap:var(--sp-2);align-items:center;font-size:13px}
+.pg-sec.all{padding:var(--sp-1) 0 var(--sp-2);font-weight:500}
+details.pg-sec{display:block;border-top:1px solid var(--rule)}
+details.pg-sec>summary{display:grid;grid-template-columns:minmax(0,1fr) minmax(40px,1fr) 40px auto;gap:var(--sp-2);align-items:center;cursor:pointer;padding:var(--sp-2) 0;list-style:none}
+details.pg-sec>summary::-webkit-details-marker{display:none}
+.pg-sec .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}.pg-sec .pc{text-align:right;font-family:Anton,Impact,sans-serif}
+.pg-meter{display:block;height:8px;background:var(--wash)}.pg-meter i{display:block;height:100%;background:var(--good)}
+.pg-rows li{display:grid;grid-template-columns:auto minmax(0,1fr);gap:0 var(--sp-2);align-items:baseline;padding:var(--sp-1) 0 var(--sp-1) var(--sp-3);font-size:13px}
+.pg-rows li .small{grid-column:2}.pg-rows li b{font-weight:500;overflow-wrap:anywhere}
+.pg-next{display:grid;gap:var(--sp-1)}.pg-next>li{padding:var(--row-y) 0;border-top:1px solid var(--rule);font-size:13px;line-height:1.4}
+.pg-next summary{cursor:pointer;font-weight:500;overflow-wrap:anywhere}.pg-next details p{margin-top:var(--sp-1);overflow-wrap:anywhere}
+.pg-prs{display:flex;flex-wrap:wrap;gap:var(--pill-gap);margin-top:var(--sp-1)}
+.pg-panel code{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--wash);padding:0 var(--sp-1);overflow-wrap:anywhere}
+.pg-count{font-size:13px;color:var(--soft);margin-bottom:var(--sp-1)}.pg-count b{font:400 20px/1 Anton,Impact,sans-serif;color:var(--ink);margin-right:var(--sp-1)}
+.pg-commits li{display:block;padding:var(--sp-1) 0;border-top:1px solid var(--rule);font-size:13px;line-height:1.35;overflow-wrap:anywhere}
+.pg-commits li a{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin-right:var(--sp-1)}
+.pg-areas li{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(24px,1fr) 24px;gap:var(--sp-2);align-items:center;padding:var(--sp-1) 0;font-size:13px}
+.pg-areas li b{text-align:right}
+@media (min-width:900px){
+.pg-hero{grid-template-columns:auto minmax(0,1fr)}
+.js .pg{flex:1;min-height:0}
+.js .pg-grid{flex:1;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:minmax(0,1.45fr) minmax(0,1fr);grid-template-areas:"games next" "check work"}
+.pg-games-p{grid-area:games}.pg-check-p{grid-area:check}.pg-next-p{grid-area:next}.pg-work-p{grid-area:work}
+.js .pg-body{max-height:none}
+.pg-panel{padding:var(--sp-3) var(--pan-x)}
+.pg-hero .score{font-size:clamp(34px,7.4vh,72px)}
+}
+"""
+
+
+PAGES = [("progress", "Progress"), ("effort", "Effort"), ("areas", "Areas"), ("trends", "Trends"), ("stats", "Stats")]
+DEFAULT_PAGE = PAGES[0][0]
 CHART_WIDE, CHART_HALF = (640, 240), (320, 240)   # viewBox of the large trend charts: a wide one and two half-width ones
 
 
-def render_html(an, repo, now, hist=None):
+def render_html(an, repo, now, hist=None, progress=None):
     hist = hist or []
+    pg = progress or {"assessment": None, "live": {}, "features": None, "games": [], "highlights": [], "next": [], "inprogress": None, "commits": None}
     prs = an["prs"]
     closed = an.get("closed")
     has_closed = closed is not None
@@ -1954,6 +2623,7 @@ def render_html(an, repo, now, hist=None):
         scenes[key] = effort_scene(view, rl=rl)
         c = range_counts(an, secs, now)
         rdata[key] = {"s": secs, "rl": rl, "counts": c, "metas": range_metas(c, rl), "standings": standings_html(view, rl, spark_hist), "sel": select_counts(top, view),
+                      "work": progress_work_html(pg["commits"], view, now, secs, rl, repo),
                       "line": "Last %s: %d active · %s merged · %s closed" % (
                           rl, c["active"], c["merged"] if has_closed else "?", c["closed"] if has_closed else "?") if has_closed
                       else "Last %s: %d active" % (rl, c["active"])}
@@ -1994,19 +2664,34 @@ def render_html(an, repo, now, hist=None):
              "<title>PR scan: %s</title>"
              "<link rel=preconnect href='https://fonts.googleapis.com'><link rel=preconnect href='https://fonts.gstatic.com' crossorigin>"
              "<link rel=stylesheet href='%s'><script>%s</script><style>%s%s</style></head><body><div class=\"app\">" % (
-                 esc(repo), FONTS_URL, THEME_JS, CSS, SCENE_CSS))
+                 esc(repo), FONTS_URL, THEME_JS, CSS, SCENE_CSS + PROGRESS_CSS))
     o.append('<header class="top"><div class="nav-row"><h1>PR scan <span>/ <a href="https://github.com/%s">%s</a></span></h1>'
              '<nav class="ptabs" id="ptabs" aria-label="Pages">%s</nav>'
              '<div class="top-right"><div class="live"><i class="dot" aria-hidden="true"></i>'
              '<span><span id="ago">Updated </span><time id="upd" datetime="%s">%s UTC</time></span></div>'
              '<button type="button" class="theme" id="theme" aria-label="Colour theme">Theme</button></div></div>%s</header>' % (
                  esc(repo), esc(repo),
-                 "".join('<button type="button" data-page="%s" aria-pressed="%s">%s</button>' % (k, "true" if k == "effort" else "false", n) for k, n in PAGES),
+                 "".join('<button type="button" data-page="%s" aria-pressed="%s">%s</button>' % (k, "true" if k == DEFAULT_PAGE else "false", n) for k, n in PAGES),
                  now.strftime(TS_FMT), now.strftime("%Y-%m-%d %H:%M"), toolbar))
     o.append('<main class="pages" id="pages">')
 
     def page_open(k):
         return '<div class="page" id="page-%s" data-page="%s"><h2 class="page-title">%s</h2>' % (k, k, esc(dict(PAGES)[k]))
+
+    # ---- Progress page: overall hero and ladder, games, README checklist, what is next, what is being worked on
+    o.append(page_open("progress"))
+    o.append('<div class="pg" id="pg">%s<div class="pg-grid">' % progress_hero_html(pg, repo))
+    nfeat = pg["features"]
+    o.append('<section class="pg-panel pg-games-p" aria-label="Games"><div class="head"><h2>Games</h2><span>%s</span></div><div class="pg-body">%s</div></section>' % (
+        "assessed by %s on %s" % (esc(pg["assessment"]["assessedBy"]), esc(pg["assessment"]["assessedAt"])) if pg["assessment"] else NO_DATA.lower(),
+        progress_games_html(pg, repo)))
+    o.append('<section class="pg-panel pg-check-p" aria-label="README feature checklist"><div class="head"><h2>What works</h2><span>%s</span></div><div class="pg-body">%s</div></section>' % (
+        "%d of %d done" % (nfeat["done"], nfeat["total"]) if nfeat else NO_DATA.lower(), progress_features_html(nfeat)))
+    o.append('<section class="pg-panel pg-next-p" aria-label="What is next"><div class="head"><h2>What&rsquo;s next</h2><span>HANDOFF, by priority</span></div><div class="pg-body">%s</div></section>' % (
+        progress_next_html(pg, prs)))
+    o.append('<section class="pg-panel pg-work-p" aria-label="Being worked on now"><div class="head"><h2>Being worked on now</h2><span>main commits and areas, last <span id="pg-rl">%s</span></span></div>'
+             '<div class="pg-body" id="pg-work">%s</div></section>' % (esc(rl0), rdata[DEFAULT_RANGE]["work"]))
+    o.append("</div></div></div>")
 
     # ---- Effort page: hero, effort map, road
     d_open = change_24h(hist, "open", n_open, now)
@@ -2404,7 +3089,7 @@ def cmd_report(args):
             write(args.history, history_text(hist))
         except OSError as e:
             print("pr-scan: could not write history: %s" % e, file=sys.stderr)
-    write(os.path.join(args.out, "index.html"), render_html(an, args.repo, now, hist))
+    write(os.path.join(args.out, "index.html"), render_html(an, args.repo, now, hist, build_progress(args.repo, now)))
     write(os.path.join(args.out, "report.md"), render_md(an, args.repo, now, hist))
     data = {
         "repo": args.repo, "generatedAt": now.strftime("%Y-%m-%dT%H:%M:%SZ"),

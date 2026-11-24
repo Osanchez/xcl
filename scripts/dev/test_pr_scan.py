@@ -426,7 +426,7 @@ class PageTests(unittest.TestCase):
         out = ps.render_html(self.an(), "o/r", NOW, same_day)
         self.assertIn("<polyline class=\"line", out)
         self.assertNotIn("<rect class=\"b-new", out)
-        self.assertEqual(out.count("No data yet"), 3)  # the bars, the merged-per-day chart and the Closed tab (no closed-PR data in this analysis)
+        self.assertEqual(out.split('data-page="effort"><h2')[1].split('id="range-data"')[0].count("No data yet"), 3)  # the bars, the merged-per-day chart and the Closed tab (no closed-PR data in this analysis)
         two = [snap("2026-11-22T23:00:00Z", [1]), snap("2026-11-23T09:00:00Z", [1, 2])]
         self.assertIn("<rect class=\"b-new", ps.render_html(self.an(), "o/r", NOW, two))
 
@@ -1311,7 +1311,7 @@ print(JSON.stringify(res));
         self.assertEqual(res["range"]["hash"], "#range=30d&focus=" + sl[0])
         self.assertFalse(res["end"]["foc"])
         self.assertEqual(res["end"]["hash"], "#range=30d")
-        self.assertEqual(res["bar"]["hash"], "#range=30d&focus=" + sl[2])  # a bar on the Areas page focuses its tower
+        self.assertEqual(res["bar"]["hash"], "#range=30d&page=effort&focus=" + sl[2])  # a bar on the Areas page focuses its tower
         self.assertTrue(res["bar"]["foc"])
         self.assertFalse(res["bad"]["foc"])  # an unknown slug focuses nothing
 
@@ -1820,19 +1820,20 @@ class PageRangeTests(unittest.TestCase):
     def test_page_tabs_markup_and_no_js_fallback(self):
         out = self.page()
         nav = out.split('id="ptabs"')[1].split("</nav>")[0]
-        self.assertEqual(re.findall(r">([^<]+)</button>", nav), ["Effort", "Areas", "Trends", "Stats"])
-        self.assertEqual(re.findall(r'data-page="([^"]+)"', nav), ["effort", "areas", "trends", "stats"])
-        self.assertIn('data-page="effort" aria-pressed="true"', nav)
+        self.assertEqual(re.findall(r">([^<]+)</button>", nav), ["Progress", "Effort", "Areas", "Trends", "Stats"])
+        self.assertEqual(re.findall(r'data-page="([^"]+)"', nav), ["progress", "effort", "areas", "trends", "stats"])
+        self.assertIn('data-page="progress" aria-pressed="true"', nav)
+        self.assertIn('data-page="effort" aria-pressed="false"', nav)
         self.assertLess(out.index('id="ptabs"'), out.index('id="filters"'))  # next to the title, before the toolbar
         self.assertLess(out.index("<h1>"), out.index('id="ptabs"'))
         pages = re.findall(r'<div class="page" id="page-(\w+)" data-page="(\w+)"', out)
-        self.assertEqual(pages, [("effort", "effort"), ("areas", "areas"), ("trends", "trends"), ("stats", "stats")])
+        self.assertEqual(pages, [("progress", "progress"), ("effort", "effort"), ("areas", "areas"), ("trends", "trends"), ("stats", "stats")])
         self.assertNotIn('class="page" id="page-areas" data-page="areas" hidden', out)  # nothing is hidden without JS
         self.assertNotIn("<div class=\"page\" hidden", out)
         self.assertIn(".ptabs{display:none", out)
         self.assertIn(".js .ptabs{display:flex}", out)
         self.assertIn(".js .page-title{display:none}", out)  # the stacked pages keep a heading only without JS
-        self.assertEqual(out.count('class="page-title"'), 4)
+        self.assertEqual(out.count('class="page-title"'), 5)
         for sec in ("a-city", "a-road", "a-standings", "a-trends", "a-meta"):
             self.assertEqual(out.count('class="%s"' % sec), 1, sec)
         self.assertIn("showPage", ps.JS)
@@ -1949,7 +1950,8 @@ class PageRangeTests(unittest.TestCase):
         self.assertIn("p.push('range='+range)", ps.JS)
         self.assertIn("p.push('page='+page)", ps.JS)
         self.assertIn("range!==DEF", ps.JS)
-        self.assertIn("page!=='effort'", ps.JS)
+        self.assertIn("page!==DP", ps.JS)
+        self.assertIn("var DP='progress'", ps.JS)
         self.assertIn("prscan-range", ps.JS)
         self.assertIn("prscan-range", ps.SCENE_JS)
 
@@ -2031,6 +2033,421 @@ class NavFontTests(unittest.TestCase):
         for key in data["ranges"]:
             self.assertEqual(sorted(data["ranges"][key]["sel"]), sorted(vals))
         self.assertIn("o.textContent=nm+' ('+n+')'", ps.JS)
+
+
+README_FIXTURE = """# XCL
+
+## Games
+
+| Game | Package (version) | State | What works | Limits |
+|---|---|---|---|---|
+| **Minecraft Preview** | `Microsoft.MinecraftBeta` 1.18.3064.0 | ✅ | fully playable | – |
+| **Fortnite** | `436609B6.FortniteClient` 2.0.1461.7919 | ✅ | works fully, as far as the game allows without its online services | the game itself is online-only (multiplayer servers) |
+| **A newer retail game** | – | \U0001f6a7 | starts in ~4 s, runs at a steady 30 fps; fits a 32 GB machine (~15 GB committed in the menus) | gameplay not reached yet; its minimap mesh pipelines are refused |
+
+## Highlights
+
+- **100 % of a retail game's shaders translate** – all 26 698 RDNA2 programs
+  become HLSL; see [the docs](docs/x.md).
+- **370+ automated tests**, including GPU tests.
+
+## What works
+
+✅ done and verified
+
+### Running the game's code
+
+| Feature | State | What it does | Verified by |
+|---|---|---|---|
+| **PE loader** | ✅ | relocations, imports by name / ordinal | the game's 16 DLLs load |
+| **kernelx** | ✅ | title memory | unit tests |
+| **Memory** | \U0001f6a7 | shared memory, `a | b` in code | GPU tests |
+
+### Graphics
+
+| Feature | State | What it does | Verified by |
+|---|---|---|---|
+| **Textures** | ✅ | GFX10 tiling | 909 / 912 exact |
+| **Ray tracing** | planned | BLAS / TLAS | - |
+
+## Controls
+
+| Key | State |
+|---|---|
+| not a feature | ✅ |
+"""
+
+HANDOFF_FIXTURE = """# HANDOFF
+
+## In progress (unfinished)
+### Retail game menus
+Its minimap mesh pipelines are refused. More text.
+### Audio
+Opus voices.
+
+## Other
+text
+
+## Next steps (priority)
+Little is left to do.
+1. Once the user has a legal game exe: `xcl inspect`, `xcl run`, analysis of `report.json`
+   (e.g. PresentX; `d3d12.unknown_iids`). Second sentence.
+2. Textures: binding `gpu::texture` to the title's API (textures in its memory), MSAA.
+3. Audio: Opus is decoded; XMA2 low priority.
+
+## After
+1. not an item
+"""
+
+
+def pg_fixture(**kw):
+    a = ps.load_progress()
+    d = {"assessment": a, "live": {"README": a["readmeBlob"], "HANDOFF": a["handoffBlob"]}, "features": ps.parse_features(README_FIXTURE),
+         "games": ps.parse_games(README_FIXTURE), "highlights": ps.parse_highlights(README_FIXTURE), "next": ps.parse_next_steps(HANDOFF_FIXTURE),
+         "inprogress": ps.parse_in_progress(HANDOFF_FIXTURE),
+         "commits": ps.parse_commits([{"sha": "abcdef123456", "html_url": "https://github.com/o/r/commit/abcdef1", "author": {"login": "dev1"},
+                                        "commit": {"message": "VFS: subject line\n\nbody", "committer": {"date": ago(hours=3)}}},
+                                       {"sha": "0123456789ab", "html_url": "https://github.com/o/r/commit/0123456", "author": None,
+                                        "commit": {"message": "old", "author": {"name": "Zed"}, "committer": {"date": ago(days=10)}}}])}
+    d.update(kw)
+    return d
+
+
+class LadderTests(unittest.TestCase):
+    def setUp(self):
+        self.a = ps.load_progress()
+        self.ladder = self.a["ladder"]
+
+    def pct(self, **lv):
+        return ps.game_pct(dict({k: 0 for k in ps.GAME_STEPS}, **lv), self.ladder)
+
+    def test_each_step(self):
+        self.assertEqual(self.pct(), 15)
+        self.assertEqual(self.pct(loads=1), 30)
+        self.assertEqual(self.pct(loads=1, boots=1), 45)
+        self.assertEqual(self.pct(loads=1, boots=1, menus=1), 60)
+        self.assertEqual(self.pct(loads=1, boots=1, menus=1, ingame=1), 80)
+        self.assertEqual(self.pct(loads=1, boots=1, menus=1, ingame=1, playable=1), 100)
+
+    def test_partial_fraction_toward_the_next_step(self):
+        self.assertEqual(self.pct(loads=0.5), 22.5)
+        self.assertEqual(self.pct(loads=1, boots=0.5), 37.5)
+        self.assertEqual(self.pct(loads=1, boots=1, menus=1, ingame=0.5), 70)
+        self.assertEqual(self.pct(loads=1, boots=1, menus=1, ingame=1, playable=0.25), 85)
+        self.assertEqual(self.pct(loads=2, boots=-1), 30)  # levels are clamped to 0..1
+        self.assertEqual(ps.fmt_pct(22.5), "22.5")
+        self.assertEqual(ps.fmt_pct(60.0), "60")
+
+    def test_furthest_reached_step_counts(self):
+        self.assertEqual(self.pct(menus=1), 60)
+        cur, nxt, frac = ps.game_reach({"loads": 1, "boots": 0.4}, self.ladder)
+        self.assertEqual((cur["key"], nxt["key"], frac), ("loads", "boots", 0.4))
+
+    def test_overall_is_the_furthest_game_not_yet_playable(self):
+        games = [{"name": "a", "levels": {"loads": 1, "boots": 1, "menus": 1, "ingame": 1, "playable": 1}},
+                 {"name": "b", "levels": {"loads": 1, "boots": 1, "menus": 0.5, "ingame": 0, "playable": 0}},
+                 {"name": "c", "levels": {"loads": 1, "boots": 0, "menus": 0, "ingame": 0, "playable": 0}}]
+        ov = ps.overall_progress(games, self.ladder)
+        self.assertEqual((ov["pct"], ov["step"], ov["game"], ov["playable"], ov["total"]), (52.5, "Boots", "b", 1, 3))
+
+    def test_overall_when_all_playable_and_without_games(self):
+        g = {"name": "a", "levels": {k: 1 for k in ps.GAME_STEPS}}
+        ov = ps.overall_progress([g, dict(g, name="b")], self.ladder)
+        self.assertEqual((ov["pct"], ov["step"], ov["game"], ov["playable"], ov["total"]), (100.0, "Playable", None, 2, 2))
+        self.assertIsNone(ps.overall_progress([], self.ladder))
+
+    def test_markers_stack_at_the_same_percentage(self):
+        mk = ps.ladder_markers(self.a["games"], self.ladder)
+        self.assertEqual([(m["name"], m["pct"], m["row"]) for m in mk],
+                         [("A newer retail game", 60, 0), ("Fortnite", 100, 0), ("Minecraft Preview", 100, 1), ("Unicorn Overlord", 100, 2), ("XDefiant", 100, 3)])
+        self.assertEqual([m["playable"] for m in mk], [False, True, True, True, True])
+
+
+class ProgressFileTests(unittest.TestCase):
+    def test_file_is_valid_and_has_the_initial_values(self):
+        with open(ps.PROGRESS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertEqual(ps.validate_progress(d), [])
+        self.assertEqual((d["assessedAt"], d["assessedBy"]), ("2026-11-24", "manual"))
+        self.assertEqual(d["readmeBlob"], "4d1932d2a423821dfd5f36fa44068f5689af817a")
+        self.assertEqual(d["handoffBlob"], "984a45360ab0cdb3750654199552df033f7fee87")
+        self.assertEqual([(s["key"], s["pct"]) for s in d["ladder"]],
+                         [("groundwork", 15), ("loads", 30), ("boots", 45), ("menus", 60), ("ingame", 80), ("playable", 100)])
+        g = {x["name"]: x for x in d["games"]}
+        self.assertEqual(list(g), ["Minecraft Preview", "Unicorn Overlord", "Fortnite", "XDefiant", "A newer retail game"])
+        for n in ("Minecraft Preview", "Unicorn Overlord", "Fortnite", "XDefiant"):
+            self.assertEqual(g[n]["levels"], {k: 1 for k in ps.GAME_STEPS})
+            self.assertEqual(ps.game_pct(g[n]["levels"], d["ladder"]), 100)
+        self.assertEqual(g["Minecraft Preview"]["evidence"], "fully playable")
+        self.assertIn("online services", g["Fortnite"]["evidence"])
+        self.assertIn("online-only", g["Fortnite"]["limits"])
+        self.assertIn("servers have been shut down", g["XDefiant"]["limits"])
+        n = g["A newer retail game"]
+        self.assertEqual(n["levels"], {"loads": 1, "boots": 1, "menus": 1, "ingame": 0, "playable": 0})
+        self.assertEqual(n["evidence"], "starts in ~4 s, runs at a steady 30 fps without a crash, shows its menus and goes on past the first one to its settings")
+        self.assertEqual(n["limits"], "gameplay not reached yet; its minimap mesh pipelines are refused")
+        self.assertEqual(ps.game_pct(n["levels"], d["ladder"]), 60)
+        ov = ps.overall_progress(d["games"], d["ladder"])
+        self.assertEqual((ov["pct"], ov["step"], ov["playable"], ov["total"]), (60, "Menus", 4, 5))
+        for x in d["games"]:
+            self.assertTrue(x["source"].startswith("README.md#"))
+
+    def test_validation_rejects_bad_files(self):
+        good = ps.load_progress()
+        bad = lambda f: ps.validate_progress(f(json.loads(json.dumps(good))))
+        self.assertTrue(bad(lambda d: d.update(assessedBy="human") or d))
+        self.assertTrue(bad(lambda d: d.update(readmeBlob="abc") or d))
+        self.assertTrue(bad(lambda d: d.update(assessedAt="24 Nov") or d))
+        self.assertTrue(bad(lambda d: d["games"][0]["levels"].update(boots=1.5) or d))
+        self.assertTrue(bad(lambda d: d["games"][0]["levels"].pop("boots") and d))
+        self.assertTrue(bad(lambda d: d["ladder"].pop() and d))
+        self.assertTrue(bad(lambda d: d.update(games=[]) or d))
+        self.assertTrue(ps.validate_progress([]))
+
+    def test_load_progress_falls_back_to_none(self):
+        d = tempfile.mkdtemp()
+        try:
+            self.assertIsNone(ps.load_progress(os.path.join(d, "missing.json")))
+            p = os.path.join(d, "x.json")
+            with open(p, "w") as f:
+                f.write("{not json")
+            self.assertIsNone(ps.load_progress(p))
+            with open(p, "w") as f:
+                f.write("{}")
+            self.assertIsNone(ps.load_progress(p))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class ProgressParserTests(unittest.TestCase):
+    def test_cells_keep_pipes_in_backticks(self):
+        self.assertEqual(ps.md_cells("| a | `x | y` | c\\|d |"), ["a", "`x | y`", "c|d"])
+        self.assertIsNone(ps.md_cells("not a row"))
+
+    def test_features_by_section_with_percent(self):
+        f = ps.parse_features(README_FIXTURE)
+        self.assertEqual([(s["name"], s["done"], s["total"], s["pct"]) for s in f["sections"]],
+                         [("Running the game's code", 2, 3, 67), ("Graphics", 1, 2, 50)])
+        self.assertEqual((f["done"], f["total"], f["pct"]), (3, 5, 60))
+        row = f["sections"][0]["rows"][2]
+        self.assertEqual((row["feature"], row["kind"], row["what"]), ("Memory", "wip", "shared memory, `a | b` in code"))
+        self.assertEqual(f["sections"][1]["rows"][1]["kind"], "other")
+        self.assertEqual(f["sections"][1]["rows"][1]["state"], "planned")
+        self.assertNotIn("Controls", [s["name"] for s in f["sections"]])  # outside "What works"
+        self.assertIsNone(ps.parse_features("# nothing\n"))
+
+    def test_games_table_in_the_real_row_format(self):
+        g = ps.parse_games(README_FIXTURE)
+        self.assertEqual([x["name"] for x in g], ["Minecraft Preview", "Fortnite", "A newer retail game"])
+        self.assertEqual((g[0]["package"], g[0]["kind"], g[0]["what"], g[0]["limits"]), ("`Microsoft.MinecraftBeta` 1.18.3064.0", "done", "fully playable", ""))
+        self.assertEqual((g[2]["package"], g[2]["kind"]), ("", "wip"))
+        self.assertIn("minimap mesh pipelines", g[2]["limits"])
+        self.assertEqual(ps.parse_games("nothing"), [])
+
+    def test_highlights_join_continuation_lines(self):
+        h = ps.parse_highlights(README_FIXTURE)
+        self.assertEqual(len(h), 2)
+        self.assertEqual(h[0], "100 % of a retail game's shaders translate – all 26 698 RDNA2 programs become HLSL; see the docs.")
+        self.assertEqual(h[1], "370+ automated tests, including GPU tests.")
+
+    def test_next_steps_numbered_items(self):
+        n = ps.parse_next_steps(HANDOFF_FIXTURE)
+        self.assertEqual([x["n"] for x in n], [1, 2, 3])
+        self.assertTrue(n[0]["text"].startswith("Once the user has a legal game exe: `xcl inspect`"))
+        self.assertIn("(e.g. PresentX; `d3d12.unknown_iids`). Second sentence.", n[0]["text"])
+        self.assertEqual(n[0]["short"], "Once the user has a legal game exe: `xcl inspect`, `xcl run`, analysis of `report.json` (e.g. PresentX; `d3d12.unknown_iids`).")
+        self.assertEqual(n[1]["short"], "Textures: binding `gpu::texture` to the title's API (textures in its memory), MSAA.")
+        self.assertEqual(ps.parse_next_steps("## Next steps (priority)\n"), [])
+        self.assertLessEqual(len(ps.first_sentence("word " * 100)), ps.SHORT_MAX)
+
+    def test_in_progress_headings_and_first_lines(self):
+        ip = ps.parse_in_progress(HANDOFF_FIXTURE)
+        self.assertEqual(ip, [{"heading": "Retail game menus", "line": "Its minimap mesh pipelines are refused. More text."},
+                              {"heading": "Audio", "line": "Opus voices."}])
+        self.assertEqual(ps.parse_in_progress("## In progress (unfinished)\nNothing open.\n\n## x\n"), [{"heading": "", "line": "Nothing open."}])
+        self.assertEqual(ps.parse_in_progress("## In progress (unfinished)\n\n## x\n"), [])
+
+    def test_sections_skip_fenced_code(self):
+        self.assertEqual(ps.md_section("## A\n```\n## B\n```\nx\n## C\n", "A"), ["```", "## B", "```", "x"])
+
+    def test_contents_api_decoding(self):
+        import base64
+        sha, text = ps.decode_contents({"sha": "s", "encoding": "base64", "content": base64.b64encode("héllo\n".encode()).decode()})
+        self.assertEqual((sha, text), ("s", "héllo\n"))
+        self.assertEqual(ps.decode_contents({"sha": "s", "encoding": "none", "content": ""}), ("s", None))
+
+    def test_commits_parse_and_range(self):
+        c = pg_fixture()["commits"]
+        self.assertEqual([(x["sha"], x["subject"], x["author"]) for x in c], [("abcdef1", "VFS: subject line", "dev1"), ("0123456", "old", "Zed")])
+        self.assertEqual(len(ps.commits_in_range(c, 24 * 3600, NOW)), 1)
+        self.assertEqual(len(ps.commits_in_range(c, 30 * 86400, NOW)), 2)
+        self.assertEqual(ps.parse_commits("garbage"), [])
+        self.assertEqual(ps.parse_commits([{"nope": 1}]), [])
+
+
+class RelatedPrTests(unittest.TestCase):
+    ITEM = {"n": 2, "text": "Textures: binding `gpu::texture` to the title's API, MSAA.", "short": "Textures: binding `gpu::texture` to the title's API, MSAA."}
+
+    def test_path_match_and_title_jaccard(self):
+        prs = [pr(1, "Shaders: unrelated words here", ["crates/xcl/src/gpu/texture.rs"]),
+               pr(2, "bind textures to the title's API MSAA", ["crates/xcl/src/vfs/a.rs"]),
+               pr(3, "VFS: something else entirely", ["crates/xcl/src/vfs/b.rs"]),
+               pr(4, "Tests: dir match", ["crates/xcl/src/gpu/texture/mod.rs"]),
+               pr(5, "Tests: sibling must not match", ["crates/xcl/src/gpu/textures.rs"])]
+        rel = ps.related_prs(self.ITEM, prs)
+        self.assertEqual([r["number"] for r in rel], [4, 1, 2])  # shared paths first (newest first), then similarity
+        self.assertEqual(rel[1]["paths"], ["crates/xcl/src/gpu/texture.rs"])
+        self.assertGreaterEqual(rel[2]["jaccard"], ps.RELATED_JACCARD)
+
+    def test_limit_and_literal_paths(self):
+        prs = [pr(n, "VFS: x", ["crates/xcl/src/gpu/texture.rs"]) for n in range(1, 9)]
+        self.assertEqual([r["number"] for r in ps.related_prs(self.ITEM, prs)], [8, 7, 6, 5, 4])
+        item = {"n": 1, "text": "Check `d3d12x/device_x.rs` first", "short": "Check `d3d12x/device_x.rs` first"}
+        self.assertEqual([r["number"] for r in ps.related_prs(item, [pr(1, "x", ["crates/xcl/src/hle/d3d12x/device_x.rs"]), pr(2, "x", ["a/device_x.rs.bak"])])], [1])
+        self.assertEqual(ps.related_prs(self.ITEM, []), [])
+
+    def test_module_paths(self):
+        ex, mods = ps.module_paths("`gpu::bvh::build/build_top` and `texture::CONSOLE_PIPES` and `x.rs`")
+        self.assertEqual(mods, {"crates/xcl/src/gpu/bvh/build"})
+        self.assertEqual(ex, {"x.rs"})
+
+
+class ProgressPageTests(unittest.TestCase):
+    def an(self):
+        return RangeTests().an()
+
+    def page(self, **kw):
+        return ps.render_html(self.an(), "o/r", NOW, None, pg_fixture(**kw))
+
+    def prog(self, out):
+        return out.split('data-page="progress"><h2')[1].split('<div class="page"')[0]
+
+    def test_tab_order_default_and_no_js_fallback(self):
+        out = self.page()
+        nav = out.split('id="ptabs"')[1].split("</nav>")[0]
+        self.assertEqual(re.findall(r">([^<]+)</button>", nav), ["Progress", "Effort", "Areas", "Trends", "Stats"])
+        self.assertEqual(ps.PAGES[0], ("progress", "Progress"))
+        self.assertIn('data-page="progress" aria-pressed="true"', nav)
+        self.assertEqual([k for k, _ in re.findall(r'<div class="page" id="page-(\w+)" data-page="(\w+)"', out)][:2], ["progress", "effort"])
+        self.assertNotIn('<div class="page" id="page-progress" data-page="progress" hidden', out)  # shown without JS, stacked
+        self.assertIn("showPage", ps.JS)
+        self.assertIn("PGS=['progress','effort','areas','trends','stats']", ps.JS)
+
+    def test_hero_ladder_and_games(self):
+        p = self.prog(self.page())
+        self.assertIn('<div class="score">60<small>%</small></div>', p)
+        self.assertIn("<b>Menus</b><span>4 of 5 games playable</span><span>Assessed 2026-11-24 (manual)</span>", p)
+        self.assertEqual(p.count('class="pg-mk '), 5)
+        self.assertIn('class="pg-mk wip" style="left:60%;bottom:0px"', p)
+        self.assertIn('class="pg-mk ok" style="left:100%;bottom:33px"', p)
+        self.assertEqual(re.findall(r'<li style="left:(\d+)%"[^>]*><b>', p), ["15", "30", "45", "60", "80", "100"])
+        self.assertIn('<div class="pg-track"><i style="width:60%"></i>', p)
+        self.assertEqual(p.count('class="pg-game"'), 5)
+        self.assertEqual(re.findall(r'<li class="pg-game"><div class="pg-gh"><b>([^<]+)</b>', p),
+                         ["A newer retail game", "Minecraft Preview", "Unicorn Overlord", "Fortnite", "XDefiant"])  # in progress first, then file order
+        self.assertEqual(p.count('class="c full"'), 4 * 6 + 4)  # four playable games, plus groundwork, loads, boots, menus of the fifth
+        self.assertEqual(p.count('class="c none"'), 2)
+        self.assertIn("“fully playable”", p)
+        self.assertIn("<b>Limit</b> gameplay not reached yet; its minimap mesh pipelines are refused", p)
+        self.assertIn('class="pg-st">✅</span>', p)
+        self.assertEqual(ps.first_sentence("x `" + "y" * 200 + "`"), "x…")  # a cut never leaves an open code span
+
+    def test_partial_cells(self):
+        a = json.loads(json.dumps(ps.load_progress()))
+        a["games"][4]["levels"]["ingame"] = 0.5
+        out = self.page(assessment=a)
+        self.assertIn('class="c part" style="--f:50%"', self.prog(out))
+        self.assertIn('<span class="pg-gp">70 %</span>', self.prog(out))
+
+    def test_checklist_next_and_work(self):
+        p = self.prog(self.page())
+        self.assertIn("3 of 5 done", p)
+        self.assertEqual(p.count('<details class="pg-sec">'), 2)
+        self.assertIn('<span class="nm">Graphics</span><span class="pg-meter"><i style="width:50%"></i></span><span class="pc">50 %</span>', p)
+        self.assertEqual(p.count('<li value='), 3)
+        self.assertIn("<summary>Textures: binding <code>gpu::texture</code> to the title&#x27;s API (textures in its memory), MSAA.</summary>", p)
+        self.assertIn("In progress (HANDOFF)", p)
+        self.assertIn("<b>Retail game menus</b>", p)
+        self.assertIn("Highlights", p)
+        self.assertIn("<b>1</b> commit on main in the last 7 d", p)
+        self.assertIn("VFS: subject line", p)
+        self.assertIn("dev1", p)
+        self.assertIn('id="pg-work"', p)
+        data = json.loads(self.page().split('id="range-data">')[1].split("</script>")[0])
+        self.assertIn("<b>2</b> commits on main in the last 30 d", data["ranges"]["30d"]["work"])
+        self.assertIn("No commits in the last 1 h.", data["ranges"]["1h"]["work"])
+        self.assertIn("Most active areas", data["ranges"]["30d"]["work"])
+        self.assertEqual(set(data["ranges"]), {k for k, _, _ in ps.RANGES})
+        self.assertIn("wk.innerHTML=R.work", ps.JS)
+
+    def test_related_prs_render_in_next_steps(self):
+        an = ps.build_analysis([pr(7, "Textures: tiling", ["crates/xcl/src/gpu/texture.rs"], createdAt=ago(days=1), updatedAt=ago(days=1))], NOW, [])
+        p = self.prog(ps.render_html(an, "o/r", NOW, None, pg_fixture()))
+        self.assertIn('href="https://github.com/o/r/pull/7"', p.split("<ol class=\"pg-next\">")[1])
+        self.assertIn("No related open PR", p)
+
+    def test_banner_on_a_sha_mismatch(self):
+        a = ps.load_progress()
+        live = {"README": "f" * 40, "HANDOFF": a["handoffBlob"]}
+        out = self.prog(self.page(live=live))
+        self.assertIn("README changed since this assessment (2026-11-24).", out)
+        self.assertIn('href="https://github.com/o/r/commits/main/README.md"', out)
+        self.assertNotIn("HANDOFF history", out)
+        both = ps.banner_html(a, {"README": "1" * 40, "HANDOFF": "2" * 40}, "o/r")
+        self.assertIn("README and HANDOFF changed since", both)
+        self.assertEqual(ps.changed_docs(a, {"README": a["readmeBlob"], "HANDOFF": a["handoffBlob"]}), [])
+        self.assertEqual(ps.changed_docs(a, {"README": None, "HANDOFF": None}), [])  # an unknown live sha is no change
+        self.assertEqual(ps.changed_docs(None, {"README": "x"}), [])
+        self.assertNotIn("pg-banner", self.prog(self.page()))
+
+    def test_empty_states(self):
+        out = ps.render_html(self.an(), "o/r", NOW)
+        p = self.prog(out)
+        self.assertGreaterEqual(p.count("No data yet"), 5)
+        self.assertNotIn('class="pg-game"', p)
+        self.assertNotIn("pg-banner", p)
+        self.assertIn("No data yet", ps.progress_work_html(None, ps.range_view(self.an(), 86400, NOW), NOW, 86400, "24 h", "o/r"))
+        w = ps.progress_work_html([], {"prs": [], "closed": None}, NOW, 86400, "24 h", "o/r")
+        self.assertIn("No commits in the last 24 h.", w)
+        self.assertIn("No PR activity in the last 24 h.", w)
+        only_readme = self.prog(self.page(assessment=None, live={}))
+        self.assertIn("No data yet", only_readme)
+        self.assertEqual(only_readme.count('class="pg-game"'), 3)  # README games are still listed, unassessed
+
+    def test_hostile_markdown_is_escaped(self):
+        hostile = "<img src=x onerror=alert(1)>"
+        readme = ("## Games\n\n| Game | Package | State | What works | Limits |\n|---|---|---|---|---|\n| **%s** | `<b>` | ✅ | [x](javascript:alert(1)) <script>a</script> | \"q\" |\n"
+                  "\n## Highlights\n\n- <script>alert(1)</script> `<i>code</i>` **bold**\n\n## What works\n\n### <b>H</b>\n\n| Feature | State | What it does |\n|---|---|---|\n| <u>f</u> | <i>s</i> | <script>w</script> |\n" % hostile)
+        handoff = "## Next steps (priority)\n1. <script>alert(2)</script> `<b>x</b>` [l](javascript:evil)\n## In progress (unfinished)\n### <h1>t</h1>\n<script>line</script>\n"
+        pg = pg_fixture(games=ps.parse_games(readme), highlights=ps.parse_highlights(readme), features=ps.parse_features(readme),
+                        next=ps.parse_next_steps(handoff), inprogress=ps.parse_in_progress(handoff))
+        pg["commits"] = ps.parse_commits([{"sha": "abc1234", "html_url": "javascript:x", "author": {"login": "<s>"},
+                                           "commit": {"message": "<script>c</script>", "committer": {"date": ago(hours=1)}}}])
+        p = self.prog(ps.render_html(self.an(), "o/r", NOW, None, pg))
+        for bad in ("<script", "<img", "<u>", "<i>s", "<b>H", "<h1>", "<s>", "javascript:alert", "javascript:evil", 'href="javascript'):
+            self.assertNotIn(bad, p, bad)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt; <code>&lt;i&gt;code&lt;/i&gt;</code> bold", p)
+        self.assertIn("<code>&lt;b&gt;x&lt;/b&gt;</code>", p)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", p)
+        for bad in ("<script>c", "javascript:x"):
+            self.assertNotIn(bad, p)
+        data = self.page().split('id="range-data">')[1].split("</script>")[0]
+        self.assertNotIn("<", data)
+
+    def test_fits_the_viewport_and_scrolls_inside_panels(self):
+        self.assertIn(".js .pg-grid{flex:1;grid-template-columns:repeat(2,minmax(0,1fr))", ps.PROGRESS_CSS)
+        self.assertIn(".pg-body{overflow:auto;min-height:0", ps.PROGRESS_CSS)
+        self.assertIn(".js .pg-body{max-height:none}", ps.PROGRESS_CSS)
+        out = self.page()
+        self.assertIn(ps.PROGRESS_CSS, out)
+        for var in ("--surface", "--edge", "--good", "--partial", "--accent", "--sp-3"):
+            self.assertIn(var, ps.CSS)
+
+    @unittest.skipUnless(jsc_available(), "jsc not available")
+    def test_progress_is_the_default_page_in_jsc(self):
+        html = self.page()
+        res = jsc_run(ps.JS, "print('ok');", html=html)
+        self.assertIn("ok", res)
 
 
 if __name__ == "__main__":
