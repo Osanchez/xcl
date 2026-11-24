@@ -474,11 +474,6 @@ def delta_text(d):
     return '<span class="delta">%s %d / 24 h</span>' % ("&#9650;" if d > 0 else "&#9660;", abs(d))
 
 
-def tile(label, value, delta=None, show_delta=True):
-    return '<div class="stat"><div class="stat-l">%s</div><div class="stat-v">%d</div>%s</div>' % (
-        esc(label), value, delta_text(delta) if show_delta else "")
-
-
 def legend(items):
     return '<ul class="legend">%s</ul>' % "".join(
         '<li><i class="sw %s"></i>%s</li>' % (esc(cls), esc(name)) for name, cls in items)
@@ -552,9 +547,10 @@ def svg_line_chart(series, label, w=480, h=240):
         # tooltip dots: the last point of each day, plus the very last one
         marks = {t.date(): (t, v) for t, v in sp}
         for t, v in marks.values():
-            body.append('<circle class="dot %s" cx="%.1f" cy="%.1f" r="%d"><title>%s</title></circle>' % (
+            tip_text = "%s %s UTC: %s %d" % (_md(t), t.strftime("%H:%M"), s["name"], v)
+            body.append('<circle class="dot %s" cx="%.1f" cy="%.1f" r="%d" data-tip="%s"><title>%s</title></circle>' % (
                 esc(s["cls"]), x(t), y(v), 4 if len(sp) == 1 else 3,
-                esc("%s %s UTC: %s %d" % (_md(t), t.strftime("%H:%M"), s["name"], v))))
+                esc(tip_text), esc(tip_text)))
     return svg_frame(w, h, label, "".join(body))
 
 
@@ -574,22 +570,22 @@ def svg_bars(rows, label, w=480, h=240):
         for j, (key, cls, name) in enumerate((("new", "b-new", "opened"), ("closed", "b-closed", "closed"))):
             bh = (h - mt - mb) * r[key] / top
             bx = cx - bw - 1 + j * (bw + 2)
-            body.append('<rect class="%s" x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="2"><title>%s</title></rect>' % (
-                cls, bx, h - mb - bh, bw, max(bh, 0), esc("%s: %d %s" % (r["day"], r[key], name))))
+            body.append('<rect class="%s" x="%.1f" y="%.1f" width="%.1f" height="%.1f" data-tip="%s"><title>%s</title></rect>' % (
+                cls, bx, h - mb - bh, bw, max(bh, 0), esc("%s: %d %s" % (r["day"], r[key], name)), esc("%s: %d %s" % (r["day"], r[key], name))))
         if (len(rows) - 1 - i) % every == 0:
             body.append('<text class="tick" x="%.1f" y="%d" text-anchor="middle">%s</text>' % (cx, h - 8, esc(r["day"][5:])))
     return svg_frame(w, h, label, "".join(body))
 
 
 def sparkline(vals, label="", w=72, h=24):
-    cls = 'class="spark" width="%d" height="%d" viewBox="0 0 %d %d"' % (w, h, w, h)
+    cls = 'class="spark" width="%d" height="%d" viewBox="0 0 %d %d" preserveAspectRatio="none"' % (w, h, w, h)
     if len(vals) < 2:
         return '<span class="nodata">no data</span>'
     lo, hi = min(vals), max(vals)
     pts = " ".join("%.1f,%.1f" % (2 + (w - 4) * i / (len(vals) - 1),
                                   h / 2 if hi == lo else h - 3 - (h - 6) * (v - lo) / (hi - lo)) for i, v in enumerate(vals))
-    return '<svg %s role="img" aria-label="%s"><title>%s</title><polyline class="spline" points="%s"/></svg>' % (
-        cls, esc(label), esc(label), pts)
+    return '<svg %s role="img" aria-label="%s" data-tip="%s"><title>%s</title><polyline class="spline" points="%s"/></svg>' % (
+        cls, esc(label), esc(label), esc(label), pts)
 
 
 def avatar(login):
@@ -612,100 +608,136 @@ def category_css():
 
 
 _LIGHT_CAT, _DARK_CAT = category_css()
-_DARK_TOKENS = ("--page:#0e1219;--ink:#eef2f8;--soft:#a2adbc;--rule:#2a3240;--wash:#1a212c;--accent:#8ca8ff;--partial:#ffab5c;"
-                "--good:#b4e06a;--bad:#ff8a80;" + _DARK_CAT)
+_DARK_TOKENS = ("--page:#0e1219;--ink:#eef2f8;--soft:#a2adbc;--rule:#2a3240;--wash:#1a212c;--accent:#8ca8ff;--partial:#ffab5c;--partial-text:#ffab5c;"
+                "--empty:#39424f;--tip:#eef2f8;--tip-text:#0e1219;--tip-soft:#3a4454;--good:#b4e06a;--bad:#ff8a80;" + _DARK_CAT)
 CSS = (":root{color-scheme:light dark;--page:#fff;--ink:#10141c;--soft:#566070;--rule:#d9dee6;--wash:#eef1f5;--accent:#1546e0;"
-       "--partial:#e8770c;--good:#4f7f16;--bad:#c4261d;" + _LIGHT_CAT + "}\n"
+       "--partial:#e8770c;--partial-text:#a94f00;--empty:#c9cfd9;--tip:#10141c;--tip-text:#fff;--tip-soft:#d7dce4;--good:#4f7f16;--bad:#c4261d;"
+       + _LIGHT_CAT + "}\n"
        "@media (prefers-color-scheme:dark){:root:not([data-theme=light]){" + _DARK_TOKENS + "}}\n"
        ":root[data-theme=dark]{color-scheme:dark;" + _DARK_TOKENS + "}\n:root[data-theme=light]{color-scheme:light}\n") + """
 *{box-sizing:border-box}
-html{-webkit-text-size-adjust:100%}
-body{margin:0;background:var(--page);color:var(--ink);font:400 15px/1.45 Roboto,system-ui,-apple-system,"Segoe UI",sans-serif;font-variant-numeric:tabular-nums}
-.cond,h1,h2,.hero-n,.stat-v,.aname,th{font-family:"Roboto Condensed","Arial Narrow",Roboto,system-ui,sans-serif}
-main{max-width:1280px;margin:0 auto;padding:0 16px 48px}
+html{background:var(--page);-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--page);color:var(--ink);font:400 15px/1.45 Roboto,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;font-variant-numeric:tabular-nums}
+h1,h2,h3,p,ol,ul{margin:0;padding:0}ol,ul{list-style:none}
+h1,h2,h3,.cond,.score,.stat b,.rank,.step b,th{font-family:"Roboto Condensed","Arial Narrow",Roboto,system-ui,sans-serif}
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 a:focus-visible,button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.bar{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px 24px;padding:16px 0;border-bottom:2px solid var(--ink)}
-h1{font-size:20px;line-height:24px;margin:0;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
-h1 span{color:var(--soft)}
-.live{display:flex;align-items:center;gap:16px;font-size:13px;line-height:20px;color:var(--soft)}
-.status{display:flex;align-items:center;gap:8px}
-.dot-live{width:8px;height:8px;background:var(--good);animation:pulse 2s ease-in-out infinite}
-@keyframes pulse{50%{opacity:.25}}@media (prefers-reduced-motion:reduce){.dot-live{animation:none}}
-.tbtn{font:500 13px/20px Roboto,system-ui,sans-serif;color:var(--ink);background:none;border:1px solid var(--rule);padding:4px 12px;cursor:pointer;min-width:72px}
-.tbtn:hover{border-color:var(--ink)}
-.hero{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 24px;padding:32px 0 24px}
-.hero-n{font-size:72px;line-height:72px;font-weight:700;letter-spacing:-.02em}
-.hero-t{display:flex;flex-direction:column;gap:4px}.hero-l{font:700 16px/24px "Roboto Condensed",Roboto,sans-serif;text-transform:uppercase;letter-spacing:.04em}
-.note{color:var(--soft);margin:0;max-width:640px}.note b{color:var(--ink);font-weight:500}
-.delta{display:block;white-space:nowrap;font-size:13px;line-height:20px;color:var(--soft)}
-.strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(144px,1fr));border-top:1px solid var(--rule);border-left:1px solid var(--rule)}
-.stat{padding:16px;border-right:1px solid var(--rule);border-bottom:1px solid var(--rule)}
-.stat-l{font-size:13px;line-height:20px;color:var(--soft)}.stat-v{font-size:20px;line-height:28px;font-weight:700}
-.stat-h{font-size:13px;line-height:20px;color:var(--soft)}
-.cols{display:block}
-.sec{margin-top:40px}
-.sh{display:flex;justify-content:space-between;align-items:baseline;gap:8px 16px;flex-wrap:wrap;padding-bottom:8px;border-bottom:1px solid var(--rule)}
-h2{font-size:16px;line-height:24px;margin:0;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
-.meta,.muted,.small{color:var(--soft)}.meta,.small{font-size:13px;line-height:20px}
-.sec-note{color:var(--soft);font-size:13px;line-height:20px;margin:8px 0 16px}
-.chart-block{padding-top:16px}.chart-block+.chart-block{border-top:1px solid var(--rule);margin-top:16px}
-.chart-block h3{font-size:15px;line-height:24px;margin:0 0 4px;font-weight:500}
-.chart{display:block;width:100%;height:auto;margin-top:8px}
-.chart .grid{stroke:var(--rule);stroke-width:1}.chart .tick{fill:var(--soft);font-size:12px;font-family:Roboto,system-ui,sans-serif}
+.app{display:grid;grid-template-columns:minmax(0,1fr);padding:0 16px;
+grid-template-areas:"top" "city" "road" "standings" "filters" "feed" "meta" "foot"}
+.app>*{min-width:0}
+.top{grid-area:top;display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:50px;border-bottom:2px solid var(--ink)}
+h1{font:700 20px/1.1 "Roboto Condensed",Arial,sans-serif;text-transform:uppercase;letter-spacing:.04em}h1 span{color:var(--soft)}
+h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:1.3;font-weight:700}
+.top-right{display:flex;align-items:center;gap:12px;min-width:0}
+.live{display:flex;align-items:center;gap:8px;color:var(--soft);font-size:13px;white-space:nowrap}
+.dot{width:8px;height:8px;background:var(--accent);animation:beat 2s steps(2) infinite}
+@keyframes beat{50%{opacity:.25}}
+.theme{border:1px solid var(--rule);background:transparent;color:var(--ink);font:500 13px/1 Roboto,Arial,sans-serif;padding:7px 10px;cursor:pointer}
+.theme:hover{border-color:var(--ink)}
+.filters{grid-area:filters;display:none;flex-direction:column;gap:8px;padding:9px 0;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule)}
+.js .filters{display:flex}
+.frow{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px}
+.chips{display:flex;gap:6px;overflow-x:auto;scrollbar-width:thin;padding-bottom:2px}
+.chip{flex:none;border:1px solid var(--rule);background:transparent;color:var(--ink);font:500 13px/1 Roboto,Arial,sans-serif;padding:7px 10px;cursor:pointer;border-radius:0}
+.chip:hover{border-color:var(--ink)}
+.chip[aria-pressed=true]{background:var(--ink);border-color:var(--ink);color:var(--page)}
+.filters input{font:500 13px/1.2 Roboto,Arial,sans-serif;padding:7px 10px;border:1px solid var(--rule);background:var(--page);color:var(--ink);min-width:0;flex:1 1 240px;max-width:380px;border-radius:0}
+.result{font-size:13px;color:var(--soft)}
+.a-city,.a-road,.a-standings,.a-feed{min-width:0;min-height:0;padding:12px 0}
+.a-road,.a-standings,.a-feed{border-top:1px solid var(--rule)}
+.a-city{grid-area:city}.a-road{grid-area:road;display:flex;flex-direction:column}.a-standings{grid-area:standings;display:flex;flex-direction:column}
+.a-feed{grid-area:feed;display:flex;flex-direction:column}
+.head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:8px;min-width:0}
+.head>span{color:var(--soft);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.score-box{display:flex;align-items:flex-end;flex-wrap:wrap;gap:8px 16px;margin-bottom:8px}
+.score{font:700 72px/.86 "Roboto Condensed",Arial,sans-serif}.score small{font-size:28px;margin-left:6px;color:var(--soft)}
+.score-note{color:var(--soft);font-size:13px;line-height:1.35}.score-note b{display:block;color:var(--ink);font-size:15px;font-weight:500}
+.score-note span{display:block}
+.sec-note{color:var(--soft);font-size:13px;line-height:1.35;margin:4px 0 8px}
+.chart-block{padding-top:12px;border-top:1px solid var(--rule);margin-top:12px}
+.chart-block h3{font-weight:500;margin-bottom:4px}
+.chart{display:block;width:100%;height:auto;margin-top:4px}
+.chart .grid{stroke:var(--rule);stroke-width:1}.chart .tick{fill:var(--soft);font-size:12px;font-family:Roboto,Arial,sans-serif}
 .chart .line{fill:none;stroke-width:2;stroke-linejoin:round}
 .line.s-open{stroke:var(--accent)}.dot.s-open{fill:var(--accent)}.line.s-unrev{stroke:var(--partial)}.dot.s-unrev{fill:var(--partial)}
 .chart .dot{stroke:none}.b-new{fill:var(--accent)}.b-closed{fill:var(--good)}
-.legend{display:flex;flex-wrap:wrap;gap:4px 16px;list-style:none;margin:0;padding:0;font-size:13px;line-height:20px;color:var(--soft)}
-.legend li{display:flex;align-items:center;gap:8px}.sw{display:inline-block;width:10px;height:10px}
+.legend{display:flex;flex-wrap:wrap;gap:2px 14px;font-size:13px;line-height:1.3;color:var(--soft)}
+.legend li{display:flex;align-items:center;gap:6px}.sw{display:inline-block;width:8px;height:8px}
 .sw.s-open,.sw.b-new,.sw.k-rev{background:var(--accent)}.sw.s-unrev,.sw.k-wait{background:var(--partial)}.sw.b-closed,.sw.k-done{background:var(--good)}.sw.k-draft{background:var(--soft)}
-.empty{margin:16px 0 0}.empty-block{margin:16px 0 4px;padding:24px 0;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);color:var(--soft);font:700 16px/24px "Roboto Condensed",Roboto,sans-serif;text-transform:uppercase;letter-spacing:.04em}
-.arow{display:grid;grid-template-columns:152px 1fr 72px;gap:8px 16px;align-items:center;padding:12px 0;border-bottom:1px solid var(--rule)}
-.aname{font-weight:700;font-size:15px;display:flex;align-items:center;gap:8px;min-width:0}
-.aname i{width:10px;height:10px;flex:none;background:var(--ac)}.aname small{font:400 13px Roboto,sans-serif;color:var(--soft);margin-left:auto}
-.abar{display:flex;height:8px;background:var(--wash);min-width:8px}.abar i{display:block;min-width:2px}
-.abar .draft{background:var(--soft)}.abar .wait{background:var(--partial)}.abar .rev{background:var(--accent)}.abar .done{background:var(--good)}
-.abar-wrap{display:flex;flex-direction:column;gap:4px;min-width:0}.acount{font-size:13px;line-height:20px;color:var(--soft)}
-.spark{display:block;justify-self:end}.nodata{justify-self:end;font-size:13px;color:var(--soft)}.spline{fill:none;stroke:var(--soft);stroke-width:1.5;stroke-linejoin:round}
-.cluster{margin-top:16px;padding:0 0 16px 16px;border-left:4px solid var(--ac);border-bottom:1px solid var(--rule)}
-.cluster:first-of-type{margin-top:16px}
-.chead{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 16px;align-items:baseline}
-h3{font-size:15px;line-height:24px;margin:0;font-weight:700}
-.members{list-style:none;margin:8px 0;padding:0}
-.members li{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:center;padding:8px 0;border-top:1px solid var(--rule)}
-.members li:first-child{border-top:0}.mt{flex:1 1 240px;min-width:0;overflow-wrap:anywhere}
-.chips{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
-.chip,.fbtn{font:500 13px/20px Roboto,system-ui,sans-serif;padding:4px 12px;border:1px solid var(--rule);background:var(--page);color:var(--ink);cursor:pointer}
-.chip:hover,.fbtn:hover{border-color:var(--ink)}
-.chip.file{font:12px/20px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:0 8px;background:var(--wash);border-color:var(--wash);cursor:default;overflow-wrap:anywhere}
-button.chip[aria-pressed=true],.fbtn[aria-pressed=true]{background:var(--ink);border-color:var(--ink);color:var(--page)}
-.pill{display:inline-block;font-size:12px;line-height:18px;padding:0 8px;border:1px solid var(--rule);white-space:nowrap;font-weight:500;color:var(--soft)}
-.pill.ok{color:var(--good);border-color:var(--good)}.pill.bad{color:var(--bad);border-color:var(--bad)}
-.pill.warn{color:var(--ink);border-color:var(--partial);background:var(--wash)}.pill.accent{color:var(--accent);border-color:var(--accent)}
-.tw{overflow-x:auto}
-table{border-collapse:collapse;width:100%;min-width:560px}
-th,td{text-align:left;padding:8px 16px 8px 0;border-bottom:1px solid var(--rule);vertical-align:top}
-th{font-size:13px;line-height:20px;color:var(--soft);font-weight:700;text-transform:uppercase;letter-spacing:.04em}
-td.n,th.n{text-align:right;white-space:nowrap}th.n,td.n{padding-right:0;padding-left:16px}
+.empty{margin:8px 0 0}
+.empty-block{margin:8px 0 4px;padding:20px 0;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);color:var(--soft);font:700 16px/1.2 "Roboto Condensed",Arial,sans-serif;text-transform:uppercase;letter-spacing:.04em}
+.road{display:grid;grid-template-columns:repeat(5,minmax(max-content,1fr));gap:3px;flex:1;min-height:92px}
+.step{display:flex;flex-direction:column;justify-content:flex-end;gap:4px;padding:8px 4px;background:var(--wash);border-bottom:3px solid var(--empty);font-size:13px;line-height:1.2;min-width:0}
+.step b{font-size:22px;line-height:1}.step>span{font-size:12px;font-weight:500;white-space:nowrap}.step small{color:var(--soft);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.step.on{border-bottom-color:var(--sc)}
+.pips{display:flex;gap:2px}.pips i{display:block;flex:1;max-width:9px;height:7px;background:var(--empty)}.pips i.on{background:var(--sc)}
+.st-axis,.st{display:grid;grid-template-columns:22px minmax(128px,1fr) minmax(40px,72px) 56px;gap:0 8px;align-items:center}
+.st-axis{position:sticky;top:0;z-index:1;padding:0 4px 4px 2px;background:var(--page);color:var(--soft);font-size:13px;line-height:1.2}
+.st-axis span:last-child{text-align:right}
+.st-list{overflow-y:auto;min-height:0;flex:1;max-height:420px}
+.st{padding:6px 4px 6px 2px;border-top:1px solid var(--rule);font-size:13px;line-height:1.3;min-height:44px}
+.st:hover{background:color-mix(in srgb,var(--ink) 6%,transparent)}
+.rank{font-size:16px;font-weight:700;text-align:center;line-height:1}
+.who{min-width:0}.who b{display:block;font-size:14px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.who small{display:block;color:var(--soft);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ptype{display:inline-flex;align-items:center;gap:6px;color:var(--ink);font-weight:500;min-width:0}
+.ptype{max-width:100%}.ptype .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.ptype i{display:block;flex:none;width:8px;height:8px;background:var(--ac)}
+.track{display:block;height:12px;background:var(--wash)}.fill{display:flex;height:100%}.fill i{display:block;min-width:2px}
+.fill .draft{background:var(--soft)}.fill .wait{background:var(--partial)}.fill .rev{background:var(--accent)}.fill .done{background:var(--good)}
+.where{display:grid;justify-items:end;gap:2px;color:var(--soft)}.where b{font:700 16px/1 "Roboto Condensed",Arial,sans-serif;color:var(--ink)}
+.spark{display:block;width:100%;height:20px}.spline{vector-effect:non-scaling-stroke;fill:none;stroke:var(--soft);stroke-width:1.5;stroke-linejoin:round}.nodata{font-size:12px;color:var(--soft)}
+.tabs{display:none;gap:14px}.js .tabs{display:flex}
+.tabs button{padding:0 0 2px;border:0;border-bottom:2px solid transparent;background:none;color:var(--soft);font:700 16px/1.2 "Roboto Condensed",Arial,sans-serif;cursor:pointer;border-radius:0}
+.tabs button:hover{color:var(--ink)}.tabs button[aria-pressed=true]{border-bottom-color:var(--partial);color:var(--ink)}
+.feed-body{overflow:auto;min-height:0;flex:1;max-height:640px}
+.panel+.panel{margin-top:24px}.js .panel+.panel{margin-top:0}
+.ptitle{display:flex;justify-content:space-between;gap:8px;align-items:baseline;padding-bottom:6px}.ptitle span{color:var(--soft);font-size:13px}.js .ptitle{display:none}
+.panel[hidden]{display:none}
+.row{display:grid;grid-template-columns:30px minmax(0,1fr);gap:8px;padding:7px 4px 7px 2px;border-top:1px solid var(--rule);font-size:13px;line-height:1.35}
+.row:hover{background:color-mix(in srgb,var(--ink) 6%,transparent)}
+.row .lead{color:var(--soft)}.row .lead b{display:block;color:var(--ink);font:700 15px/1.2 "Roboto Condensed",Arial,sans-serif}
+.row .ttl{overflow-wrap:anywhere;font-size:14px}.row .ttl a{font-weight:500}
+.sys{display:flex;flex-wrap:wrap;align-items:center;gap:2px 10px;color:var(--soft);font-size:13px;margin-top:2px}
+.av{width:20px;height:20px;background:var(--wash);color:transparent;overflow:hidden;flex:none}
+.pill{display:inline-flex;align-items:center;gap:4px;font-size:13px;line-height:1.3;white-space:nowrap;font-weight:500;color:var(--soft)}
+.pill:before{content:"";width:7px;height:7px;background:currentColor;flex:none}
+.pill.ok{color:var(--good)}.pill.bad{color:var(--bad)}.pill.warn{color:var(--partial-text)}.pill.accent{color:var(--accent)}
 .add{color:var(--good)}.del{color:var(--bad)}
-.heat{display:block;height:8px;background:var(--wash);min-width:96px}.heat i{display:block;height:100%;background:var(--partial)}
-.pls{display:flex;flex-wrap:wrap;gap:4px 8px}
-.filters{display:none;gap:16px;flex-wrap:wrap;align-items:center;margin:16px 0}
-.js .filters{display:flex}
-.filters input{font:inherit;padding:8px 12px;border:1px solid var(--rule);background:var(--page);color:var(--ink);min-width:260px;flex:1 1 260px;max-width:420px;border-radius:0}
-.frow{display:flex;flex-wrap:wrap;gap:8px}
-.result{font-size:13px;color:var(--soft)}
+.dup{padding:0 0 12px 12px;margin-bottom:12px;border-left:4px solid var(--ac);border-bottom:1px solid var(--rule)}
+.dup .chead{display:flex;flex-wrap:wrap;justify-content:space-between;gap:2px 12px;align-items:baseline}
+.dup .row:first-of-type{border-top:0}
+.chips-f{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.fchip{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:0 6px;background:var(--wash);overflow-wrap:anywhere}
+.heat{display:block;height:6px;background:var(--wash);margin:4px 0}.heat i{display:block;height:100%;background:var(--partial)}
+.mono{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
 details.area{border-bottom:1px solid var(--rule)}
-details.area>summary{cursor:pointer;padding:12px 0;list-style:none;display:flex;gap:8px;align-items:center;font:700 15px/24px "Roboto Condensed",Roboto,sans-serif}
-details.area>summary::-webkit-details-marker{display:none}
-details.area>summary::before{content:"";width:10px;height:10px;background:var(--ac);flex:none}
-details.area .cnt{font:400 13px Roboto,sans-serif;color:var(--soft);margin-left:auto}
-.rt{display:flex;gap:8px;align-items:flex-start}.av{width:20px;height:20px;background:var(--wash);color:transparent;overflow:hidden;flex:none;margin-top:2px}
+details.area>summary{cursor:pointer;padding:8px 2px;list-style:none;display:flex;gap:8px;align-items:center;font:700 15px/1.3 "Roboto Condensed",Arial,sans-serif}
+details.area>summary::-webkit-details-marker{display:none}details.area .cnt{margin-left:auto;font:400 13px Roboto,sans-serif;color:var(--soft)}
+details.area>summary:before{content:"+";width:12px;color:var(--soft);font-weight:700}details.area[open]>summary:before{content:"\\2212"}
+.a-meta{grid-area:meta;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 16px;padding:12px 0;border-top:1px solid var(--rule)}
+.stat{min-width:0}.stat span{display:block;color:var(--soft);font-size:13px;line-height:1.25}
+.stat b{display:block;font-size:20px;line-height:1.15;white-space:nowrap}.stat.key b{color:var(--accent)}.stat.warn b{color:var(--partial-text)}
+.stat small{display:block;color:var(--soft);font-size:13px;line-height:1.25}
+.foot{grid-area:foot;padding:8px 0 10px;border-top:1px solid var(--rule);color:var(--soft);font-size:13px;line-height:1.35}
+.small{color:var(--soft);font-size:13px;line-height:1.35}
+.tip{position:fixed;top:0;left:0;z-index:30;max-width:260px;padding:6px 9px;background:var(--tip);color:var(--tip-text);font-size:13px;line-height:1.3;pointer-events:none}
+.tip[hidden]{display:none}
 .vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
-tr[hidden],details[hidden]{display:none}
-footer{margin-top:48px;padding-top:16px;border-top:1px solid var(--rule);color:var(--soft);font-size:13px;line-height:20px}
-@media (min-width:1100px){.cols{display:grid;grid-template-columns:1fr 1fr;gap:0 48px;align-items:start}}
-@media (max-width:640px){.arow{grid-template-columns:1fr auto}.abar-wrap{grid-column:1/-1;order:3}.hero-n{font-size:56px;line-height:56px}}
+[hidden]{display:none!important}
+@media (min-width:640px){.a-meta{grid-template-columns:repeat(4,minmax(0,1fr))}}
+@media (max-width:760px){.road{grid-template-columns:1fr}.step{display:grid;grid-template-columns:44px minmax(0,1fr) auto;align-items:center;gap:8px;padding:6px 8px;border-bottom-width:2px}.step .pips{display:none}}
+@media (max-width:560px){.st{grid-template-columns:22px minmax(0,1fr) 56px}.st .track{grid-column:2/4;grid-row:2}.st-axis{display:none}.score{font-size:56px}}
+@media (max-width:620px){.top{flex-wrap:wrap;gap:4px 12px;padding:7px 0}.top-right{width:100%;justify-content:space-between}}
+@media (min-width:1100px) and (min-height:660px){
+.app{height:100dvh;overflow:hidden;column-gap:24px;padding:0 20px;
+grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1.15fr);grid-template-rows:auto auto minmax(0,1fr) 172px auto auto;
+grid-template-areas:"top top top" "filters filters filters" "city standings feed" "road standings feed" "meta meta meta" "foot foot foot"}
+.a-city,.a-standings,.a-feed{overflow:auto}.a-city{padding-top:12px}.a-road{overflow:hidden}
+.st-list,.feed-body{max-height:none}.feed-body{overflow:auto}.a-feed,.a-standings{overflow:hidden}
+.a-meta{display:flex;justify-content:space-between;gap:18px}.stat{flex:none}
+.foot{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+}
+@media (prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
 """
 
 THEME_JS = """
@@ -724,38 +756,78 @@ try{if(n==='auto')localStorage.removeItem('prscan-theme');else localStorage.setI
 var u=d.getElementById('upd'),a=d.getElementById('ago');
 if(u&&a){var m=Math.round((Date.now()-Date.parse(u.getAttribute('datetime')))/6e4);
 a.textContent='Updated '+(m<1?'just now':m<60?m+' min ago':m<2880?Math.round(m/60)+' h ago':Math.round(m/1440)+' days ago')+' \\u00b7 ';}
-var F=d.getElementById('filters');if(!F)return;
-var rows=[].slice.call(d.querySelectorAll('tr.pr')),groups=[].slice.call(d.querySelectorAll('details.area')),
-q=d.getElementById('q'),res=d.getElementById('result'),btns=[].slice.call(F.querySelectorAll('button'));
+var tip=d.getElementById('tip'),tipped=[].slice.call(d.querySelectorAll('[data-tip]'));
+tipped.forEach(function(el){var t=el.querySelector('title');if(t)el.removeChild(t);el.removeAttribute('title');});
+function place(e){var x=e.clientX+12,y=e.clientY+14,w=tip.offsetWidth,h=tip.offsetHeight;
+if(x+w>innerWidth-8)x=Math.max(8,e.clientX-w-12);if(y+h>innerHeight-8)y=Math.max(8,e.clientY-h-12);
+tip.style.left=x+'px';tip.style.top=y+'px';}
+d.addEventListener('mouseover',function(e){var el=e.target.closest&&e.target.closest('[data-tip]');
+if(!el){tip.hidden=true;return;}tip.textContent=el.getAttribute('data-tip');tip.hidden=false;place(e);});
+d.addEventListener('mousemove',function(e){if(!tip.hidden)place(e);});
+d.addEventListener('mouseleave',function(){tip.hidden=true;});
+var tabs=[].slice.call(d.querySelectorAll('.tabs button')),panels=[].slice.call(d.querySelectorAll('.panel')),
+tmeta=d.getElementById('tabmeta'),tab='dup';
+function showTab(n){tab=n;tabs.forEach(function(b){b.setAttribute('aria-pressed',String(b.getAttribute('data-tab')===n));});
+panels.forEach(function(p){var on=p.getAttribute('data-panel')===n;p.hidden=!on;if(on&&tmeta)tmeta.textContent=p.getAttribute('data-meta')||'';});}
+tabs.forEach(function(b){b.addEventListener('click',function(){showTab(b.getAttribute('data-tab'));write();});});
+var F=d.getElementById('filters');
+var rows=[].slice.call(d.querySelectorAll('.pr')),groups=[].slice.call(d.querySelectorAll('details.area')),
+q=d.getElementById('q'),res=d.getElementById('result'),btns=F?[].slice.call(F.querySelectorAll('button')):[];
 var st={q:'',area:'',draft:0,unrev:0,done:0};
 function dec(s){try{return decodeURIComponent(s.replace(/\\+/g,' '))}catch(e){return ''}}
-function parse(){st={q:'',area:'',draft:0,unrev:0,done:0};
+function parse(){st={q:'',area:'',draft:0,unrev:0,done:0};var tt='';
 (location.hash||'').replace(/^#/,'').split('&').forEach(function(kv){var i=kv.indexOf('=');if(i<1)return;
-var k=kv.slice(0,i),v=dec(kv.slice(i+1));if(k==='q'||k==='area')st[k]=v;else if(k in st)st[k]=v==='1'?1:0;});}
+var k=kv.slice(0,i),v=dec(kv.slice(i+1));if(k==='q'||k==='area')st[k]=v;else if(k==='tab')tt=v;else if(k in st)st[k]=v==='1'?1:0;});return tt;}
+function on(){return !!(st.q.trim()||st.area||st.draft||st.unrev||st.done);}
 function write(){var p=[];if(st.q)p.push('q='+encodeURIComponent(st.q));if(st.area)p.push('area='+encodeURIComponent(st.area));
-['draft','unrev','done'].forEach(function(k){if(st[k])p.push(k+'=1')});
+['draft','unrev','done'].forEach(function(k){if(st[k])p.push(k+'=1')});if(tab!=='dup')p.push('tab='+tab);
 history.replaceState(null,'',p.length?'#'+p.join('&'):location.pathname+location.search);}
-function apply(){var t=st.q.toLowerCase().trim(),on=!!(t||st.area||st.draft||st.unrev||st.done),shown=0;
+function apply(){var t=st.q.toLowerCase().trim(),f=on(),shown=0;
 rows.forEach(function(r){var ok=(!t||r.getAttribute('data-q').indexOf(t)>=0)&&(!st.area||r.getAttribute('data-area')===st.area)&&
 (!st.draft||r.getAttribute('data-draft')==='1')&&(!st.unrev||r.getAttribute('data-unrev')==='1')&&(!st.done||r.getAttribute('data-done')==='1');
 r.hidden=!ok;if(ok)shown++;});
-groups.forEach(function(g){var n=g.querySelectorAll('tr.pr:not([hidden])').length,c=g.querySelector('.cnt'),tot=g.querySelectorAll('tr.pr').length;
-g.hidden=n===0;if(on)g.open=n>0;if(c)c.textContent=on?n+' of '+tot:String(tot);});
+groups.forEach(function(g){var n=g.querySelectorAll('.pr:not([hidden])').length,c=g.querySelector('.cnt'),tot=g.querySelectorAll('.pr').length;
+g.hidden=n===0;if(f)g.open=n>0;if(c)c.textContent=f?n+' of '+tot:String(tot);});
 btns.forEach(function(b){var k=b.getAttribute('data-flag'),ar=b.getAttribute('data-area');
-b.setAttribute('aria-pressed',String(k?!!st[k]:ar===st.area));});
-res.textContent=on?'Showing '+shown+' of '+rows.length+' pull requests':rows.length+' pull requests';}
-function sync(){q.value=st.q;apply();}
-q.addEventListener('input',function(){st.q=q.value;write();apply();});
+if(k||ar!==null)b.setAttribute('aria-pressed',String(k?!!st[k]:ar===st.area));});
+if(res)res.textContent=f?'Showing '+shown+' of '+rows.length+' pull requests':rows.length+' pull requests';
+var allp=d.querySelector('.panel[data-panel=all]');if(allp&&f)allp.setAttribute('data-meta','Showing '+shown+' of '+rows.length);
+else if(allp)allp.setAttribute('data-meta',rows.length+' pull requests');
+showTab(tab);}
+function sync(){if(q)q.value=st.q;apply();}
+if(F){q.addEventListener('input',function(){st.q=q.value;if(on())tab='all';write();apply();});
 F.addEventListener('click',function(e){var b=e.target.closest('button');if(!b)return;var k=b.getAttribute('data-flag'),ar=b.getAttribute('data-area');
-if(k)st[k]=st[k]?0:1;else st.area=st.area===ar?'':ar;write();apply();});
-window.addEventListener('hashchange',function(){parse();sync();var el=d.getElementById('all');if(el&&st.area)el.scrollIntoView();});
-parse();sync();
+if(k)st[k]=st[k]?0:1;else st.area=st.area===ar?'':ar;if(on())tab='all';write();apply();});}
+window.addEventListener('hashchange',function(){var tt=parse();tab=tt||(on()?'all':tab);sync();var el=d.getElementById('feed');if(el&&on())el.scrollIntoView();});
+var t0=parse();tab=t0||(on()?'all':'dup');sync();
 })();
 """
 
 
-def sec_head(title, meta="", sid=""):
-    return '<div class="sh"%s><h2>%s</h2><span class="meta">%s</span></div>' % (' id="%s"' % sid if sid else "", esc(title), esc(meta))
+def stat(label, value, delta=None, show_delta=True, cls=""):
+    return '<div class="stat%s"><span>%s</span><b>%s</b>%s</div>' % (
+        " " + cls if cls else "", esc(label), esc(value), delta_text(delta) if show_delta else "")
+
+
+def ptype(area, link=False):
+    inner = '<i></i><span class="nm">%s</span>' % esc(area)
+    if link:
+        inner = '<a class="ptype" title="%s" href="#area=%s">%s</a>' % (esc(area), esc(urllib.parse.quote(slug(area), safe="-")), inner)
+        return '<span style="%s">%s</span>' % (cat_style(area), inner)
+    return '<span class="ptype" style="%s">%s</span>' % (cat_style(area), inner)
+
+
+def road_step(label, count, share, color, note=None):
+    """count None means no data; share is 0..1 or None (no pips)."""
+    if count is None:
+        return '<li class="step" style="--sc:%s"><b>&ndash;</b><span>%s</span><small>no data yet</small></li>' % (color, esc(label))
+    pips = ""
+    if share is not None:
+        n = round(share * 10)
+        pips = '<div class="pips" aria-hidden="true">%s</div>' % "".join('<i class="on"></i>' if i < n else "<i></i>" for i in range(10))
+    small = note if note is not None else "%d%%" % round(100 * (share or 0))
+    return '<li class="step%s" style="--sc:%s"><b>%d</b><span>%s</span>%s%s</li>' % (
+        " on" if count else "", color, count, esc(label), pips, "<small>%s</small>" % esc(small) if small else "")
 
 
 def cluster_label(members):
@@ -787,142 +859,142 @@ def render_html(an, repo, now, hist=None):
     by_num = {p["number"]: p for p in prs}
     hot_set = {h["file"] for h in an["hotFiles"]}
     areas = sorted(an["areas"], key=lambda a: (-len(an["areas"][a]), a))
+    n_open, n_un, n_dr = len(prs), sum(p["unreviewed"] for p in prs), sum(bool(p["isDraft"]) for p in prs)
+    n_done, n_stale = sum(p["looksDone"] for p in prs), sum(p["stale"] for p in prs)
+    n_fail = sum(p["ci"] in ("FAILURE", "ERROR") for p in prs)
+    n_clusters = len(an["clusters"])
 
     def plink(n):
         return '<a href="%s">#%d</a>' % (esc(safe_url(by_num[n]["url"])), n)
 
-    def vals(key, cur):
-        return cur, change_24h(hist, key, cur, now)
+    def dl(key, cur):
+        return change_24h(hist, key, cur, now)
 
-    n_un, n_dr = sum(p["unreviewed"] for p in prs), sum(bool(p["isDraft"]) for p in prs)
-    n_done, n_stale = sum(p["looksDone"] for p in prs), sum(p["stale"] for p in prs)
+    def pr_line(p):
+        return '<a href="%s">#%d</a> %s' % (esc(safe_url(p["url"])), p["number"], esc(p["title"]))
+
     o = []
     o.append("<!doctype html><html lang=en><head><meta charset=utf-8>"
              "<meta name=viewport content='width=device-width,initial-scale=1'>"
              "<title>PR scan: %s</title>"
              "<link rel=preconnect href='https://fonts.googleapis.com'><link rel=preconnect href='https://fonts.gstatic.com' crossorigin>"
-             "<link rel=stylesheet href='%s'><script>%s</script><style>%s</style></head><body><main>" % (
+             "<link rel=stylesheet href='%s'><script>%s</script><style>%s</style></head><body><div class=\"app\">" % (
                  esc(repo), FONTS_URL, THEME_JS, CSS))
-    o.append('<header class="bar"><h1>PR scan <span>/ <a href="https://github.com/%s">%s</a></span></h1>'
-             '<div class="live"><span class="status"><i class="dot-live" aria-hidden="true"></i>'
-             '<span><span id="ago">Updated </span><time id="upd" datetime="%s">%s UTC</time></span></span>'
-             '<button type="button" class="tbtn" id="theme" aria-label="Colour theme">Theme</button></div></header>' % (
+    o.append('<header class="top"><h1>PR scan <span>/ <a href="https://github.com/%s">%s</a></span></h1>'
+             '<div class="top-right"><div class="live"><i class="dot" aria-hidden="true"></i>'
+             '<span><span id="ago">Updated </span><time id="upd" datetime="%s">%s UTC</time></span></div>'
+             '<button type="button" class="theme" id="theme" aria-label="Colour theme">Theme</button></div></header>' % (
                  esc(repo), esc(repo), now.strftime(TS_FMT), now.strftime("%Y-%m-%d %H:%M")))
 
-    d_open = change_24h(hist, "open", len(prs), now)
-    o.append('<section class="hero" aria-label="Summary"><div class="hero-n">%d</div><div class="hero-t">'
-             '<div class="hero-l">Open pull requests</div>%s'
-             '<p class="note"><b>%d</b> unreviewed &middot; <b>%d</b> look done &middot; <b>%d</b> possible duplicate group%s</p></div></section>' % (
-                 len(prs), delta_text(d_open), n_un, n_done, len(an["clusters"]), "" if len(an["clusters"]) == 1 else "s"))
-    o.append('<section class="strip" aria-label="Stats">%s</section>' % "".join((
-        tile("Unreviewed", *vals("unreviewed", n_un)),
-        tile("Looks done", *vals("looksDone", n_done)),
-        tile("Possible duplicates", *vals("clusters", len(an["clusters"]))),
-        tile("Drafts", *vals("draft", n_dr)),
-        tile("Stale (%dd+)" % STALE_DAYS, n_stale, show_delta=False))))
-
-    # left column: duplicates, trends
-    left = []
-    left.append('<section class="sec">%s' % sec_head("Possible duplicate work", "%d group%s" % (len(an["clusters"]), "" if len(an["clusters"]) == 1 else "s")))
-    if not an["clusters"]:
-        left.append('<p class="sec-note">None.</p>')
-    else:
-        left.append('<p class="sec-note">Linked by changed files (Jaccard &ge; %.1f) or title words (Jaccard &ge; %.1f). Hot files are ignored.</p>' % (FILE_JACCARD, TITLE_JACCARD))
-        for c in an["clusters"]:
-            count = {}
-            for n in c["members"]:
-                for path in {f["path"] for f in by_num[n].get("files", [])}:
-                    count[path] = count.get(path, 0) + 1
-            shared = sorted(p for p, k in count.items() if k >= 2 and p not in hot_set)
-            chips = "".join('<span class="chip file">%s</span>' % esc(p) for p in shared[:8])
-            if len(shared) > 8:
-                chips += '<span class="chip file">+%d more</span>' % (len(shared) - 8)
-            members = "".join(
-                '<li>%s<span class="mt"><a href="%s">#%d</a> %s <span class="small">by %s</span></span>%s</li>' % (
-                    avatar(by_num[n]["author"]), esc(safe_url(by_num[n]["url"])), n, esc(by_num[n]["title"]),
-                    esc(by_num[n]["author"]), state_pills(by_num[n])) for n in c["members"])
-            label, label_area = cluster_label([by_num[n] for n in c["members"]])
-            left.append('<div class="cluster" style="%s"><div class="chead"><h3>%s</h3><span class="small">%s</span></div>'
-                        '<ul class="members">%s</ul>%s<p class="small" style="margin:0">Why: %s</p></div>' % (
-                            cat_style(label_area), esc(label),
-                            esc(", ".join("#%d" % n for n in c["members"])),
-                            members, '<div class="chips">%s</div>' % chips if chips else "", esc(cluster_why(c))))
-    left.append("</section>")
-
+    # ---- city panel: score box + trends
+    d_open = change_24h(hist, "open", n_open, now)
+    o.append('<section class="a-city" aria-label="Summary and trends"><div class="score-box"><div class="score">%d<small>open</small></div>'
+             '<p class="score-note"><b>%d unreviewed &middot; %d look done</b><span>%d possible duplicate group%s &middot; %d draft%s</span>%s</p></div>' % (
+                 n_open, n_un, n_done, n_clusters, "" if n_clusters == 1 else "s", n_dr, "" if n_dr == 1 else "s", delta_text(d_open)))
     recent = window(hist, now, TREND_DAYS)
-    left.append('<section class="sec">%s' % sec_head("Trends", "last %d days, %d snapshot%s" % (TREND_DAYS, len(recent), "" if len(recent) == 1 else "s")))
+    o.append('<div class="head" style="margin-top:16px"><h2>Trends</h2><span>last %d days, %d snapshot%s</span></div>' % (
+        TREND_DAYS, len(recent), "" if len(recent) == 1 else "s"))
     if len(recent) < 2:
-        left.append('<p class="empty-block">No data yet</p><p class="sec-note">Trends start after the first hours of hourly snapshots (%d so far).</p></section>' % len(recent))
+        o.append('<p class="empty-block">No data yet</p><p class="sec-note">Trends start after the first hours of hourly snapshots (%d so far).</p>' % len(recent))
     else:
-        days = [d for d in daily_summary(recent) if d["pairs"]] if len({x["ts"][:10] for x in recent}) >= 2 else []
-        left.append('<div class="chart-block"><h3>Open and unreviewed</h3>%s%s</div>' % (
+        days = [x for x in daily_summary(recent) if x["pairs"]] if len({x["ts"][:10] for x in recent}) >= 2 else []
+        o.append('<div class="chart-block"><h3>Open and unreviewed</h3>%s%s</div>' % (
             legend([("Open", "s-open"), ("Unreviewed", "s-unrev")]),
             svg_line_chart([
                 {"name": "open", "cls": "s-open", "points": [(parse_time(x["ts"]), x["open"]) for x in recent]},
                 {"name": "unreviewed", "cls": "s-unrev", "points": [(parse_time(x["ts"]), x["unreviewed"]) for x in recent]}],
                 "Open and unreviewed pull requests over the last %d days" % TREND_DAYS)))
-        left.append('<div class="chart-block"><h3>Opened and closed per day</h3>%s%s</div></section>' % (
+        o.append('<div class="chart-block"><h3>Opened and closed per day</h3>%s%s</div>' % (
             legend([("Opened", "b-new"), ("Closed or merged", "b-closed")]),
             svg_bars(days, "Pull requests opened and closed per day (UTC)")))
-
-    # right column: areas, ready to merge
-    right = []
-    right.append('<section class="sec">%s' % sec_head("By area", "line: open count, %d days" % SPARK_DAYS))
-    right.append('<div style="padding:12px 0 0">%s</div><div class="arows">' % legend([(n, "k-" + k) for k, n in BUCKETS]))
-    spark_hist = window(hist, now, SPARK_DAYS)
-    biggest = max([len(ps) for ps in an["areas"].values()] or [1])
-    for a in areas:
-        ps = an["areas"][a]
-        cnt = {k: sum(bucket(p) == k for p in ps) for k, _ in BUCKETS}
-        segs = "".join('<i class="%s" style="flex:%d" title="%s"></i>' % (k, cnt[k], esc("%s: %d" % (n, cnt[k])))
-                       for k, n in BUCKETS if cnt[k])
-        series = downsample([s["areas"].get(a, 0) for s in spark_hist if s["open"] == 0 or s["areas"]], 48)
-        right.append('<div class="arow" style="%s"><div class="aname"><i></i><a href="#area=%s">%s</a><small>%d</small></div>'
-                     '<div class="abar-wrap"><div class="abar" style="width:%.1f%%">%s</div>'
-                     '<div class="acount">%s</div></div>%s</div>' % (
-                         cat_style(a), esc(urllib.parse.quote(slug(a), safe="-")), esc(a), len(ps), 100.0 * len(ps) / biggest, segs,
-                         esc(" · ".join("%d %s" % (cnt[k], n.lower()) for k, n in BUCKETS if cnt[k])),
-                         sparkline(series, "%s: open PRs over %d days" % (a, SPARK_DAYS))))
-    right.append("</div></section>")
-
-    done = sorted([p for p in prs if p["looksDone"]], key=lambda p: (-p["ageDays"], p["number"]))
-    right.append('<section class="sec">%s' % sec_head("Ready to merge", "%d, oldest first" % len(done)))
-    right.append('<p class="sec-note">Not draft, CI green, and unreviewed or approved.</p>')
-    if not done:
-        right.append('<p class="sec-note">None.</p>')
-    else:
-        right.append('<div class="tw"><table><thead><tr><th>PR<th>Area<th class="n">Age<th>CI<th class="n">Size</tr></thead><tbody>%s</tbody></table></div>' % "".join(
-            '<tr><td><a href="%s">#%d</a> %s</td><td>%s</td><td class="n">%dd</td><td>%s</td>'
-            '<td class="n"><span class="add">+%d</span> <span class="del">&minus;%d</span> &middot; %s files</td></tr>' % (
-                esc(safe_url(p["url"])), p["number"], esc(p["title"]), esc(p["primary"]), p["ageDays"], ci_pill(p["ci"]),
-                p["additions"], p["deletions"], esc(pr_files_note(p))) for p in done))
-    right.append("</section>")
-    o.append('<div class="cols"><div>%s</div><div>%s</div></div>' % ("".join(left), "".join(right)))
-
-    o.append('<section class="sec">%s' % sec_head("Hot files", "touched by more than %g open PRs" % an["hotThreshold"]))
-    o.append('<p class="sec-note">Conflict hotspots, left out of the duplicate groups.</p>')
-    if not an["hotFiles"]:
-        o.append('<p class="sec-note">None.</p>')
-    else:
-        top = max(h["count"] for h in an["hotFiles"])
-        o.append('<div class="tw"><table><thead><tr><th>File<th class="n">PRs<th>Heat<th>Open PRs</tr></thead><tbody>%s</tbody></table></div>' % "".join(
-            '<tr><td style="overflow-wrap:anywhere">%s</td><td class="n">%d</td><td><span class="heat"><i style="width:%d%%"></i></span></td>'
-            '<td><div class="pls">%s</div></td></tr>' % (
-                esc(h["file"]), h["count"], round(100 * h["count"] / top),
-                " ".join(plink(n) for n in h["prs"][:12]) + (" +%d more" % (len(h["prs"]) - 12) if len(h["prs"]) > 12 else ""))
-            for h in an["hotFiles"]))
     o.append("</section>")
 
-    o.append('<section class="sec">%s' % sec_head("All PRs by area", "%d pull requests" % len(prs), "all"))
-    o.append('<div class="filters" id="filters"><label class="vh" for="q">Search pull requests</label>'
-             '<input id="q" type="search" placeholder="Search title, number, author or path" autocomplete="off">'
-             '<div class="frow" role="group" aria-label="State filters">%s</div>'
-             '<div class="frow" role="group" aria-label="Area filters">%s</div>'
-             '<div class="result" id="result" role="status"></div></div>' % (
-                 "".join('<button type="button" class="fbtn" data-flag="%s" aria-pressed="false">%s</button>' % (k, n)
+    # ---- road: PR lifecycle
+    cnt_all = {k: sum(bucket(p) == k for p in prs) for k, _ in BUCKETS}
+    merged24 = an.get("merged24")
+    o.append('<section class="a-road" aria-label="Pull request lifecycle"><div class="head"><h2>Road to merged</h2><span>%d open</span></div><ol class="road">' % n_open)
+    for (k, name), color in zip(BUCKETS, ("var(--soft)", "var(--partial)", "var(--accent)", "var(--good)")):
+        o.append(road_step({"wait": "Waiting", "done": "Ready"}.get(k, name), cnt_all[k], cnt_all[k] / n_open if n_open else 0, color))
+    o.append(road_step("Merged 24 h", merged24, None, "var(--good)", ""))
+    o.append("</ol></section>")
+
+    # ---- standings: areas ranked by open PRs
+    spark_hist = window(hist, now, SPARK_DAYS)
+    biggest = max([len(ps) for ps in an["areas"].values()] or [1])
+    o.append('<section class="a-standings" aria-label="Areas"><div class="head"><h2>By area</h2><span>ranked by open PRs, line = %dd</span></div>'
+             '<div style="margin-bottom:8px">%s</div><div class="st-list"><div class="st-axis" aria-hidden="true"><span>#</span><span>Area</span>'
+             '<span>State mix</span><span>Open</span></div><ol>' % (SPARK_DAYS, legend([(n, "k-" + k) for k, n in BUCKETS])))
+    for i, a in enumerate(areas, 1):
+        ps = an["areas"][a]
+        cnt = {k: sum(bucket(p) == k for p in ps) for k, _ in BUCKETS}
+        segs = "".join('<i class="%s" style="flex:%d" data-tip="%s" title="%s"></i>' % (
+            k, cnt[k], esc("%s: %d" % (n, cnt[k])), esc("%s: %d" % (n, cnt[k]))) for k, n in BUCKETS if cnt[k])
+        series = downsample([s["areas"].get(a, 0) for s in spark_hist if s["open"] == 0 or s["areas"]], 48)
+        o.append('<li class="st"><span class="rank">%d</span><div class="who"><b>%s</b><small>%s</small></div>'
+                 '<span class="track"><span class="fill" style="width:%.1f%%">%s</span></span>'
+                 '<div class="where"><b>%d</b>%s</div></li>' % (
+                     i, ptype(a, link=True),
+                     esc(" · ".join("%d %s" % (cnt[k], n.lower()) for k, n in BUCKETS if cnt[k])),
+                     100.0 * len(ps) / biggest, segs, len(ps),
+                     sparkline(series, "%s: open PRs over %d days" % (a, SPARK_DAYS))))
+    o.append("</ol></div></section>")
+
+    # ---- filters
+    o.append('<div class="filters" id="filters"><div class="frow"><label class="vh" for="q">Search pull requests</label>'
+             '<input id="q" type="search" placeholder="Search title, number, author or path" autocomplete="off">%s'
+             '<span class="result" id="result" role="status"></span></div><div class="chips" role="group" aria-label="Area filters">%s</div></div>' % (
+                 "".join('<button type="button" class="chip" data-flag="%s" aria-pressed="false">%s</button>' % (k, n)
                          for k, n in (("draft", "Draft"), ("unrev", "Unreviewed"), ("done", "Looks done"))),
                  "".join('<button type="button" class="chip" data-area="%s" aria-pressed="false">%s</button>' % (
                      esc(slug(a)), esc(a)) for a in areas)))
+
+    # ---- feed: tabs
+    done = sorted([p for p in prs if p["looksDone"]], key=lambda p: (-p["ageDays"], p["number"]))
+    metas = {"dup": "%d group%s" % (n_clusters, "" if n_clusters == 1 else "s"), "ready": "%d, oldest first" % len(done),
+             "hot": "%d file%s" % (len(an["hotFiles"]), "" if len(an["hotFiles"]) == 1 else "s"), "all": "%d pull requests" % n_open}
+    titles = [("dup", "Duplicates"), ("ready", "Ready to merge"), ("hot", "Hot files"), ("all", "All PRs")]
+    o.append('<section class="a-feed" aria-label="Pull request lists"><div class="head"><div class="tabs">%s</div><span id="tabmeta"></span></div><div class="feed-body" id="feed">' % "".join(
+        '<button type="button" data-tab="%s" aria-pressed="%s">%s</button>' % (k, "true" if k == "dup" else "false", n) for k, n in titles))
+
+    def panel(key, body, note=""):
+        name = dict(titles)[key]
+        return ('<div class="panel" data-panel="%s" data-meta="%s"><div class="ptitle"><h2>%s</h2><span>%s</span></div>%s%s</div>' % (
+            key, esc(metas[key]), esc(name), esc(metas[key]), '<p class="sec-note">%s</p>' % note if note else "", body))
+
+    dup = []
+    if not an["clusters"]:
+        dup.append('<p class="empty-block">None found</p>')
+    for c in an["clusters"]:
+        count = {}
+        for n in c["members"]:
+            for path in {f["path"] for f in by_num[n].get("files", [])}:
+                count[path] = count.get(path, 0) + 1
+        shared = sorted(p for p, k in count.items() if k >= 2 and p not in hot_set)
+        chips = "".join('<span class="fchip">%s</span>' % esc(p) for p in shared[:8])
+        if len(shared) > 8:
+            chips += '<span class="fchip">+%d more</span>' % (len(shared) - 8)
+        members = "".join(
+            '<div class="row"><div class="lead">%s</div><div><div class="ttl">%s</div>'
+            '<div class="sys"><span>by %s</span>%s</div></div></div>' % (
+                avatar(by_num[n]["author"]), pr_line(by_num[n]), esc(by_num[n]["author"]), state_pills(by_num[n]))
+            for n in c["members"])
+        label, label_area = cluster_label([by_num[n] for n in c["members"]])
+        dup.append('<div class="dup" style="%s"><div class="chead"><h3>%s</h3><span class="small">%s</span></div>%s%s'
+                   '<p class="small">Why: %s</p></div>' % (
+                       cat_style(label_area), esc(label), esc(", ".join("#%d" % n for n in c["members"])), members,
+                       '<div class="chips-f">%s</div>' % chips if chips else "", esc(cluster_why(c))))
+    ready = ['<p class="empty-block">None</p>'] if not done else [
+        '<div class="row"><div class="lead"><b>%dd</b>old</div><div><div class="ttl">%s</div><div class="sys">%s%s'
+        '<span><span class="add">+%d</span> <span class="del">&minus;%d</span> &middot; %s files</span></div></div></div>' % (
+            p["ageDays"], pr_line(p), ptype(p["primary"]), ci_pill(p["ci"]), p["additions"], p["deletions"], esc(pr_files_note(p)))
+        for p in done]
+    hot = ['<p class="empty-block">None</p>'] if not an["hotFiles"] else [
+        '<div class="row"><div class="lead"><b>%d</b>PRs</div><div><div class="mono">%s</div>'
+        '<span class="heat"><i style="width:%d%%"></i></span><div class="sys">%s</div></div></div>' % (
+            h["count"], esc(h["file"]), round(100 * h["count"] / max(x["count"] for x in an["hotFiles"])),
+            " ".join(plink(n) for n in h["prs"][:12]) + (" +%d more" % (len(h["prs"]) - 12) if len(h["prs"]) > 12 else ""))
+        for h in an["hotFiles"]]
+    allp = []
     for a in areas:
         ps = sorted(an["areas"][a], key=lambda p: p["number"])
         rows = []
@@ -930,21 +1002,31 @@ def render_html(an, repo, now, hist=None):
             also = [x for x in p["areas"] if x != p["primary"]]
             q = " ".join([str(p["number"]), "#%d" % p["number"], p["title"], p["author"]] + [f["path"] for f in p.get("files", [])]).lower()
             rows.append(
-                '<tr class="pr" data-area="%s" data-draft="%d" data-unrev="%d" data-done="%d" data-q="%s">'
-                '<td><div class="rt">%s<a href="%s">#%d</a></div></td>'
-                '<td><div>%s%s</div><div class="pls" style="margin-top:4px">%s</div></td>'
-                '<td class="n">%dd</td><td class="n"><span class="add">+%d</span> <span class="del">&minus;%d</span></td>'
-                '<td class="n">%s</td></tr>' % (
-                    esc(slug(a)), bool(p["isDraft"]), p["unreviewed"], p["looksDone"], esc(q),
-                    avatar(p["author"]), esc(safe_url(p["url"])), p["number"],
-                    esc(p["title"]), ' <span class="small">(also %s)</span>' % esc(", ".join(also)) if also else "",
+                '<div class="row pr" data-area="%s" data-draft="%d" data-unrev="%d" data-done="%d" data-q="%s"><div class="lead">%s</div>'
+                '<div><div class="ttl">%s%s</div><div class="sys">%s<span>%dd</span>'
+                '<span><span class="add">+%d</span> <span class="del">&minus;%d</span></span><span>%s files</span></div></div></div>' % (
+                    esc(slug(a)), bool(p["isDraft"]), p["unreviewed"], p["looksDone"], esc(q), avatar(p["author"]),
+                    pr_line(p), ' <span class="small">(also %s)</span>' % esc(", ".join(also)) if also else "",
                     state_pills(p), p["ageDays"], p["additions"], p["deletions"], esc(pr_files_note(p))))
-        o.append('<details class="area" id="%s" style="%s"><summary>%s <span class="cnt">%d</span></summary><div class="tw"><table>'
-                 '<thead><tr><th>PR<th>Title<th class="n">Age<th class="n">Lines<th class="n">Files</tr></thead><tbody>%s</tbody></table></div></details>' % (
-                     esc(slug(a)), cat_style(a), esc(a), len(ps), "".join(rows)))
-    o.append("</section>")
-    o.append("<footer>Generated %s UTC for %s. Read-only scan of public PR metadata.</footer></main><script>%s</script></body></html>" % (
-        now.strftime("%Y-%m-%d %H:%M"), esc(repo), JS))
+        allp.append('<details class="area" id="%s"><summary>%s <span class="cnt">%d</span></summary>%s</details>' % (
+            esc(slug(a)), ptype(a), len(ps), "".join(rows)))
+    o.append(panel("dup", "".join(dup), "Linked by changed files (Jaccard &ge; %.1f) or title words (Jaccard &ge; %.1f). Hot files are ignored." % (FILE_JACCARD, TITLE_JACCARD)))
+    o.append(panel("ready", "".join(ready), "Not draft, CI green, and unreviewed or approved."))
+    o.append(panel("hot", "".join(hot), "Touched by more than %g open PRs: conflict hotspots, left out of the duplicate groups." % an["hotThreshold"]))
+    o.append(panel("all", "".join(allp)))
+    o.append("</div></section>")
+
+    # ---- meta strip
+    o.append('<section class="a-meta" aria-label="Overall stats">%s</section>' % "".join((
+        stat("Open", n_open, dl("open", n_open), cls="key"),
+        stat("Unreviewed", n_un, dl("unreviewed", n_un)),
+        stat("Looks done", n_done, dl("looksDone", n_done)),
+        stat("Possible duplicates", n_clusters, dl("clusters", n_clusters)),
+        stat("Drafts", n_dr, dl("draft", n_dr)),
+        stat("Stale (%dd+)" % STALE_DAYS, n_stale, show_delta=False),
+        stat("CI failing", n_fail, show_delta=False, cls="warn" if n_fail else ""))))
+    o.append('<footer class="foot">Generated %s UTC for %s. Read-only scan of public PR metadata.</footer></div>'
+             '<div class="tip" id="tip" hidden></div><script>%s</script></body></html>' % (now.strftime("%Y-%m-%d %H:%M"), esc(repo), JS))
     return "".join(o)
 
 
@@ -1120,9 +1202,20 @@ def public_pr(p):
     return {k: v for k, v in p.items() if k != "body"}
 
 
+def merged_last_24h(repo, now):
+    """Number of PRs merged in the last 24 h, or None when the query fails (shown as "no data yet")."""
+    try:
+        since = now - dt.timedelta(hours=24)
+        return sum(1 for p in fetch_merged(repo, now) if p.get("mergedAt") and parse_time(p["mergedAt"]) >= since)
+    except (SystemExit, Exception) as e:
+        print("pr-scan: merged-PR query failed: %s" % e, file=sys.stderr)
+        return None
+
+
 def cmd_report(args):
     now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
     an = build_analysis(fetch_open(args.repo), now)
+    an["merged24"] = merged_last_24h(args.repo, now)
     os.makedirs(args.out, exist_ok=True)
     hist = []
     if args.history:

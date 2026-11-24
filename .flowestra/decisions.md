@@ -288,3 +288,24 @@ Keep every version of ivall/xcl even if upstream or the whole fork network is ta
 - Section heads: h2 on the left, muted meta text on the right (counts, time ranges).
 - Lists are ruled rows, not cards. Duplicate clusters are ruled blocks with a left colour bar in the area colour.
 - Fonts: Google Fonts stylesheet `family=Roboto+Condensed:wght@700&family=Roboto:wght@400;500;700&display=swap`, with system fallbacks. This is the only external CSS allowed; it overrides "no external CSS" above.
+
+### Closer match to gta6pc.meth.dev (user request, 2026-11-24): our own code
+- We write all of the CSS, JS and markup ourselves, closely following their layout and components.
+- Reference copies, for reading only, are in the session scratch `ref/`: index.html, city.css, goal.css.
+- **App shell on desktop (≥1100px):**
+  - The page fills the viewport (`height:100dvh`), and only the panels scroll.
+  - Grid areas: top / filters / main panels / meta strip.
+  - Panels use `min-height:0; overflow:auto` with thin rules between them.
+  - Phones keep ordinary page scrolling in a single column.
+- **Top bar:** title on the left; on the right the live dot (a square stepped blink, `steps(2)`), the updated time and the theme button. Height 50px, with a 2px ink rule below.
+- **Filters row**, like their `.filters`: square chips with a 1px rule border, the active chip filled with ink.
+- **Hero / score box:** one huge condensed number (open PRs) with a small suffix, a note with a bold first line, and muted sub-lines.
+- **Standings-style ranked list for areas**, like their `.a-standings`/`.st` rows:
+  - each row has a rank number, an area name with a colour tag (like `.ptype`), a thin track bar (`.track`, a wash background with coloured segments) and right-aligned values;
+  - group headers like `.st-group`.
+- **"Road" step list for the PR lifecycle**, like `.a-road`/`.step` with `.pips`: draft → waiting for review → reviewed → looks done → merged in the last 24 h, with the count at each step and filled pips for the share.
+- **Tabbed feed panel**, like `.feed-tabs` with `aria-pressed` buttons. Tabs: Duplicates, Ready to merge, Hot files, All PRs. Rows are ruled list items with small tags like `.news-tag`. Without JS, every tab's content is shown in sequence.
+- **Bottom meta strip**, like `.a-meta`: label-over-value stats in one row on desktop and two columns on phones. The key stat (open PRs) uses the accent colour, and a "warn" stat shows the number failing CI.
+- **Chart tooltip** like their `.city-tip`: inverted colours, square, small text.
+- Trends chart and empty states stay as built, restyled to match.
+- The data rules are unchanged: no fake data, and explicit "no data yet" states.

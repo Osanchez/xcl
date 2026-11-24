@@ -345,8 +345,8 @@ class PageTests(unittest.TestCase):
             self.assertIn("Trends start after the first hours of hourly snapshots (%d so far)." % len(h), out)
             self.assertNotIn("<polyline class=\"line", out)
             self.assertIn("Trends start after", ps.render_md(self.an(), "o/r", NOW, h))
-        self.assertIn("Possible duplicate work", out)
-        self.assertIn("Ready to merge", out)
+        self.assertIn("data-panel=\"dup\"", out)
+        self.assertIn("data-panel=\"ready\"", out)
 
     def test_bars_need_two_days(self):
         same_day = [snap("2026-11-23T01:00:00Z", [1]), snap("2026-11-23T09:00:00Z", [1, 2])]
@@ -366,7 +366,7 @@ class PageTests(unittest.TestCase):
         out = ps.render_html(self.an(), "o/r", NOW, [snap(t(22), [1], open=1)])
         self.assertIn("no 24 h data yet", out)
         self.assertNotIn("/ 24 h", out)
-        self.assertEqual(ps.render_html(self.an(), "o/r", NOW).count("no 24 h data yet"), 5)  # hero + 4 tiles, not Stale
+        self.assertEqual(ps.render_html(self.an(), "o/r", NOW).count("no 24 h data yet"), 6)  # hero + 5 stats, not Stale or CI failing
 
     def test_trends_shown_with_history(self):
         h = [snap(t(48), [1]), snap(t(24), [1, 2]), snap(t(1), [2, 3, 4])]
@@ -382,6 +382,28 @@ class PageTests(unittest.TestCase):
         self.assertNotIn('"<z>', out)
         self.assertIn("avatars.githubusercontent.com/x%2Fy%22%3Cz%3E?s=40", out)
         self.assertIn('loading="lazy"', out)
+
+    def test_panels_all_present_without_js(self):
+        out = ps.render_html(self.an(), "o/r", NOW)
+        for k in ("dup", "ready", "hot", "all"):
+            self.assertEqual(out.count('data-panel="%s"' % k), 1)
+        self.assertNotIn('class="panel" hidden', out)
+        self.assertIn(".js .tabs{display:flex}", out)  # tab buttons only exist with JS
+        self.assertEqual(out.count('<div class="panel"'), 4)
+
+    def test_road_merged_step(self):
+        an = self.an()
+        self.assertIn("no data yet", ps.render_html(an, "o/r", NOW).split('class="road"')[1].split("</ol>")[0])
+        an["merged24"] = 7
+        road = ps.render_html(an, "o/r", NOW).split('class="road"')[1].split("</ol>")[0]
+        self.assertIn("<b>7</b><span>Merged 24 h</span>", road)
+        self.assertEqual(road.count('class="step'), 5)
+
+    def test_tooltips_on_charts(self):
+        h = [snap(t(48), [1]), snap(t(24), [1, 2]), snap(t(1), [2, 3, 4])]
+        out = ps.render_html(self.an(), "o/r", NOW, h)
+        self.assertIn("data-tip=", out)
+        self.assertIn('id="tip"', out)
 
     def test_only_font_stylesheet_external(self):
         out = ps.render_html(self.an(), "o/r", NOW)
