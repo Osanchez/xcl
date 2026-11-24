@@ -361,20 +361,25 @@ def daily_summary(hist):
     prev = None
     for s in hist:
         day = s["ts"][:10]
-        d = days.setdefault(day, {"day": day, "open": 0, "unreviewed": 0, "new": 0, "closed": 0})
+        d = days.setdefault(day, {"day": day, "open": 0, "unreviewed": 0, "new": 0, "closed": 0, "pairs": 0})
         d["open"], d["unreviewed"] = s["open"], s["unreviewed"]
         if prev is not None and prev["prs"] is not None and s["prs"] is not None:
             n, c = new_and_closed(prev["prs"], s["prs"])
             d["new"] += n
             d["closed"] += c
+            d["pairs"] += 1
         prev = s
     return [days[k] for k in sorted(days)]
 
 
 def change_24h(hist, key, current, now):
-    """current - value in the newest snapshot at least 24 h old, or None without one."""
-    base = [s for s in hist if now - parse_time(s["ts"]) >= dt.timedelta(hours=24)]
-    return current - base[-1][key] if base else None
+    """current - value in the snapshot closest to 24 h ago, among those at least 23 h old; None without one."""
+    day = dt.timedelta(hours=24)
+    base = [s for s in hist if now - parse_time(s["ts"]) >= dt.timedelta(hours=23)]
+    if not base:
+        return None
+    best = min(base, key=lambda s: abs((now - parse_time(s["ts"])) - day))
+    return current - best[key]
 
 
 def downsample(vals, n):
@@ -463,14 +468,15 @@ def state_pills(p):
 
 def delta_text(d):
     if d is None:
-        return ""
+        return '<span class="delta">no 24 h data yet</span>'
     if d == 0:
         return '<span class="delta">no change / 24 h</span>'
     return '<span class="delta">%s %d / 24 h</span>' % ("&#9650;" if d > 0 else "&#9660;", abs(d))
 
 
-def tile(label, value, delta=None):
-    return '<div class="stat"><div class="stat-l">%s</div><div class="stat-v">%d</div>%s</div>' % (esc(label), value, delta_text(delta))
+def tile(label, value, delta=None, show_delta=True):
+    return '<div class="stat"><div class="stat-l">%s</div><div class="stat-v">%d</div>%s</div>' % (
+        esc(label), value, delta_text(delta) if show_delta else "")
 
 
 def legend(items):
@@ -508,7 +514,7 @@ def _y_axis(ml, mr, mt, mb, w, h, top, step):
 def svg_line_chart(series, label, w=480, h=240):
     """series: [{"name", "cls", "points": [(datetime, value)]}]. Empty text with no points."""
     pts = [p for s in series for p in s["points"]]
-    if not pts:
+    if max([len(s["points"]) for s in series] or [0]) < 2:
         return '<p class="muted empty">No data yet.</p>'
     ml, mr, mt, mb = 36, 12, 12, 28
     t0 = min(t for t, _ in pts).timestamp()
@@ -578,7 +584,7 @@ def svg_bars(rows, label, w=480, h=240):
 def sparkline(vals, label="", w=72, h=24):
     cls = 'class="spark" width="%d" height="%d" viewBox="0 0 %d %d"' % (w, h, w, h)
     if len(vals) < 2:
-        return "<svg %s aria-hidden=\"true\"></svg>" % cls
+        return '<span class="nodata">no data</span>'
     lo, hi = min(vals), max(vals)
     pts = " ".join("%.1f,%.1f" % (2 + (w - 4) * i / (len(vals) - 1),
                                   h / 2 if hi == lo else h - 3 - (h - 6) * (v - lo) / (hi - lo)) for i, v in enumerate(vals))
@@ -653,14 +659,14 @@ h2{font-size:16px;line-height:24px;margin:0;font-weight:700;text-transform:upper
 .legend{display:flex;flex-wrap:wrap;gap:4px 16px;list-style:none;margin:0;padding:0;font-size:13px;line-height:20px;color:var(--soft)}
 .legend li{display:flex;align-items:center;gap:8px}.sw{display:inline-block;width:10px;height:10px}
 .sw.s-open,.sw.b-new,.sw.k-rev{background:var(--accent)}.sw.s-unrev,.sw.k-wait{background:var(--partial)}.sw.b-closed,.sw.k-done{background:var(--good)}.sw.k-draft{background:var(--soft)}
-.empty{margin:16px 0 0}
+.empty{margin:16px 0 0}.empty-block{margin:16px 0 4px;padding:24px 0;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);color:var(--soft);font:700 16px/24px "Roboto Condensed",Roboto,sans-serif;text-transform:uppercase;letter-spacing:.04em}
 .arow{display:grid;grid-template-columns:152px 1fr 72px;gap:8px 16px;align-items:center;padding:12px 0;border-bottom:1px solid var(--rule)}
 .aname{font-weight:700;font-size:15px;display:flex;align-items:center;gap:8px;min-width:0}
 .aname i{width:10px;height:10px;flex:none;background:var(--ac)}.aname small{font:400 13px Roboto,sans-serif;color:var(--soft);margin-left:auto}
 .abar{display:flex;height:8px;background:var(--wash);min-width:8px}.abar i{display:block;min-width:2px}
 .abar .draft{background:var(--soft)}.abar .wait{background:var(--partial)}.abar .rev{background:var(--accent)}.abar .done{background:var(--good)}
 .abar-wrap{display:flex;flex-direction:column;gap:4px;min-width:0}.acount{font-size:13px;line-height:20px;color:var(--soft)}
-.spark{display:block;justify-self:end}.spline{fill:none;stroke:var(--soft);stroke-width:1.5;stroke-linejoin:round}
+.spark{display:block;justify-self:end}.nodata{justify-self:end;font-size:13px;color:var(--soft)}.spline{fill:none;stroke:var(--soft);stroke-width:1.5;stroke-linejoin:round}
 .cluster{margin-top:16px;padding:0 0 16px 16px;border-left:4px solid var(--ac);border-bottom:1px solid var(--rule)}
 .cluster:first-of-type{margin-top:16px}
 .chead{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 16px;align-items:baseline}
@@ -813,7 +819,7 @@ def render_html(an, repo, now, hist=None):
         tile("Looks done", *vals("looksDone", n_done)),
         tile("Possible duplicates", *vals("clusters", len(an["clusters"]))),
         tile("Drafts", *vals("draft", n_dr)),
-        tile("Stale (%dd+)" % STALE_DAYS, n_stale))))
+        tile("Stale (%dd+)" % STALE_DAYS, n_stale, show_delta=False))))
 
     # left column: duplicates, trends
     left = []
@@ -844,14 +850,16 @@ def render_html(an, repo, now, hist=None):
     left.append("</section>")
 
     recent = window(hist, now, TREND_DAYS)
-    if len(recent) >= 2:
-        days = daily_summary(recent)
-        left.append('<section class="sec">%s' % sec_head("Trends", "last %d days, %d snapshots" % (TREND_DAYS, len(recent))))
+    left.append('<section class="sec">%s' % sec_head("Trends", "last %d days, %d snapshot%s" % (TREND_DAYS, len(recent), "" if len(recent) == 1 else "s")))
+    if len(recent) < 2:
+        left.append('<p class="empty-block">No data yet</p><p class="sec-note">Trends start after the first hours of hourly snapshots (%d so far).</p></section>' % len(recent))
+    else:
+        days = [d for d in daily_summary(recent) if d["pairs"]] if len({x["ts"][:10] for x in recent}) >= 2 else []
         left.append('<div class="chart-block"><h3>Open and unreviewed</h3>%s%s</div>' % (
             legend([("Open", "s-open"), ("Unreviewed", "s-unrev")]),
             svg_line_chart([
-                {"name": "open", "cls": "s-open", "points": [(parse_time(s["ts"]), s["open"]) for s in recent]},
-                {"name": "unreviewed", "cls": "s-unrev", "points": [(parse_time(s["ts"]), s["unreviewed"]) for s in recent]}],
+                {"name": "open", "cls": "s-open", "points": [(parse_time(x["ts"]), x["open"]) for x in recent]},
+                {"name": "unreviewed", "cls": "s-unrev", "points": [(parse_time(x["ts"]), x["unreviewed"]) for x in recent]}],
                 "Open and unreviewed pull requests over the last %d days" % TREND_DAYS)))
         left.append('<div class="chart-block"><h3>Opened and closed per day</h3>%s%s</div></section>' % (
             legend([("Opened", "b-new"), ("Closed or merged", "b-closed")]),
@@ -868,7 +876,7 @@ def render_html(an, repo, now, hist=None):
         cnt = {k: sum(bucket(p) == k for p in ps) for k, _ in BUCKETS}
         segs = "".join('<i class="%s" style="flex:%d" title="%s"></i>' % (k, cnt[k], esc("%s: %d" % (n, cnt[k])))
                        for k, n in BUCKETS if cnt[k])
-        series = downsample([s["areas"].get(a, 0) for s in spark_hist], 48)
+        series = downsample([s["areas"].get(a, 0) for s in spark_hist if s["open"] == 0 or s["areas"]], 48)
         right.append('<div class="arow" style="%s"><div class="aname"><i></i><a href="#area=%s">%s</a><small>%d</small></div>'
                      '<div class="abar-wrap"><div class="abar" style="width:%.1f%%">%s</div>'
                      '<div class="acount">%s</div></div>%s</div>' % (
@@ -955,7 +963,7 @@ def render_md(an, repo, now, hist=None):
 
     def ch(key, cur):
         d = change_24h(hist, key, cur, now)
-        return "" if d is None else " (%+d in 24 h)" % d
+        return " (no 24 h data yet)" if d is None else " (%+d in 24 h)" % d
 
     head = ["| PR | Title | Author | Age | Review | CI | Files |", "|---|---|---|---|---|---|---|"]
     n_un, n_dr = sum(p["unreviewed"] for p in prs), sum(bool(p["isDraft"]) for p in prs)
@@ -965,10 +973,14 @@ def render_md(an, repo, now, hist=None):
         len(prs), ch("open", len(prs)), n_un, ch("unreviewed", n_un), n_done, ch("looksDone", n_done),
         len(an["clusters"]), ch("clusters", len(an["clusters"])), n_dr, ch("draft", n_dr), n_stale))
     recent = window(hist, now, TREND_DAYS)
-    if len(recent) >= 2:
-        o += ["", "## Trends", "", "Last %d days, last snapshot of each UTC day; opened and closed from consecutive snapshots." % TREND_DAYS, "",
+    o += ["", "## Trends", ""]
+    if len(recent) < 2:
+        o += ["No data yet.", "", "Trends start after the first hours of hourly snapshots (%d so far)." % len(recent)]
+    else:
+        o += ["Last %d days, last snapshot of each UTC day; opened and closed from consecutive snapshots (- = no earlier snapshot to compare)." % TREND_DAYS, "",
               "| Day | Open | Unreviewed | Opened | Closed |", "|---|---|---|---|---|"]
-        o += ["| %s | %d | %d | %d | %d |" % (d["day"], d["open"], d["unreviewed"], d["new"], d["closed"]) for d in daily_summary(recent)]
+        o += ["| %s | %d | %d | %s | %s |" % (d["day"], d["open"], d["unreviewed"], d["new"] if d["pairs"] else "-", d["closed"] if d["pairs"] else "-")
+              for d in daily_summary(recent)]
     areas = sorted(an["areas"], key=lambda a: (-len(an["areas"][a]), a))
     o += ["", "## By area", "", "| Area | Open | Draft | Waiting for review | Reviewed | Looks done | + lines | - lines |", "|---|---|---|---|---|---|---|---|"]
     for a in areas:

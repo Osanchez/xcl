@@ -275,6 +275,18 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(ps.change_24h(h, "open", 15, NOW), 3)
         self.assertIsNone(ps.change_24h([snap(t(2), [1])], "open", 5, NOW))
 
+    def test_change_24h_23h_rule(self):
+        self.assertIsNone(ps.change_24h([snap(t(22.9), [1], open=1)], "open", 5, NOW))
+        self.assertEqual(ps.change_24h([snap(t(23), [1], open=1)], "open", 5, NOW), 4)
+
+    def test_change_24h_picks_closest_to_24h(self):
+        h = [snap(t(48), [1], open=1), snap(t(26), [1], open=2), snap(t(23.5), [1], open=3), snap(t(23), [1], open=4)]
+        self.assertEqual(ps.change_24h(h, "open", 10, NOW), 7)  # 23.5 h is 0.5 h from 24 h; 26 h is 2 h
+
+    def test_daily_summary_pairs(self):
+        d = ps.daily_summary([snap("2026-11-20T10:00:00Z", [1]), snap("2026-11-21T10:00:00Z", [1, 2])])
+        self.assertEqual([x["pairs"] for x in d], [0, 1])
+
     def test_downsample(self):
         self.assertEqual(ps.downsample([1, 2, 3], 5), [1, 2, 3])
         v = ps.downsample(list(range(100)), 10)
@@ -288,8 +300,9 @@ class ChartTests(unittest.TestCase):
     def test_line_chart_points(self):
         self.assertIn("No data yet", ps.svg_line_chart(self.series(0), "x"))
         one = ps.svg_line_chart(self.series(1), "x")
-        self.assertIn("<circle", one)
-        self.assertNotIn("<polyline", one)
+        self.assertIn("No data yet", one)
+        self.assertNotIn("<svg", one)
+        self.assertIn("<polyline", ps.svg_line_chart(self.series(2), "x"))
         many = ps.svg_line_chart(self.series(200), "x")
         self.assertIn("<polyline", many)
         self.assertIn("<title>", many)
@@ -304,9 +317,11 @@ class ChartTests(unittest.TestCase):
         self.assertIn("<rect", ps.svg_bars([{"day": "2026-11-01", "new": 0, "closed": 0}], "x"))
 
     def test_sparkline_and_ticks(self):
-        for vals in ([], [3], [3, 3, 3], [1, 5, 2]):
-            self.assertIn("<svg", ps.sparkline(vals))
-        self.assertNotIn("<polyline", ps.sparkline([3]))
+        for vals in ([3, 3, 3], [1, 5, 2], [1, 2]):
+            self.assertIn("<polyline", ps.sparkline(vals))
+        for vals in ([], [3]):
+            self.assertIn("no data", ps.sparkline(vals))
+            self.assertNotIn("<svg", ps.sparkline(vals))
         step, top = ps.nice_ticks(0)
         self.assertGreaterEqual(top, 1)
         step, top = ps.nice_ticks(37)
@@ -322,12 +337,36 @@ class PageTests(unittest.TestCase):
         return ps.build_analysis([pr(1, "VFS: a", ["crates/xcl/src/vfs/a.rs"]),
                                   pr(2, "VFS: a", ["crates/xcl/src/vfs/a.rs"], author="x/y\"<z>")], NOW)
 
-    def test_trends_hidden_without_history(self):
-        out = ps.render_html(self.an(), "o/r", NOW, [snap(t(1), [1])])
-        self.assertNotIn("<h2>Trends", out)
-        self.assertNotIn("Trends", ps.render_md(self.an(), "o/r", NOW))
+    def test_trends_empty_state(self):
+        for h in ([], [snap(t(1), [1])]):
+            out = ps.render_html(self.an(), "o/r", NOW, h)
+            self.assertIn("<h2>Trends", out)
+            self.assertIn("No data yet", out)
+            self.assertIn("Trends start after the first hours of hourly snapshots (%d so far)." % len(h), out)
+            self.assertNotIn("<polyline class=\"line", out)
+            self.assertIn("Trends start after", ps.render_md(self.an(), "o/r", NOW, h))
         self.assertIn("Possible duplicate work", out)
         self.assertIn("Ready to merge", out)
+
+    def test_bars_need_two_days(self):
+        same_day = [snap("2026-11-23T01:00:00Z", [1]), snap("2026-11-23T09:00:00Z", [1, 2])]
+        out = ps.render_html(self.an(), "o/r", NOW, same_day)
+        self.assertIn("<polyline class=\"line", out)
+        self.assertNotIn("<rect class=\"b-new", out)
+        self.assertEqual(out.count("No data yet"), 1)
+        two = [snap("2026-11-22T23:00:00Z", [1]), snap("2026-11-23T09:00:00Z", [1, 2])]
+        self.assertIn("<rect class=\"b-new", ps.render_html(self.an(), "o/r", NOW, two))
+
+    def test_area_sparkline_no_data(self):
+        out = ps.render_html(self.an(), "o/r", NOW, [snap(t(1), [1])])
+        self.assertIn("no data", out)
+        self.assertNotIn('class="spark"', out)
+
+    def test_no_delta_without_old_snapshot(self):
+        out = ps.render_html(self.an(), "o/r", NOW, [snap(t(22), [1], open=1)])
+        self.assertIn("no 24 h data yet", out)
+        self.assertNotIn("/ 24 h", out)
+        self.assertEqual(ps.render_html(self.an(), "o/r", NOW).count("no 24 h data yet"), 5)  # hero + 4 tiles, not Stale
 
     def test_trends_shown_with_history(self):
         h = [snap(t(48), [1]), snap(t(24), [1, 2]), snap(t(1), [2, 3, 4])]
