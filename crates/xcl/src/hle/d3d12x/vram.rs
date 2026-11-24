@@ -178,6 +178,39 @@ struct Page {
     idle_since: Option<std::time::Instant>,
 }
 
+/// A page of `Pages::pages` (its title address) or of `Pages::extra_pages` (its key there).
+#[derive(Clone, Copy)]
+enum PageKey {
+    Own(usize),
+    Extra(usize, usize),
+}
+
+/// The pages of `idle` – those whose last user went, oldest first, each with when – that no
+/// resource has used for `IDLE` go back to the pools: out of their map, their tile to `cooling`.
+/// An entry whose page was used again since (in use now, or idle again from a later moment, with
+/// a later entry) is dropped. Only the queue is looked at: every page of both maps, looked at at
+/// every placement, grew with the square of what a title streams.
+fn sweep_idle(
+    idle: &mut std::collections::VecDeque<(PageKey, std::time::Instant)>,
+    pages: &mut std::collections::HashMap<usize, Page>,
+    extra_pages: &mut std::collections::HashMap<(usize, usize), Page>,
+    cooling: &mut std::collections::VecDeque<(Tile, std::time::Instant)>,
+    now: std::time::Instant,
+) {
+    while idle.front().is_some_and(|&(_, since)| now.duration_since(since) >= IDLE) {
+        let Some((key, since)) = idle.pop_front() else { break };
+        let still_idle = |p: &Page| p.idle_since == Some(since);
+        let page = match key {
+            PageKey::Own(a) if pages.get(&a).is_some_and(still_idle) => pages.remove(&a),
+            PageKey::Extra(va, i) if extra_pages.get(&(va, i)).is_some_and(still_idle) => extra_pages.remove(&(va, i)),
+            _ => None,
+        };
+        if let Some(p) = page {
+            cooling.push_back((p.tile, now));
+        }
+    }
+}
+
 struct Target {
     va: usize,
     console_bytes: Option<u64>,
@@ -202,6 +235,8 @@ struct Pages {
     /// extra / sub-64 KiB tiles keyed by `(va, tile_index)` so repeated placements at the same
     /// address share them without aliasing unrelated addresses
     extra_pages: std::collections::HashMap<(usize, usize), Page>,
+    /// pages of both maps whose last user went, oldest first, with when (`sweep_idle`)
+    idle: std::collections::VecDeque<(PageKey, std::time::Instant)>,
     /// resource → its mapping metadata and currently held pages / extra keys
     targets: std::collections::HashMap<usize, Target>,
     /// queue → the fence value it last waited for
@@ -235,24 +270,15 @@ impl Pages {
             cooling: std::collections::VecDeque::new(),
             pages: std::collections::HashMap::new(),
             extra_pages: std::collections::HashMap::new(),
+            idle: std::collections::VecDeque::new(),
             targets: std::collections::HashMap::new(),
             waited: std::collections::HashMap::new(),
         })
     }
 
-    fn sweep_map<K: Copy + Eq + std::hash::Hash>(map: &mut std::collections::HashMap<K, Page>, cooling: &mut std::collections::VecDeque<(Tile, std::time::Instant)>, now: std::time::Instant) {
-        let old: Vec<K> = map.iter().filter(|(_, p)| p.idle_since.is_some_and(|t| now.duration_since(t) >= IDLE)).map(|(&k, _)| k).collect();
-        for k in old {
-            if let Some(p) = map.remove(&k) {
-                cooling.push_back((p.tile, now));
-            }
-        }
-    }
-
     /// Pages no resource used for `IDLE` go back to the pools.
     fn sweep(&mut self, now: std::time::Instant) {
-        Self::sweep_map(&mut self.pages, &mut self.cooling, now);
-        Self::sweep_map(&mut self.extra_pages, &mut self.cooling, now);
+        sweep_idle(&mut self.idle, &mut self.pages, &mut self.extra_pages, &mut self.cooling, now);
     }
 
     unsafe fn take_tile(&mut self, dev: &ID3D12Device) -> Option<Tile> {
@@ -342,6 +368,7 @@ impl Pages {
                         }
                     } else {
                         p.idle_since = Some(now);
+                        self.idle.push_back((PageKey::Own(a), now));
                     }
                 }
             }
@@ -356,6 +383,7 @@ impl Pages {
                         }
                     } else {
                         p.idle_since = Some(now);
+                        self.idle.push_back((PageKey::Extra(k.0, k.1), now));
                     }
                 }
             }
@@ -448,6 +476,32 @@ fn owned_pages(va: usize, console_bytes: Option<u64>, total: usize) -> Option<(u
     }
 }
 
+/// A reserved texture needs TILED in the format's support (`support2`) and, multisampled, a
+/// tiled quality level at its sample count.
+fn can_reserve(support2: i32, samples: u32, tiled_msaa_levels: u32) -> bool {
+    support2 & D3D12_FORMAT_SUPPORT2_TILED.0 != 0 && (samples <= 1 || tiled_msaa_levels > 0)
+}
+
+/// Whether the device can make `desc` a reserved texture, asked before CreateReservedResource:
+/// refused, it is an error in the debug layer (#940: R32G8X24_TYPELESS depth, 1 and 4 samples).
+/// A query that fails says yes, and creation decides.
+unsafe fn reservable(dev: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> bool {
+    let mut f = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: desc.Format, ..Default::default() };
+    if dev.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &mut f as *mut _ as *mut c_void, std::mem::size_of_val(&f) as u32).is_err() {
+        return true;
+    }
+    // a format without TILED is not reservable whatever the sample count's query says
+    if !can_reserve(f.Support2.0, 1, 0) {
+        return false;
+    }
+    let samples = desc.SampleDesc.Count;
+    let mut m = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS { Format: desc.Format, SampleCount: samples, Flags: D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE, NumQualityLevels: 0 };
+    if samples > 1 && dev.CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &mut m as *mut _ as *mut c_void, std::mem::size_of_val(&m) as u32).is_err() {
+        return true;
+    }
+    can_reserve(f.Support2.0, samples, m.NumQualityLevels)
+}
+
 /// A texture at `va` as a reserved resource on the title's shared 64 KiB pages
 /// (`console_bytes`: its size on the console; tiles past the owned page boundaries are shared by
 /// `(va, tile_index)` so repeated placements at the same address do not leak). None: it cannot be.
@@ -470,18 +524,23 @@ unsafe fn place_on_pages(
     if (require_aligned || console_bytes.is_none()) && va % PAGE != 0 {
         return None;
     }
-    let mut g = PAGES.lock().unwrap();
-    let pages = g.entry(dev.as_raw() as usize).or_insert_with(|| Pages::new(dev)).as_mut()?;
     // reserved textures have the PC's 64 KiB tiles
     let tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..*desc };
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let log = |why: &str| {
+        if require_aligned && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            crate::xlog_info!("D3D12.X: GPU-owned texture at {va:#x} ({}x{}, format {}, {} samples) not reserved ({why}): in an arena", desc.Width, desc.Height, desc.Format.0, desc.SampleDesc.Count);
+        }
+    };
+    if !reservable(dev, &tiled) {
+        log("no tiled support for its format or sample count");
+        return None;
+    }
+    let mut g = PAGES.lock().unwrap();
+    let pages = g.entry(dev.as_raw() as usize).or_insert_with(|| Pages::new(dev)).as_mut()?;
     let hr = super::real::dev_create_reserved_resource(this, &tiled as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
-        if require_aligned {
-            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-                crate::xlog_info!("D3D12.X: GPU-owned texture at {va:#x} ({}x{}, format {}, {} samples) not reserved ({hr:#x}): in an arena", desc.Width, desc.Height, desc.Format.0, desc.SampleDesc.Count);
-            }
-        }
+        log(&format!("{hr:#x}"));
         return None;
     }
     let raw = *ppv;
@@ -670,6 +729,60 @@ mod tests {
         assert_eq!(heap_ranges(0, &[(0, 3), (0, 1), (0, 2)]), [(true, 3, 1), (true, 1, 2)]);
     }
 
+    /// Idle pages go back after `IDLE`, and a sweep looks at the queue of idle pages alone: one
+    /// used again stays, one idle again later goes when that is `IDLE` ago, and the sweeps of
+    /// 20 000 placements beside 200 000 pages in use take no time to speak of (a look at every
+    /// page at each of them: 4 000 000 000 looks).
+    #[test]
+    fn idle_pages_are_swept_from_their_queue() {
+        use std::collections::{HashMap, VecDeque};
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut idle: VecDeque<(PageKey, Instant)> = VecDeque::new();
+        let mut pages: HashMap<usize, Page> = (0..200_000usize).map(|i| (i * PAGE, Page { tile: (0, i as u32), users: 1, idle_since: None })).collect();
+        let mut extra: HashMap<(usize, usize), Page> = HashMap::from([((7 * PAGE, 3), Page { tile: (1, 0), users: 1, idle_since: None })]);
+        let mut cooling: VecDeque<(Tile, Instant)> = VecDeque::new();
+        // what `release_tiles` and `bind` do to a page
+        fn release(p: &mut Page, idle: &mut VecDeque<(PageKey, Instant)>, key: PageKey, when: Instant) {
+            (p.users, p.idle_since) = (0, Some(when));
+            idle.push_back((key, when));
+        }
+        fn use_again(p: &mut Page) {
+            (p.users, p.idle_since) = (1, None);
+        }
+        // pages 1, 2, 3 idle at 0 ms and an extra page at 100 ms; page 2 is used again at
+        // 500 ms; page 3 too, and is idle again at 1500 ms
+        for a in [PAGE, 2 * PAGE, 3 * PAGE] {
+            release(pages.get_mut(&a).unwrap(), &mut idle, PageKey::Own(a), at(0));
+        }
+        release(extra.get_mut(&(7 * PAGE, 3)).unwrap(), &mut idle, PageKey::Extra(7 * PAGE, 3), at(100));
+        use_again(pages.get_mut(&(2 * PAGE)).unwrap());
+        use_again(pages.get_mut(&(3 * PAGE)).unwrap());
+        release(pages.get_mut(&(3 * PAGE)).unwrap(), &mut idle, PageKey::Own(3 * PAGE), at(1500));
+
+        sweep_idle(&mut idle, &mut pages, &mut extra, &mut cooling, at(1900));
+        assert!(cooling.is_empty() && pages.len() == 200_000 && idle.len() == 5, "nothing is idle for IDLE yet");
+        sweep_idle(&mut idle, &mut pages, &mut extra, &mut cooling, at(2050));
+        assert_eq!(cooling.iter().map(|c| c.0).collect::<Vec<_>>(), [(0, 1)], "page 1 alone: 2 is in use, 3 idle since 1500 ms");
+        assert!(!pages.contains_key(&PAGE) && pages.contains_key(&(2 * PAGE)) && pages.contains_key(&(3 * PAGE)) && extra.len() == 1);
+        sweep_idle(&mut idle, &mut pages, &mut extra, &mut cooling, at(2150));
+        assert_eq!(cooling.iter().map(|c| c.0).collect::<Vec<_>>(), [(0, 1), (1, 0)], "the extra page, idle since 100 ms");
+        assert!(extra.is_empty() && pages.len() == 199_999);
+        sweep_idle(&mut idle, &mut pages, &mut extra, &mut cooling, at(3499));
+        assert!(pages.contains_key(&(3 * PAGE)));
+        sweep_idle(&mut idle, &mut pages, &mut extra, &mut cooling, at(3500));
+        assert_eq!(cooling.iter().map(|c| c.0).collect::<Vec<_>>(), [(0, 1), (1, 0), (0, 3)]);
+        assert!(idle.is_empty() && pages.len() == 199_998 && pages[&(2 * PAGE)].users == 1);
+
+        // every placement sweeps: with nothing idle that is nothing, whatever is in use
+        let t = Instant::now();
+        for k in 0..20_000u64 {
+            sweep_idle(&mut idle, &mut pages, &mut extra, &mut cooling, at(4000 + k));
+        }
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?} for 20 000 sweeps", t.elapsed());
+        assert_eq!(pages.len(), 199_998);
+    }
+
     /// Any 64 KiB page boundary inside `[va, va + bytes)` belongs to that range alone, so
     /// non-overlapping ranges never share an owned page even when only 4 KiB aligned.
     #[test]
@@ -696,6 +809,50 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Reserved only with TILED support, and for MSAA a tiled sample count (#940: the driver
+    /// refused R32G8X24_TYPELESS reserved, at 1 and 4 samples, and the debug layer said so).
+    #[test]
+    fn reserved_needs_tiled_format_and_tiled_msaa() {
+        let tiled = D3D12_FORMAT_SUPPORT2_TILED.0;
+        assert!(can_reserve(tiled, 1, 0));
+        assert!(!can_reserve(0, 1, 0), "format without TILED");
+        assert!(can_reserve(tiled, 4, 1));
+        assert!(!can_reserve(tiled, 4, 0), "no tiled quality level at 4 samples");
+        assert!(!can_reserve(0, 4, 1));
+    }
+
+    /// The device's answer agrees with CreateReservedResource: what `reservable` turns away the
+    /// driver refuses, what it lets through the driver makes (WARP or a hardware adapter).
+    #[test]
+    fn reservable_agrees_with_the_driver() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let factory: windows::Win32::Graphics::Dxgi::IDXGIFactory4 = windows::Win32::Graphics::Dxgi::CreateDXGIFactory1().expect("DXGI factory");
+                let Ok(warp) = factory.EnumWarpAdapter::<windows::Win32::Graphics::Dxgi::IDXGIAdapter>() else { return };
+                let _ = D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev);
+            }
+            let Some(dev) = dev else { return };
+            let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &mut o as *mut _ as *mut c_void, std::mem::size_of_val(&o) as u32).is_err() || o.TiledResourcesTier.0 < D3D12_TILED_RESOURCES_TIER_2.0 {
+                return;
+            }
+            for (format, samples) in [(DXGI_FORMAT_R32G8X24_TYPELESS, 1), (DXGI_FORMAT_R32G8X24_TYPELESS, 4), (DXGI_FORMAT_R32_TYPELESS, 1), (DXGI_FORMAT_R8G8B8A8_UNORM, 1)] {
+                let flags = if format == DXGI_FORMAT_R8G8B8A8_UNORM { D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET } else { D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL };
+                let desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 128, Height: 128, DepthOrArraySize: 1, MipLevels: 1, Format: format,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, Flags: flags, ..Default::default()
+                };
+                let mut r: Option<ID3D12Resource> = None;
+                let made = dev.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut r).is_ok() && r.is_some();
+                assert_eq!(reservable(&dev, &desc), made, "format {} x{samples}: reservable vs CreateReservedResource", format.0);
             }
         }
     }
