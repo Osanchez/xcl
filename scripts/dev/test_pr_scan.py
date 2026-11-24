@@ -516,10 +516,10 @@ class GroupTests(unittest.TestCase):
     def test_select_optgroups_and_member_filter(self):
         out = ps.render_html(analysis_of({"Recompiler": 9, "kernelx": 4, "VFS": 3, "Scripts": 2}), "o/r", NOW)
         sel = out.split('<select id="area">')[1].split("</select>")[0]
-        self.assertIn('<optgroup label="Core runtime"><option value="%s" data-members="%s,%s">All Core runtime (7)</option>' % (
+        self.assertIn('<optgroup label="Core runtime"><option value="%s" data-members="%s,%s" data-name="All Core runtime">All Core runtime (7)</option>' % (
             ps.slug("Core runtime"), ps.slug("kernelx"), ps.slug("VFS")), sel)
-        self.assertIn('<option value="%s">kernelx (4)</option>' % ps.slug("kernelx"), sel)
-        self.assertIn('<option value="%s">VFS (3)</option>' % ps.slug("VFS"), sel)
+        self.assertIn('<option value="%s" data-name="kernelx">kernelx (4)</option>' % ps.slug("kernelx"), sel)
+        self.assertIn('<option value="%s" data-name="VFS">VFS (3)</option>' % ps.slug("VFS"), sel)
         self.assertIn('<optgroup label="Tooling">', sel)
         # the filter on one member area: rows carry the area slug, the option has no data-members, so only that area matches
         self.assertEqual(out.count('class="row pr" data-area="%s"' % ps.slug("kernelx")), 4)
@@ -543,7 +543,7 @@ class ToolbarTests(unittest.TestCase):
         for a in counts:
             self.assertEqual(sel.count('value="%s"' % ps.slug(a)), 1, a)
         self.assertEqual(sel.count("<option "), 1 + 7 + 1 + 3)  # All, top 7, "All Other", the 3 inside it
-        self.assertIn('<optgroup label="Other"><option value="%s" data-members="%s">All Other (12)</option>' % (
+        self.assertIn('<optgroup label="Other"><option value="%s" data-members="%s" data-name="All Other">All Other (12)</option>' % (
             ps.ROLLUP_SLUG, ",".join(ps.slug(a) for a in ("A7", "A8", "A9"))), sel)
         grp = sel.split("<optgroup")[1]
         self.assertEqual(grp.count("<option "), 4)
@@ -573,7 +573,8 @@ class ToolbarTests(unittest.TestCase):
         self.assertIn(".toolbar{display:none", out)
         self.assertIn(".js .toolbar{display:flex}", out)
         self.assertEqual(out.count('id="filters"'), 1)
-        self.assertLess(out.index('id="filters"'), out.index('class="top-right"'))  # inside the top bar
+        self.assertGreater(out.index('id="filters"'), out.index('class="top-right"'))  # row 2 of the top bar
+        self.assertLess(out.index('id="filters"'), out.index("</header>"))
 
     def test_hash_state_keys(self):
         for key in ("q=", "area=", "state=", "tab="):
@@ -1298,7 +1299,7 @@ class PageRangeTests(unittest.TestCase):
         self.assertIn('data-range="7d" aria-pressed="true"', seg)
         self.assertIn('aria-label="Time range"', out)
         self.assertLess(out.index('id="range"'), out.index('id="states"'))
-        self.assertLess(out.index('id="range"'), out.index('class="top-right"'))  # in the toolbar, inside the top bar
+        self.assertLess(out.index('id="range"'), out.index("</header>"))  # in the toolbar, inside the top bar
 
     def test_page_tabs_markup_and_no_js_fallback(self):
         out = self.page()
@@ -1444,6 +1445,77 @@ class PageRangeTests(unittest.TestCase):
         self.assertIn('<div class="stf"><span class="fchip"', row)
         self.assertEqual(ps.standings_html(ps.range_view(an, 3600, NOW), "1 h", []).count('class="st"'), 1)
         self.assertIn("title=", row)
+
+
+class NavFontTests(unittest.TestCase):
+    def page(self):
+        return ps.render_html(RangeTests().an(), "o/r", NOW)
+
+    def test_font_link_has_anton_and_roboto_body(self):
+        out = self.page()
+        link = re.search(r"<link rel=stylesheet href='([^']+)'", out).group(1)
+        self.assertIn("family=Anton", link)
+        self.assertIn("family=Roboto:wght@400;500;700", link)
+        self.assertIn("display=swap", link)
+        self.assertNotIn("Condensed", out)
+        self.assertIn("Anton,Impact", ps.CSS)
+        self.assertIn("font:400 15px/1.45 Roboto", ps.CSS)  # body text stays Roboto
+        self.assertIn("Anton", ps.SCENE_JS)  # tower callout names on the canvas
+        self.assertIn("Anton", ps.SCENE_CSS)
+
+    def test_no_scene_caption_but_legend_stays(self):
+        out = self.page()
+        self.assertNotIn("One tower per area", out)
+        self.assertNotIn('class="scene-cap"', out)
+        self.assertNotIn('id="scene-cap"', out)
+        self.assertNotIn("<b>Effort map.</b>", out)
+        self.assertNotIn("One layer is", out.split('id="range-data">')[1].split("</script>")[0])
+        self.assertNotIn('"caption"', out.split('id="scene-data">')[1].split("</script>")[0].split('"ranges"')[1])
+        self.assertIn("Merged in 7 d", out.split('class="scene-foot"')[1].split("</div>")[0])
+        self.assertIn('class="legend"', out.split('class="scene-foot"')[1].split("</div>")[0])
+
+    def test_navbar_has_two_rows(self):
+        out = self.page()
+        head = out.split('<header class="top">')[1].split("</header>")[0]
+        self.assertEqual(head.count('class="nav-row"'), 1)
+        row1 = head.split('class="nav-row"')[1].split('id="filters"')[0]
+        self.assertLess(row1.index("<h1>"), row1.index('id="ptabs"'))
+        self.assertLess(row1.index('id="ptabs"'), row1.index('class="top-right"'))
+        self.assertIn('id="theme"', row1)
+        self.assertIn('id="upd"', row1)
+        row2 = head.split('id="filters"')[1]
+        order = [row2.index(k) for k in ('id="q"', 'id="area"', 'id="range"', 'id="states"')]
+        self.assertEqual(order, sorted(order))
+        self.assertNotIn('id="range"', row1)
+        self.assertIn(".top{grid-area:top;display:flex;flex-direction:column", ps.CSS)
+        self.assertIn("min-width:200px;max-width:340px", ps.CSS)  # a wide search box
+
+    def test_page_still_fits(self):
+        d = FitTests().desktop()
+        self.assertIn(".js .app{height:100vh;height:100dvh;overflow:hidden", d)
+        self.assertIn(".js,.js body{height:100%;overflow:hidden}", d)
+
+    def test_select_counts_follow_the_range(self):
+        an = RangeTests().an()
+        out = ps.render_html(an, "o/r", NOW)
+        data = json.loads(out.split('id="range-data">')[1].split("</script>")[0])
+        top = ps.top_areas(an)
+        for key, secs, _ in ps.RANGES:
+            sel = data["ranges"][key]["sel"]
+            view = ps.range_view(an, secs, NOW)
+            self.assertEqual(sel[ps.slug("VFS")], len(view["areas"].get("VFS", [])), key)
+            self.assertEqual(sel[ps.entry_slug(top[0])], sum(len(view["areas"].get(m, [])) for m in (top[0]["members"] or [top[0]["name"]])), key)
+        self.assertEqual(data["ranges"]["30d"]["sel"][ps.slug("VFS")], 4)
+        self.assertEqual(data["ranges"]["1h"]["sel"][ps.slug("VFS")], 1)
+        self.assertEqual(data["ranges"]["7d"]["sel"][ps.slug("VFS")], 3)
+        self.assertEqual(data["ranges"]["1h"]["sel"]["area-core-runtime"], 1)
+        # every option has a name for the JS to relabel, and the same keys exist in every range
+        sel_html = out.split('<select id="area">')[1].split("</select>")[0]
+        vals = re.findall(r'<option value="([^"]+)"[^>]*data-name="', sel_html)
+        self.assertEqual(sel_html.count("<option "), len(vals) + 1)
+        for key in data["ranges"]:
+            self.assertEqual(sorted(data["ranges"][key]["sel"]), sorted(vals))
+        self.assertIn("o.textContent=nm+' ('+n+')'", ps.JS)
 
 
 if __name__ == "__main__":

@@ -752,7 +752,7 @@ def avatar(login):
             'loading="lazy" decoding="async">' % (urllib.parse.quote(str(login), safe=""), esc(login)))
 
 
-FONTS_URL = "https://fonts.googleapis.com/css2?family=Roboto+Condensed:wght@700&family=Roboto:wght@400;500;700&display=swap"
+FONTS_URL = "https://fonts.googleapis.com/css2?family=Anton&family=Roboto:wght@400;500;700&display=swap"
 
 # Area colour pairs (light, dark); areas past the last pair cycle.
 CATEGORY = [("#d81f82", "#ff7fc0"), ("#c96a12", "#ffb057"), ("#14839f", "#5fd0ea"), ("#4f7f16", "#b4e06a"),
@@ -788,25 +788,27 @@ html{background:var(--page);-webkit-text-size-adjust:100%}
 body::before{content:"";position:fixed;top:0;right:0;bottom:0;left:0;z-index:-1;pointer-events:none;background:var(--sky)}
 body{margin:0;color:var(--ink);font:400 15px/1.45 Roboto,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;font-variant-numeric:tabular-nums}
 h1,h2,h3,p,ol,ul{margin:0;padding:0}ol,ul{list-style:none}
-h1,h2,h3,.cond,.score,.stat b,.rank,.step b,th{font-family:"Roboto Condensed","Arial Narrow",Roboto,system-ui,sans-serif}
+h1,h2,h3,.cond,.score,.stat b,.rank,.step b,th{font-family:Anton,Impact,"Arial Narrow",sans-serif;font-synthesis:none}
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 a:focus-visible,button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .app{display:grid;grid-template-columns:minmax(0,1fr);padding:0 16px;row-gap:8px;
 grid-template-areas:"top" "pages" "feed" "foot"}
 .app>*{min-width:0}
-.top{grid-area:top;display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px 14px;min-height:50px;padding:6px 12px;background:var(--surface);border-bottom:2px solid var(--ink)}
-h1{font:700 20px/1.1 "Roboto Condensed",Arial,sans-serif;text-transform:uppercase;letter-spacing:.04em}h1 span{color:var(--soft)}
+.top{grid-area:top;display:flex;flex-direction:column;align-items:stretch;gap:10px;padding:10px 12px 12px;background:var(--surface);border-bottom:2px solid var(--ink)}
+.nav-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px 24px;min-width:0}
+h1{font:400 20px/1.1 Anton,Impact,sans-serif;text-transform:uppercase;letter-spacing:.04em}h1 span{color:var(--soft)}
 h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:1.3;font-weight:700}
-.top-right{display:flex;align-items:center;gap:12px;min-width:0}
+h1,h2,h3,.score,.stat b,.rank,.step b{font-weight:400}h2,h3{letter-spacing:.03em}
+.top-right{display:flex;align-items:center;gap:14px;min-width:0;margin-left:auto}
 .live{display:flex;align-items:center;gap:8px;color:var(--soft);font-size:13px;white-space:nowrap}
 .dot{width:8px;height:8px;background:var(--accent);animation:beat 2s steps(2) infinite}
 @keyframes beat{50%{opacity:.25}}
 .theme{border:1px solid var(--rule);background:transparent;color:var(--ink);font:500 13px/1 Roboto,Arial,sans-serif;padding:7px 10px;cursor:pointer}
 .theme:hover{border-color:var(--ink)}
-.toolbar{display:none;order:3;flex:1 1 100%;align-items:center;flex-wrap:wrap;gap:6px 8px;min-width:0}
+.toolbar{display:none;align-items:center;flex-wrap:wrap;gap:8px 16px;min-width:0}
 .js .toolbar{display:flex}
 .toolbar input,.toolbar select{font:500 13px/1.2 Roboto,Arial,sans-serif;padding:7px 10px;border:1px solid var(--rule);background:var(--page);color:var(--ink);min-width:0;border-radius:0}
-.toolbar input{flex:1 1 140px;max-width:300px}.toolbar select{flex:0 1 190px;max-width:100%;text-overflow:ellipsis}
+.toolbar input{flex:1 1 140px;max-width:340px}.toolbar select{flex:0 1 190px;max-width:100%;text-overflow:ellipsis}
 .seg{display:inline-flex;max-width:100%;border:1px solid var(--rule)}
 .seg button{flex:none;border:0;border-right:1px solid var(--rule);background:transparent;color:var(--ink);font:500 13px/1 Roboto,Arial,sans-serif;padding:7px 10px;cursor:pointer;border-radius:0}
 .seg button:last-child{border-right:0}.seg button:hover{background:var(--wash)}
@@ -817,16 +819,16 @@ h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:
 .a-city .score-box,.scene-foot,.scene-key,.a-city>.empty-block,.a-city>.sec-note{background:var(--surface);padding-left:10px;padding-right:10px}
 .pages{grid-area:pages;display:flex;flex-direction:column;gap:8px;min-width:0;min-height:0}
 .page{display:flex;flex-direction:column;gap:8px;min-width:0;min-height:0}
-.page-title{font:700 16px/1.2 "Roboto Condensed",Arial,sans-serif;text-transform:uppercase;letter-spacing:.04em;color:var(--soft);padding-top:8px}.js .page-title{display:none}
+.page-title{font:400 16px/1.2 Anton,Impact,sans-serif;text-transform:uppercase;letter-spacing:.04em;color:var(--soft);padding-top:8px}.js .page-title{display:none}
 .a-trends,.a-road,.a-standings{display:flex;flex-direction:column}
 .a-feed{grid-area:feed;display:flex;flex-direction:column}
 .ptabs{display:none;gap:4px;min-width:0}.js .ptabs{display:flex}
-.ptabs button{padding:6px 10px 4px;border:0;border-bottom:2px solid transparent;background:none;color:var(--soft);font:700 15px/1.2 "Roboto Condensed",Arial,sans-serif;text-transform:uppercase;letter-spacing:.04em;cursor:pointer;border-radius:0}
+.ptabs button{padding:6px 10px 4px;border:0;border-bottom:2px solid transparent;background:none;color:var(--soft);font:400 15px/1.2 Anton,Impact,sans-serif;text-transform:uppercase;letter-spacing:.04em;cursor:pointer;border-radius:0}
 .ptabs button:hover{color:var(--ink)}.ptabs button[aria-pressed=true]{border-bottom-color:var(--partial);color:var(--ink)}
 .head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;margin-bottom:8px;min-width:0}
 .head>span{color:var(--soft);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .score-box{display:flex;align-items:flex-end;flex-wrap:wrap;gap:8px 16px;margin-bottom:8px}
-.score{font:700 72px/.86 "Roboto Condensed",Arial,sans-serif}.score small{font-size:28px;margin-left:6px;color:var(--soft)}
+.score{font:400 72px/.86 Anton,Impact,sans-serif}.score small{font-size:28px;margin-left:6px;color:var(--soft)}
 .score-note{color:var(--soft);font-size:13px;line-height:1.35}.score-note b{display:block;color:var(--ink);font-size:15px;font-weight:500}
 .score-note span{display:block}
 .sec-note{color:var(--soft);font-size:13px;line-height:1.35;margin:4px 0 8px}
@@ -843,7 +845,7 @@ h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:
 .legend li{display:flex;align-items:center;gap:6px}.sw{display:inline-block;width:8px;height:8px}
 .sw.s-open,.sw.b-new,.sw.k-rev{background:var(--accent)}.sw.s-unrev,.sw.k-wait{background:var(--partial)}.sw.b-closed,.sw.k-done{background:var(--good)}.sw.b-merged{background:var(--merged)}.sw.k-draft{background:var(--soft)}.sw.k-merged{background:var(--merged)}
 .empty{margin:8px 0 0}
-.empty-block{margin:8px 0 4px;padding:20px 0;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);color:var(--soft);font:700 16px/1.2 "Roboto Condensed",Arial,sans-serif;text-transform:uppercase;letter-spacing:.04em}
+.empty-block{margin:8px 0 4px;padding:20px 0;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);color:var(--soft);font:400 16px/1.2 Anton,Impact,sans-serif;text-transform:uppercase;letter-spacing:.04em}
 .road{display:grid;grid-template-columns:repeat(5,minmax(max-content,1fr));gap:3px;flex:1;min-height:92px}
 .step{display:flex;flex-direction:column;justify-content:flex-end;gap:4px;padding:8px 4px;background:var(--wash);border-bottom:3px solid var(--empty);font-size:13px;line-height:1.2;min-width:0}
 .step b{font-size:22px;line-height:1}.step>span{font-size:12px;font-weight:500;white-space:nowrap}.step small{color:var(--soft);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -866,10 +868,10 @@ h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:
 .ptype{max-width:100%}.ptype .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.ptype i{display:block;flex:none;width:8px;height:8px;background:var(--ac)}
 .track{display:block;height:12px;background:var(--wash)}.fill{display:flex;height:100%}.fill i{display:block;min-width:2px}
 .fill .draft{background:var(--soft)}.fill .wait{background:var(--partial)}.fill .rev{background:var(--accent)}.fill .done{background:var(--good)}.fill .merged{background:var(--merged)}
-.where{display:grid;justify-items:end;gap:2px;color:var(--soft)}.where b{font:700 16px/1 "Roboto Condensed",Arial,sans-serif;color:var(--ink)}
+.where{display:grid;justify-items:end;gap:2px;color:var(--soft)}.where b{font:400 16px/1 Anton,Impact,sans-serif;color:var(--ink)}
 .spark{display:block;width:100%;height:20px}.spline{vector-effect:non-scaling-stroke;fill:none;stroke:var(--soft);stroke-width:1.5;stroke-linejoin:round}.nodata{font-size:12px;color:var(--soft);white-space:nowrap}
 .tabs{display:none;gap:14px;flex-wrap:wrap;min-width:0}.js .tabs{display:flex}
-.tabs button{padding:0 0 2px;border:0;border-bottom:2px solid transparent;background:none;color:var(--soft);font:700 16px/1.2 "Roboto Condensed",Arial,sans-serif;cursor:pointer;border-radius:0}
+.tabs button{padding:0 0 2px;border:0;border-bottom:2px solid transparent;background:none;color:var(--soft);font:400 16px/1.2 Anton,Impact,sans-serif;cursor:pointer;border-radius:0}
 .tabs button:hover{color:var(--ink)}.tabs button[aria-pressed=true]{border-bottom-color:var(--partial);color:var(--ink)}
 .feed-body{overflow:auto;min-height:0;flex:1;max-height:640px}
 .panel+.panel{margin-top:24px}.js .panel+.panel{margin-top:0}
@@ -877,7 +879,7 @@ h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:
 .panel[hidden]{display:none}
 .row{display:grid;grid-template-columns:30px minmax(0,1fr);gap:8px;padding:7px 4px 7px 2px;border-top:1px solid var(--rule);font-size:13px;line-height:1.35}
 .row:hover{background:color-mix(in srgb,var(--ink) 6%,transparent)}
-.row .lead{color:var(--soft)}.row .lead b{display:block;color:var(--ink);font:700 15px/1.2 "Roboto Condensed",Arial,sans-serif}
+.row .lead{color:var(--soft)}.row .lead b{display:block;color:var(--ink);font:400 15px/1.2 Anton,Impact,sans-serif}
 .row .ttl{overflow-wrap:anywhere;font-size:14px}.row .ttl a{font-weight:500}
 .sys{display:flex;flex-wrap:wrap;align-items:center;gap:2px 10px;color:var(--soft);font-size:13px;margin-top:2px}
 .av{width:20px;height:20px;background:var(--wash);color:transparent;overflow:hidden;flex:none}
@@ -893,7 +895,7 @@ h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:
 .heat{display:block;height:6px;background:var(--wash);margin:4px 0}.heat i{display:block;height:100%;background:var(--partial)}
 .mono{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
 details.area{border-bottom:1px solid var(--rule)}
-details.area>summary{cursor:pointer;padding:8px 2px;list-style:none;display:flex;gap:8px;align-items:center;font:700 15px/1.3 "Roboto Condensed",Arial,sans-serif}
+details.area>summary{cursor:pointer;padding:8px 2px;list-style:none;display:flex;gap:8px;align-items:center;font:400 15px/1.3 Anton,Impact,sans-serif}
 details.area>summary::-webkit-details-marker{display:none}details.area .cnt{margin-left:auto;font:400 13px Roboto,sans-serif;color:var(--soft)}
 details.area>summary:before{content:"+";width:12px;color:var(--soft);font-weight:700}details.area[open]>summary:before{content:"\\2212"}
 .a-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 16px;padding:12px}
@@ -913,19 +915,19 @@ details.area>summary:before{content:"+";width:12px;color:var(--soft);font-weight
 @media (min-width:640px){.a-meta{grid-template-columns:repeat(4,minmax(0,1fr))}}
 @media (max-width:760px){.road{grid-template-columns:1fr}.step{display:grid;grid-template-columns:44px minmax(0,1fr) auto;align-items:center;gap:8px;padding:6px 8px;border-bottom-width:2px}.step .pips{display:none}}
 @media (max-width:560px){.st{grid-template-columns:22px minmax(0,1fr) 68px}.st .track{grid-column:2/4;grid-row:2}.st-axis{display:none}.score{font-size:56px}}
-@media (max-width:620px){.top{flex-wrap:wrap;gap:4px 12px;padding:7px 0}.top-right{width:100%;justify-content:space-between}}
+@media (max-width:620px){.top{padding:7px 0}.top-right{width:100%;justify-content:space-between;margin-left:0}}
 @media (min-width:900px){
 :root{--fs:clamp(11px,calc(.42vw + .62vh + 4.2px),14px);--fs-s:max(10.5px,calc(var(--fs) - 1px));--gap:clamp(8px,1.4vw,22px);--pad:clamp(5px,1.1vh,12px)}
 .js,.js body{height:100%;overflow:hidden}
 body{font-size:var(--fs)}
 .app{padding:0 var(--gap);column-gap:var(--gap);row-gap:clamp(3px,.7vh,8px)}
 .js .app{height:100vh;height:100dvh;overflow:hidden;grid-template-rows:auto minmax(0,1.5fr) minmax(0,1fr) auto}
-.top{min-height:clamp(38px,6vh,50px);padding:0 12px;flex-wrap:wrap}
-h1{font-size:clamp(15px,1.5vw,20px)}h2{font-size:clamp(13px,calc(var(--fs) + 1px),16px)}h3{font-size:var(--fs)}
-.toolbar{order:0;flex:1 1 360px;justify-content:center}
-.toolbar input,.toolbar select,.seg button,.theme{font-size:var(--fs-s);padding:clamp(4px,.8vh,7px) clamp(5px,.6vw,9px)}
-.ptabs button{font-size:clamp(13px,var(--fs),15px)}
-.toolbar input{flex:1 1 90px;max-width:190px}.toolbar select{flex:0 1 clamp(100px,10vw,150px)}
+.top{gap:clamp(6px,1.1vh,12px);padding:clamp(6px,1.2vh,12px) 12px clamp(8px,1.4vh,14px)}
+h1{font-size:clamp(20px,2vw,28px)}h2{font-size:clamp(13px,calc(var(--fs) + 1px),16px)}h3{font-size:var(--fs)}
+.toolbar{justify-content:flex-start}
+.toolbar input,.toolbar select,.seg button,.theme{font-size:var(--fs-s);padding:clamp(6px,1vh,10px) clamp(8px,.8vw,12px)}
+.ptabs button{font-size:clamp(15px,calc(var(--fs) + 3px),19px);padding:6px 4px 4px}
+.toolbar input{flex:1 1 240px;min-width:200px;max-width:340px}.toolbar select{flex:0 1 clamp(130px,12vw,180px)}
 .live,.result,.sec-note,.score-note,.legend,.step,.step small,.st-axis,.st,.row,.sys,.pill,.stat span,.stat small,.foot,.small,.head>span,.scene-cap,.tabs button{font-size:var(--fs-s)}
 .a-city,.a-trends,.a-road,.a-standings,.a-feed{padding:var(--pad) 12px}
 .js .a-city,.js .a-trends,.js .a-road,.js .a-standings,.js .a-feed{overflow:hidden}
@@ -1009,6 +1011,7 @@ note('hot',hs.length,qa('.row.ht:not([hidden])').length);
 hideAll('.row.cl');note('closed',qa('.row.cl').length,qa('.row.cl:not([hidden])').length);
 panels.forEach(function(p){var k=p.getAttribute('data-panel');if(k==='all'||!R.metas[k])return;p.setAttribute('data-meta',R.metas[k]);
 var s=p.querySelector('.ptitle span');if(s)s.textContent=R.metas[k];});
+if(sel)qa('option',sel).forEach(function(o){var n=R.sel&&R.sel[o.getAttribute('value')],nm=o.getAttribute('data-name');if(nm&&n!=null)o.textContent=nm+' ('+n+')';});
 var sl=d.getElementById('standings');if(sl){sl.innerHTML=R.standings;qa('[data-tip]',sl).forEach(untitle);}
 var rl=d.getElementById('range-line');if(rl)rl.textContent=R.line;
 qa('[data-rstat]').forEach(function(e){var v=R.counts[e.getAttribute('data-rstat')],sp=e.querySelector('span'),b=e.querySelector('b');
@@ -1259,7 +1262,7 @@ def scene_key_html(scene):
 def scene_range(scene):
     """What the canvas swaps when the range changes: towers, caption, plate size, label and the narrow-box key."""
     gx, gy = scene_plate(len(scene["towers"]))
-    return {"towers": scene["towers"], "per": scene["per"], "caption": scene["caption"], "rl": scene.get("rl", DEFAULT_RL),
+    return {"towers": scene["towers"], "per": scene["per"], "rl": scene.get("rl", DEFAULT_RL),
             "hasClosed": bool(scene.get("hasClosed")), "gx": gx, "gy": gy, "key": scene_key_html(scene)}
 
 
@@ -1459,7 +1462,7 @@ SCENE_CSS = """
 .seam{fill:none;stroke:var(--page);stroke-width:.7;opacity:.85}.gseam{fill:none;stroke:var(--c);stroke-width:.7;opacity:.5}
 .callout polyline{fill:none;stroke:var(--ink);stroke-width:1}
 .scene-svg text{font:400 12px Roboto,Arial,sans-serif;fill:var(--ink);paint-order:stroke;stroke:var(--page);stroke-width:3px;stroke-linejoin:round}
-.scene-svg .co-nm{font:700 14px "Roboto Condensed",Arial,sans-serif;fill:var(--ink)}.scene-svg .co-n{font-weight:500;fill:var(--ink)}
+.scene-svg .co-nm{font:400 14px Anton,Impact,sans-serif;fill:var(--ink)}.scene-svg .co-n{font-weight:500;fill:var(--ink)}
 .scene-svg .add{fill:var(--good)}.scene-svg .del{fill:var(--bad)}
 .scene-cap{color:var(--soft);font-size:13px;line-height:1.35;flex:1 1 240px;min-width:0}
 .scene .legend{margin:0}
@@ -1469,10 +1472,10 @@ SCENE_CSS = """
 .scene-key small{color:var(--soft)}
 @media (min-width:900px){.stage{flex:1;height:auto;min-height:0}.scene-cap{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 @container (max-width:360px){
-.scene-svg .co-nm,.scene-svg .co-sub,.scene-svg .co-w,.scene-svg .co-bg{display:none}.scene-svg .co-n{font:700 30px "Roboto Condensed",Arial,sans-serif}
+.scene-svg .co-nm,.scene-svg .co-sub,.scene-svg .co-w,.scene-svg .co-bg{display:none}.scene-svg .co-n{font:400 30px Anton,Impact,sans-serif}
 .scene-key{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:12px}}
 @media (max-width:899px){@container (max-width:540px){
-.scene-svg .co-nm,.scene-svg .co-sub,.scene-svg .co-w,.scene-svg .co-bg{display:none}.scene-svg .co-n{font:700 30px "Roboto Condensed",Arial,sans-serif}
+.scene-svg .co-nm,.scene-svg .co-sub,.scene-svg .co-w,.scene-svg .co-bg{display:none}.scene-svg .co-n{font:400 30px Anton,Impact,sans-serif}
 .scene-key{display:block}}}
 """
 
@@ -1567,7 +1570,7 @@ if(x.measureText(o).width>w){while(o.length>1&&x.measureText(o+'…').width>w)o=
 function tw(x,f,s){var k='w|'+f+'|'+s,v=mc[k];if(v!==undefined)return v;x.font=f;return mc[k]=x.measureText(s).width;}
 function txt(x,s,px,py,f){x.lineWidth=3;x.lineJoin='round';x.strokeStyle=col.page;x.strokeText(s,px,py);x.fillStyle=f;x.fillText(s,px,py);}
 function sh(v){return v<1000?String(v):(v/1000).toFixed(1)+'k';}
-var F1='700 14px "Roboto Condensed",Arial,sans-serif',F2='500 12px Roboto,Arial,sans-serif',F3='400 12px Roboto,Arial,sans-serif',F4='700 22px "Roboto Condensed",Arial,sans-serif';
+var F1='400 14px Anton,Impact,sans-serif',F2='500 12px Roboto,Arial,sans-serif',F3='400 12px Roboto,Arial,sans-serif',F4='400 22px Anton,Impact,sans-serif';
 // callouts in two staggered rows (one row on narrow screens); each text lies between the leaders of the other row
 function drawLabels(x){x.setTransform(dpr,0,0,dpr,0,0);x.textBaseline='alphabetic';labelHits=[];
 var tops=T.map(function(t,i){var p=pj((i-(N-1)/2)*P,0,t.height);return{i:i,x:p[0],y:p[1]};});tops.sort(function(a,b){return a.x-b.x;});
@@ -1641,11 +1644,11 @@ if(window.MutationObserver)new MutationObserver(recolor).observe(d.documentEleme
 if(window.matchMedia)try{matchMedia('(prefers-color-scheme: dark)').addEventListener('change',recolor);}catch(e){}
 if(d.fonts&&d.fonts.ready)d.fonts.ready.then(function(){mc={};sceneDirty=true;sched();});
 // a range change swaps the towers: the layout is recomputed (plate and labels depend on them) and nothing else is rebuilt
-var semp=d.getElementById('scene-empty'),scap=d.getElementById('scene-cap'),skey=d.querySelector('.scene-key');
+var semp=d.getElementById('scene-empty'),skey=d.querySelector('.scene-key');
 function setRange(k){var R=RG[k];if(!R)return;T=R.towers||[];N=T.length;HX=R.gx||8;HY=R.gy||3;DAYS=R.rl||DAYS;HC=!!R.hasClosed;
 hover=null;hits=[];labelHits=[];if(tip)tip.hidden=true;stage.hidden=!N;
 if(semp){semp.textContent='No PRs in the last '+DAYS+'.';semp.hidden=!!N;}
-if(scap)scap.textContent=R.caption||'';if(skey)skey.innerHTML=R.key||'';
+if(skey)skey.innerHTML=R.key||'';
 K=0;sceneDirty=true;if(N)layout();sched();}
 d.addEventListener('prscan-range',function(e){setRange(e.detail);});
 readColors();var r0=d.documentElement.getAttribute('data-range');
@@ -1730,6 +1733,21 @@ def standings_html(view, rl, spark_hist):
     return "".join(o)
 
 
+def select_counts(top, view):
+    """Open PR counts of one range view for every option of the Area select, keyed by option value. top: the entries the
+    select is built from (the page's full top_areas), so the keys are the same in every range."""
+    n = lambda a: len(view["areas"].get(a, []))
+    out = {}
+    for e in top:
+        if not e["members"]:
+            out[slug(e["name"])] = n(e["name"])
+            continue
+        out[entry_slug(e)] = sum(n(m) for m in e["members"])
+        for m in e["members"]:
+            out[slug(m)] = n(m)
+    return out
+
+
 PAGES = [("effort", "Effort"), ("areas", "Areas"), ("trends", "Trends"), ("stats", "Stats")]
 CHART_WIDE, CHART_HALF = (640, 240), (320, 240)   # viewBox of the large trend charts: a wide one and two half-width ones
 
@@ -1755,7 +1773,7 @@ def render_html(an, repo, now, hist=None):
         view = range_view(an, secs, now)
         scenes[key] = effort_scene(view, rl=rl)
         c = range_counts(an, secs, now)
-        rdata[key] = {"s": secs, "rl": rl, "counts": c, "metas": range_metas(c, rl), "standings": standings_html(view, rl, spark_hist),
+        rdata[key] = {"s": secs, "rl": rl, "counts": c, "metas": range_metas(c, rl), "standings": standings_html(view, rl, spark_hist), "sel": select_counts(top, view),
                       "line": "Last %s: %d active · %s merged · %s closed" % (
                           rl, c["active"], c["merged"] if has_closed else "?", c["closed"] if has_closed else "?") if has_closed
                       else "Last %s: %d active" % (rl, c["active"])}
@@ -1776,11 +1794,11 @@ def render_html(an, repo, now, hist=None):
     area_opts = ['<option value="">All areas</option>']
     for e in top:
         if not e["members"]:
-            area_opts.append('<option value="%s">%s (%d)</option>' % (esc(slug(e["name"])), esc(area_label(e["name"])), len(e["prs"])))
+            area_opts.append('<option value="%s" data-name="%s">%s (%d)</option>' % (esc(slug(e["name"])), esc(area_label(e["name"])), esc(area_label(e["name"])), len(e["prs"])))
             continue
-        area_opts.append('<optgroup label="%s"><option value="%s" data-members="%s">All %s (%d)</option>%s</optgroup>' % (
-            esc(e["name"]), esc(entry_slug(e)), esc(",".join(slug(m) for m in e["members"])), esc(e["name"]), len(e["prs"]),
-            "".join('<option value="%s">%s (%d)</option>' % (esc(slug(m)), esc(area_label(m)), len(an["areas"].get(m, []))) for m in e["members"])))
+        area_opts.append('<optgroup label="%s"><option value="%s" data-members="%s" data-name="All %s">All %s (%d)</option>%s</optgroup>' % (
+            esc(e["name"]), esc(entry_slug(e)), esc(",".join(slug(m) for m in e["members"])), esc(e["name"]), esc(e["name"]), len(e["prs"]),
+            "".join('<option value="%s" data-name="%s">%s (%d)</option>' % (esc(slug(m)), esc(area_label(m)), esc(area_label(m)), len(an["areas"].get(m, []))) for m in e["members"])))
     toolbar = ('<div class="toolbar" id="filters" role="search"><label class="vh" for="q">Search pull requests</label>'
                '<input id="q" type="search" placeholder="Search title, number, author or path" autocomplete="off">'
                '<label class="vh" for="area">Area</label><select id="area">%s</select>'
@@ -1797,14 +1815,14 @@ def render_html(an, repo, now, hist=None):
              "<link rel=preconnect href='https://fonts.googleapis.com'><link rel=preconnect href='https://fonts.gstatic.com' crossorigin>"
              "<link rel=stylesheet href='%s'><script>%s</script><style>%s%s</style></head><body><div class=\"app\">" % (
                  esc(repo), FONTS_URL, THEME_JS, CSS, SCENE_CSS))
-    o.append('<header class="top"><h1>PR scan <span>/ <a href="https://github.com/%s">%s</a></span></h1>'
-             '<nav class="ptabs" id="ptabs" aria-label="Pages">%s</nav>%s'
+    o.append('<header class="top"><div class="nav-row"><h1>PR scan <span>/ <a href="https://github.com/%s">%s</a></span></h1>'
+             '<nav class="ptabs" id="ptabs" aria-label="Pages">%s</nav>'
              '<div class="top-right"><div class="live"><i class="dot" aria-hidden="true"></i>'
              '<span><span id="ago">Updated </span><time id="upd" datetime="%s">%s UTC</time></span></div>'
-             '<button type="button" class="theme" id="theme" aria-label="Colour theme">Theme</button></div></header>' % (
+             '<button type="button" class="theme" id="theme" aria-label="Colour theme">Theme</button></div></div>%s</header>' % (
                  esc(repo), esc(repo),
                  "".join('<button type="button" data-page="%s" aria-pressed="%s">%s</button>' % (k, "true" if k == "effort" else "false", n) for k, n in PAGES),
-                 toolbar, now.strftime(TS_FMT), now.strftime("%Y-%m-%d %H:%M")))
+                 now.strftime(TS_FMT), now.strftime("%Y-%m-%d %H:%M"), toolbar))
     o.append('<main class="pages" id="pages">')
 
     def page_open(k):
@@ -1819,12 +1837,11 @@ def render_html(an, repo, now, hist=None):
                  " has-stage" if any_tower else "", n_open, n_un, n_done, n_clusters, "" if n_clusters == 1 else "s",
                  n_dr, "" if n_dr == 1 else "s", delta_text(d_open), esc(rdata[DEFAULT_RANGE]["line"])))
     if any_tower:
-        cap = "Effort map. One tower per area, layer by PR. " + scene["caption"]
         o.append('<div class="stage" id="stage"%s>%s</div><p class="empty-block" id="scene-empty"%s>%s</p>'
-                 '<div class="scene-foot">%s<p class="scene-cap" title="%s"><b>Effort map.</b> One tower per area, layer by PR. <span id="scene-cap">%s</span></p></div>'
+                 '<div class="scene-foot">%s</div>'
                  '<ol class="scene-key">%s</ol><script type="application/json" id="scene-data">%s</script>' % (
                      "" if scene["towers"] else " hidden", scene_svg(scene), "" if not scene["towers"] else " hidden", esc(empty_range(rl0)),
-                     legend([(n, "k-" + k) for k, n, _ in SCENE_STATES if has_closed or k != "merged"]), esc(cap), esc(scene["caption"]),
+                     legend([(n, "k-" + k) for k, n, _ in SCENE_STATES if has_closed or k != "merged"]),
                      scene_key_html(scene), scene_json(scene, {k: scene_range(sc) for k, sc in scenes.items()})))
     else:
         o.append('<p class="empty-block">No data yet</p><p class="sec-note">The effort map needs at least one open pull request.</p>')

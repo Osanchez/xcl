@@ -440,3 +440,15 @@ Keep every version of ivall/xcl even if upstream or the whole fork network is ta
 - The page content area fits the viewport with no body scroll at ≥900px. Each page tab fills the space left of the feed.
 - With JS off, all page tabs are shown stacked, and every row is shown.
 - The rule for scroll stays the same: only long lists scroll, inside their own panel.
+
+### Roomier navbar, GTA-style display font, no scene caption (user request, 2026-11-24)
+- **Navbar in two rows, at ≥900px:**
+  - Row 1: the title on the left, the page tabs (Effort · Areas · Trends · Stats) next to it, and on the right the live dot, updated time and theme button.
+  - Row 2, the toolbar: the search box (wider, at least 240px), the Area select, the range switch and the state switch, in that order. Gaps of at least 16px between groups and comfortable 8–12px padding on the controls.
+  - Both rows fit the viewport; the content grid gives up the height. Below 900px the toolbar wraps onto several lines.
+- **Display font:**
+  - "Anton" (Google Fonts, SIL OFL), a heavy condensed face in the spirit of GTA's Pricedown titles, for the title, page tabs, section heads, hero numbers, tower callout names and stat values.
+  - Pricedown itself is not used: its web-embedding licence is unclear.
+  - Body and UI text stay Roboto, and Roboto Condensed is dropped where Anton replaces it.
+  - The single Google Fonts stylesheet loads Anton plus Roboto 400/500/700, with `display=swap`.
+- **No scene caption:** the "Effort map. One tower per area…" sentence is removed, and so is the scale note. The colour legend stays, and the tooltips still give exact counts.
