@@ -1033,18 +1033,18 @@ pages.forEach(function(p){p.hidden=p.getAttribute('data-page')!==n;});}
 var F=d.getElementById('filters');
 var rows=qa('.pr'),groups=qa('details.area'),
 q=d.getElementById('q'),sel=d.getElementById('area'),res=d.getElementById('result'),segs=qa('#states button');
-var st={q:'',area:'',state:''},STATES=['unrev','done','draft','closed'];
+var st={q:'',area:'',state:''},STATES=['unrev','done','draft','closed'],fcs='';
 function dec(s){try{return decodeURIComponent(s.replace(/\\+/g,' '))}catch(e){return ''}}
 function opt(v){if(!sel||!v)return null;for(var i=0;i<sel.options.length;i++)if(sel.options[i].value===v)return sel.options[i];return null;}
-function parse(){st={q:'',area:'',state:''};var tt='';range=DEF;page='effort';
+function parse(){st={q:'',area:'',state:''};var tt='';range=DEF;page='effort';fcs='';
 (location.hash||'').replace(/^#/,'').split('&').forEach(function(kv){var i=kv.indexOf('=');if(i<1)return;
 var k=kv.slice(0,i),v=dec(kv.slice(i+1));if(k==='q'||k==='area')st[k]=v;else if(k==='tab')tt=v;
-else if(k==='range'){if(RR[v])range=v;}else if(k==='page'){if(PGS.indexOf(v)>=0)page=v;}
+else if(k==='range'){if(RR[v])range=v;}else if(k==='focus'){fcs=v;}else if(k==='page'){if(PGS.indexOf(v)>=0)page=v;}
 else if(k==='state'){if(STATES.indexOf(v)>=0)st.state=v;}else if(STATES.indexOf(k)>=0&&v==='1'&&!st.state)st.state=k;});
 if(sel&&st.area&&!opt(st.area))st.area='';return tt;}
 function on(){return !!(st.q.trim()||st.area||st.state);}
 function write(){var p=[];if(st.q)p.push('q='+encodeURIComponent(st.q));if(st.area)p.push('area='+encodeURIComponent(st.area));
-if(st.state)p.push('state='+st.state);if(tab!=='dup')p.push('tab='+tab);if(range!==DEF)p.push('range='+range);if(page!=='effort')p.push('page='+page);
+if(st.state)p.push('state='+st.state);if(tab!=='dup')p.push('tab='+tab);if(range!==DEF)p.push('range='+range);if(page!=='effort')p.push('page='+page);if(fcs)p.push('focus='+encodeURIComponent(fcs));
 history.replaceState(null,'',p.length?'#'+p.join('&'):location.pathname+location.search);}
 function areaOk(r){if(!st.area)return true;var a=r.getAttribute('data-area'),o=opt(st.area),m=o&&o.getAttribute('data-members');
 return m?(','+m+',').indexOf(','+a+',')>=0:a===st.area;}
@@ -1062,13 +1062,19 @@ var allp=d.querySelector('.panel[data-panel=all]');if(allp&&f)allp.setAttribute(
 else if(allp)allp.setAttribute('data-meta',pool+' pull requests');
 if(RD&&RR[range])note('all',rows.length,pool);
 showTab(tab);}
-function sync(){if(q)q.value=st.q;if(sel)sel.value=st.area;applyRange();showPage(page);apply();}
+function sendFocus(){root.setAttribute('data-focus',fcs);try{d.dispatchEvent(new CustomEvent('prscan-focus',{detail:fcs}));}catch(e){}}
+function sync(){if(q)q.value=st.q;if(sel)sel.value=st.area;applyRange();showPage(page);apply();sendFocus();}
 function changed(){if(on())tab='all';write();apply();}
 if(F){q.addEventListener('input',function(){st.q=q.value;changed();});
 if(sel)sel.addEventListener('change',function(){st.area=sel.value;changed();});
 segs.forEach(function(b){b.addEventListener('click',function(){st.state=b.getAttribute('data-state')||'';changed();});});}
 rseg.forEach(function(b){b.addEventListener('click',function(){range=b.getAttribute('data-range');applyRange();apply();write();});});
 pbtn.forEach(function(b){b.addEventListener('click',function(){showPage(b.getAttribute('data-page'));write();});});
+// the map reports a focus change (card, tower, Esc, Back): the hash follows; a bar on the Areas page switches to Effort and focuses that tower
+d.addEventListener('prscan-focus-set',function(e){fcs=String(e.detail||'');root.setAttribute('data-focus',fcs);write();});
+function barFocus(e){var tr=e.target.closest&&e.target.closest('.st .track'),li=tr&&tr.closest('.st'),sg=li&&li.getAttribute('data-slug');if(!sg)return false;
+e.preventDefault();fcs=sg;showPage('effort');write();sendFocus();return true;}
+d.addEventListener('click',barFocus);d.addEventListener('keydown',function(e){if(e.key==='Enter'||e.key===' ')barFocus(e);});
 // an area link keeps the time range and the page: it sets the area filter instead of replacing the hash
 d.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a.ptype'),h=a&&a.getAttribute('href');
 if(!h||h.indexOf('#area=')!==0||!sel)return;e.preventDefault();st.area=dec(h.slice(6));if(!opt(st.area))st.area='';sel.value=st.area;changed();});
@@ -1139,7 +1145,6 @@ SCENE_CAP = 40          # tallest tower in layers; above it the layers are scale
 SCENE_W, SCENE_H = 720, 520   # viewBox of the static SVG
 SCENE_YAW = -22.0       # degrees, fixed angle of the SVG and centre of the canvas pan
 SCENE_ARC = 90.0        # the canvas pans inside SCENE_YAW +/- SCENE_ARC degrees (a 180 degree arc), never spins
-SCENE_IDLE = 0.7        # the idle ease swings through this fraction of the arc on each side
 SCENE_ZOOM = 0.85       # the scene is drawn at this fraction of the size that fits, centred
 SCENE_SX, SCENE_PY = 0.87, 0.36   # screen x per cell, screen y per cell on the ground (fixed pitch)
 TOWER_CELLS, TOWER_PITCH = 2, 3   # footprint of a tower and distance between towers, in cells
@@ -1147,8 +1152,15 @@ SCENE_MX, SCENE_MY = 2.2, 1.8     # ground plate margin around the tower row, in
 SCENE_GHOST = ("wait", "draft")   # layers not reviewed yet are drawn as ghost voxels
 SCENE_PAD_X, SCENE_PAD_Y = 10, 8    # inner padding between a callout's text and its box edge (SVG and canvas)
 SCENE_BOX_H = 61        # callout box height: cap height above the first baseline (11) + 3 lines + descender (3) + 2 * SCENE_PAD_Y
-SCENE_ROWS = (21, 82)   # first text baseline of the upper and lower label rows (the box starts 19 above it)
-SCENE_BAND_BOTTOM = 124  # bottom of the lower label row
+SCENE_BAND_TOP = 4      # top of the callout row
+SCENE_EDGE = 8          # margin of the callout row at both panel edges
+SCENE_GAP = 8           # space between neighbouring callout cards
+SCENE_LEAD = 10         # space between the bottom of the cards and the first scene pixel
+SCENE_MIN_SLOT = 110    # a callout slot narrower than this switches the cards to compact mode (name and open count)
+SCENE_COMPACT_H = 46    # compact card height: cap height (11) + 2 lines + descender (3) + 2 * SCENE_PAD_Y
+SCENE_FOCUS_MS = 600    # duration of the focus transition (ease-out)
+SCENE_FOCUS_FILL = 0.7  # the focused tower fills this fraction of the stage height
+SCENE_FOCUS_GAP = 0.8   # vertical gap between the state layers of the focused tower, in layers
 SCENE_LINE = 15         # extra height of the callouts for the "merged / closed" line (when closed PRs are known)
 CHART_W, CHART_H = 280, 150   # viewBox of the trend charts: close to their usual box, so the text keeps its size
 SCENE_STATES = [("merged", MERGED_LABEL, "--merged"), ("done", "Looks done", "--good"), ("rev", "Reviewed", "--accent"),
@@ -1211,7 +1223,11 @@ def effort_scene(an, n=TOP_AREAS, cap=SCENE_CAP, rl=DEFAULT_RL):
             if c:
                 layers.append({"k": k, "label": "Merged in " + rl if k == "merged" else label, "n": c, "ghost": k in SCENE_GHOST,
                                "h": c if factor == 1.0 else max(1, round(c * factor))})
-        towers.append({"name": area_label(e["name"]), "members": e["members"] or [], "open": len(ps),
+        by_state = {k: [p["number"] for p in (e["merged"] if k == "merged" else ps) if k == "merged" or bucket(p) == k]
+                    for k, _, _ in SCENE_STATES}
+        towers.append({"name": area_label(e["name"]), "slug": entry_slug(e), "members": e["members"] or [], "open": len(ps),
+                       "prs": {k: sorted(v, reverse=True) for k, v in by_state.items() if v},
+                       "files": [[f, n] for f, n, _ in top_files(ps + e["merged"])],
                        "merged": len(e["merged"]), "closed": len(e["closed"]),
                        "unreviewed": sum(bool(p["unreviewed"]) for p in ps),
                        "add": sum(p.get("additions", 0) for p in ps), "del": sum(p.get("deletions", 0) for p in ps),
@@ -1249,6 +1265,41 @@ def clamp_yaw(deg, yaw=SCENE_YAW, arc=SCENE_ARC):
     return max(lo, min(hi, deg))
 
 
+def _crosses(a, b, c, d):
+    """True when the segments a-b and c-d properly cross (touching ends and collinear overlaps do not count)."""
+    def o(p, q, r):
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+    return o(a, b, c) * o(a, b, d) < 0 and o(c, d, a) * o(c, d, b) < 0
+
+
+def callout_layout(tower_xs, panel_w, tower_ys=None, card_y=0.0, pad=SCENE_EDGE, min_slot=SCENE_MIN_SLOT):
+    """Callout cards in one row, equal slots across the panel width. Returns the slots left to right as
+    [{"i": tower index, "x0", "cx", "w": slot geometry, "compact": slot narrower than min_slot}]. The cards are ordered by the
+    towers' projected top-centre x (ties by index), so the leader lines (card bottom centre (cx, card_y) to the tower top
+    (x, y)) rarely cross. Order by x alone does not guarantee it when the tops differ in height (towers nearly in line
+    with the camera), so with tower_ys given, crossing pairs are swapped until none is left: each swap shortens the total
+    length, so it ends. The JS callout layout (calloutLayout) does the same."""
+    n = len(tower_xs)
+    if not n:
+        return []
+    sw = (panel_w - 2 * pad) / float(n)
+    order = sorted(range(n), key=lambda i: (tower_xs[i], i))
+    cx = [pad + (k + 0.5) * sw for k in range(n)]
+    if tower_ys is not None:
+        def seg(k):
+            i = order[k]
+            return (cx[k], card_y), (tower_xs[i], tower_ys[i])
+        changed = True
+        while changed:
+            changed = False
+            for k in range(n):
+                for m in range(k + 1, n):
+                    if _crosses(*seg(k), *seg(m)):
+                        order[k], order[m] = order[m], order[k]
+                        changed = True
+    return [{"i": i, "x0": pad + k * sw, "cx": cx[k], "w": sw, "compact": sw < min_slot} for k, i in enumerate(order)]
+
+
 def scene_summary(scene):
     ts = scene["towers"]
     hc = scene.get("hasClosed")
@@ -1277,15 +1328,26 @@ def scene_range(scene):
             "hasClosed": bool(scene.get("hasClosed")), "gx": gx, "gy": gy, "key": scene_key_html(scene)}
 
 
-def scene_json(scene, ranges=None):
+def scene_titles(by_num, ranges):
+    """The shared {number: [title, url, author]} map of every PR the towers list, for all ranges. Values are HTML-escaped
+    (the focus panel inserts them as markup) and the link is safe_url'd."""
+    nums = sorted({n for r in ranges.values() for t in r["towers"] for v in t["prs"].values() for n in v})
+    return {str(n): [esc(by_num[n]["title"]), esc(safe_url(by_num[n]["url"])), esc(by_num[n].get("author", ""))] for n in nums if n in by_num}
+
+
+def scene_json(scene, ranges=None, titles=None):
     """Inline JSON for the canvas renderer; every '<' is escaped so nothing can close the script block. ranges: {range key:
-    scene_range(...)}, the datasets the canvas swaps between (the top-level towers are the default range's)."""
+    scene_range(...)}, the datasets the canvas swaps between (the top-level towers are the default range's). titles:
+    scene_titles(...), shared by all ranges."""
     data = {"towers": scene["towers"], "per": scene["per"], "caption": scene["caption"], "hasClosed": bool(scene.get("hasClosed")),
             "days": scene.get("rl", DEFAULT_RL),
             "states": [{"k": k, "label": lb, "v": v, "ghost": k in SCENE_GHOST} for k, lb, v in SCENE_STATES],
             "geom": {"w": TOWER_CELLS, "pitch": TOWER_PITCH, "sx": SCENE_SX, "py": SCENE_PY, "yaw": SCENE_YAW,
-                     "arc": SCENE_ARC, "idle": SCENE_IDLE, "zoom": SCENE_ZOOM, "gx": scene_plate(len(scene["towers"]))[0],
-                     "gy": scene_plate(len(scene["towers"]))[1]}}
+                     "arc": SCENE_ARC, "zoom": SCENE_ZOOM, "gx": scene_plate(len(scene["towers"]))[0],
+                     "gy": scene_plate(len(scene["towers"]))[1], "minSlot": SCENE_MIN_SLOT, "edge": SCENE_EDGE, "gap": SCENE_GAP,
+                     "ms": SCENE_FOCUS_MS, "fill": SCENE_FOCUS_FILL, "layerGap": SCENE_FOCUS_GAP}}
+    if titles is not None:
+        data["titles"] = titles
     if ranges is not None:
         data["ranges"] = ranges
     return json.dumps(data, separators=(",", ":")).replace("<", "\\u003c")
@@ -1333,10 +1395,11 @@ def scene_svg(scene):
     xs = [(i - (n - 1) / 2.0) * TOWER_PITCH for i in range(n)]
     gx, gy = scene_plate(n)
     maxl = max([t["height"] for t in ts] or [0])
-    extra = SCENE_LINE if scene.get("hasClosed") else 0
-    rows = (SCENE_ROWS[0], SCENE_ROWS[1] + extra)
-    pad, band_bottom = 12, SCENE_BAND_BOTTOM + 2 * extra
-    px = SCENE_PAD_X
+    pad, px = 12, SCENE_PAD_X
+    compact = (SCENE_W - 2 * SCENE_EDGE) / float(n) < SCENE_MIN_SLOT
+    extra = SCENE_LINE if scene.get("hasClosed") and not compact else 0
+    card_h = SCENE_COMPACT_H if compact else SCENE_BOX_H + extra
+    band_bottom = SCENE_BAND_TOP + card_h + SCENE_LEAD
     ground = [(-gx, -gy), (gx, -gy), (gx, gy), (-gx, gy)]
 
     def bbox(k, lh):
@@ -1410,45 +1473,37 @@ def scene_svg(scene):
         o.append("</g>")
         tx, ty, _ = P(xs[i], 0, t["height"])
         tops[i] = (tx, ty)
-    # callouts in two staggered rows: a label's text lies between the leader lines of its neighbours in the other row
-    sw = (SCENE_W - 2 * pad) / float(n)
-    cs = [pad + (i + 0.5) * sw for i in range(n)]
+    # callouts in one row, ordered by the towers' x on screen: the leader lines do not cross
+    slots = callout_layout([tops[i][0] for i in range(n)], SCENE_W, [tops[i][1] - 3 for i in range(n)], SCENE_BAND_TOP + card_h)
     o.append('<g class="callouts">')
-    for i, t in enumerate(ts):
-        low = (n - 1 - i) % 2 == 0
-        if low:
-            ra, rb = (cs[i - 1] + 5 if i >= 1 else pad), (cs[i + 1] - 6 if i + 1 < n else SCENE_W - pad)
-        else:
-            ra, rb = cs[i] + 5, (cs[i + 2] - 6 if i + 2 < n else SCENE_W - pad)
-        ra, rb = ra + px, rb - px    # the box edges lie on the old bounds; the text is inset by the padding
-        room = rb - ra
+    for sl in slots:
+        i, t = sl["i"], ts[sl["i"]]
+        bx, bw = sl["x0"] + SCENE_GAP / 2.0, sl["w"] - SCENE_GAP
+        x, room = bx + px, bw - 2 * px
         name, shown = t["name"], t["name"]
         while len(shown) > 1 and len(shown) * 7.8 > room:
             shown = shown[:-1]
         if shown != name:
             shown = shown[:-1] + "\u2026"
+        y0 = SCENE_BAND_TOP + 19
+        tx, ty = tops[i]
+        pts = "%.1f,%.1f %.1f,%.1f" % (sl["cx"], SCENE_BAND_TOP + card_h, tx, ty - 3)
+        title = esc("%s: %d open, %d unreviewed%s" % (name, t["open"], t["unreviewed"], ", " + merged_line(t, rl=scene.get("rl", DEFAULT_RL)) if scene.get("hasClosed") else ""))
+        o.append('<g class="callout"><title>%s</title><polyline points="%s"/><rect class="co-bg" x="%.1f" y="%d" width="%.1f" height="%d"/>' % (
+            title, pts, bx, SCENE_BAND_TOP, bw, card_h))
+        if compact:
+            o.append('<text x="%.1f" y="%d"><tspan class="co-nm" x="%.1f">%s</tspan>'
+                     '<tspan class="co-n" x="%.1f" dy="16"><tspan class="co-num">%d</tspan><tspan class="co-w"> open</tspan></tspan></text></g>' % (
+                         x, y0, x, esc(shown), x, t["open"]))
+            continue
         l2 = "%d open \u00b7 %d unreviewed" % (t["open"], t["unreviewed"])
-        l2_s = "%d open \u00b7 %d unrev." % (t["open"], t["unreviewed"])
         if len(l2) * 6.4 > room:
-            l2 = l2_s
+            l2 = "%d open \u00b7 %d unrev." % (t["open"], t["unreviewed"])
         l4 = ""
         if extra:
             l4 = merged_line(t, rl=scene.get("rl", DEFAULT_RL))
             if len(l4) * 6.4 > room:
                 l4 = merged_line(t, True)
-        w = max(len(shown) * 7.8, len(l2) * 6.4, len(l4) * 6.4)
-        y0 = rows[1] if low else rows[0]
-        x = min(max(ra, cs[i] - 18), rb - w) if low else ra
-        x = max(ra, x) if low else x
-        tx, ty = tops[i]
-        if low:
-            xe = min(max(cs[i], x + 4), x + w - 4)
-            pts = "%.1f,%.1f %.1f,%d" % (tx, ty - 3, xe, y0 + 36 + extra)
-        else:
-            pts = "%.1f,%.1f %.1f,%d %.1f,%d" % (tx, ty - 3, cs[i], band_bottom + 8, cs[i], y0 - 19)
-        o.append('<g class="callout"><title>%s</title><polyline points="%s"/><rect class="co-bg" x="%.1f" y="%d" width="%.1f" height="%d"/>' % (
-            esc("%s: %d open, %d unreviewed%s" % (name, t["open"], t["unreviewed"], ", " + merged_line(t, rl=scene.get("rl", DEFAULT_RL)) if extra else "")),
-            pts, x - px, y0 - 19, w + 2 * px, SCENE_BOX_H + extra))
         o.append('<text x="%.1f" y="%d"><tspan class="co-nm" x="%.1f">%s</tspan>'
                  '<tspan class="co-n" x="%.1f" dy="16"><tspan class="co-num">%d</tspan><tspan class="co-w"> open</tspan>'
                  '<tspan class="co-sub">%s</tspan></tspan>'
@@ -1477,6 +1532,33 @@ SCENE_CSS = """
 .scene-svg text{font:400 12px Roboto,Arial,sans-serif;fill:var(--ink);paint-order:stroke;stroke:var(--page);stroke-width:3px;stroke-linejoin:round}
 .scene-svg .co-nm{font:400 14px Anton,Impact,sans-serif;fill:var(--ink)}.scene-svg .co-n{font-weight:500;fill:var(--ink)}
 .scene-svg .add{fill:var(--good)}.scene-svg .del{fill:var(--bad)}
+.cos{position:absolute;left:0;top:0;right:0;z-index:1;pointer-events:none}
+.cd{position:absolute;left:0;top:0;box-sizing:border-box;margin:0;padding:var(--sp-2) 10px;overflow:hidden;pointer-events:auto;text-align:left;cursor:pointer;
+background:var(--surface);color:var(--ink);border:0;border-radius:0;font:500 12px/15px Roboto,Arial,sans-serif;transition:opacity .25s}
+.cd:hover,.cd:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.cd>span{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cd-nm{font:400 14px/15px Anton,Impact,sans-serif}.cd-n b{font-weight:500}
+.cd .add,.cd .del{font-style:normal}.cd .add{color:var(--good)}.cd .del{color:var(--bad)}
+.cos.c .cd-s,.cos.c .cd-d,.cos.c .cd-m{display:none}
+.cos.t .cd-nm,.cos.t .cd-w,.cos.t .cd-s,.cos.t .cd-d,.cos.t .cd-m{display:none}.cos.t .cd-n b{font:400 22px/20px Anton,Impact,sans-serif}
+.foc .cd{opacity:0;visibility:hidden;pointer-events:none;transition:opacity .25s,visibility 0s .25s}
+.fpanel{position:absolute;z-index:2;top:0;right:0;bottom:0;width:min(380px,42%);box-sizing:border-box;display:flex;flex-direction:column;gap:var(--sp-3);padding:var(--sp-4);
+background:var(--surface);border-left:1px solid var(--edge);transform:translateX(100%);opacity:0;transition:transform .6s cubic-bezier(.2,.7,.2,1),opacity .6s ease-out}
+.fpanel[hidden]{display:none}.fpanel.on{transform:none;opacity:1}
+.fp-head{display:flex;align-items:center;gap:var(--sp-3)}.fp-head h3{margin:0;min-width:0;font:400 22px/1.15 Anton,Impact,sans-serif;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fp-back{flex:none;font:500 13px/1 Roboto,Arial,sans-serif;color:var(--ink);background:transparent;border:1px solid var(--rule);padding:var(--sp-2) var(--sp-3);cursor:pointer}
+.fp-back:hover,.fp-back:focus-visible{border-color:var(--accent);outline:none}
+.fp-body{display:flex;flex-direction:column;gap:var(--sp-3);min-height:0;flex:1;font-size:13px;line-height:1.35}
+.fp-body h4{margin:0 0 var(--sp-1);font:500 12px/1.3 Roboto,Arial,sans-serif;text-transform:uppercase;letter-spacing:.04em;color:var(--soft)}
+.fp-body p,.fp-body ul,.fp-body ol{margin:0;padding:0;list-style:none}.fp-mem{color:var(--soft)}
+.fp-counts li{display:flex;align-items:center;gap:var(--sp-2);padding:2px 0}.fp-counts li span{flex:1;min-width:0}.fp-counts b{font-weight:500}
+.fp-sw{flex:none;width:10px;height:10px;background:var(--c,var(--rule))}
+.fp-files li{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--soft)}
+.fp-prs{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain}
+.fp-prs ol{margin-bottom:var(--sp-3)}.fp-prs li{padding:2px 0}.fp-prs a{color:var(--accent);font-weight:500}
+.st .track{cursor:pointer}.st .track:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+@container (max-width:560px){.fpanel{top:auto;left:0;width:auto;height:58%;border-left:0;border-top:1px solid var(--edge);transform:translateY(100%)}}
+@media (prefers-reduced-motion:reduce){.fpanel,.cd{transition:none}}
 .scene-cap{color:var(--soft);font-size:13px;line-height:1.35;flex:1 1 240px;min-width:0}
 .scene .legend{margin:0}
 .scene .legend .sw.k-wait{background:color-mix(in srgb,var(--partial) 18%,transparent);box-shadow:inset 0 0 0 1px var(--partial)}
@@ -1498,33 +1580,39 @@ var d=document,stage=d.getElementById('stage'),dEl=d.getElementById('scene-data'
 if(!stage||!dEl)return;
 var svg=stage.querySelector('svg'),data;
 try{data=JSON.parse(dEl.textContent);}catch(e){return;}
-var T=data.towers||[],N=T.length,S=data.states||[],G=data.geom||{},HC=!!data.hasClosed,DAYS=data.days||'7 d',EX=0,RG=data.ranges||{};
+var T=data.towers||[],N=T.length,S=data.states||[],G=data.geom||{},HC=!!data.hasClosed,DAYS=data.days||'7 d',EX=0,RG=data.ranges||{},TL=data.titles||{};
 var cv=d.createElement('canvas'),g=cv.getContext&&cv.getContext('2d');
 if(!g)return;
 cv.className='scene-cv';cv.tabIndex=0;cv.setAttribute('role','img');
-cv.setAttribute('aria-label',(svg.getAttribute('aria-label')||'Effort map')+' Drag or press Left and Right to pan.');
+cv.setAttribute('aria-label',((svg&&svg.getAttribute('aria-label'))||'Effort map')+' Drag or press Left and Right to pan. Click a tower or a card to focus it.');
 if(svg)stage.replaceChild(cv,svg);else stage.appendChild(cv);
-// Layers: layer (ground plate, towers, labels; rebuilt when the yaw or the size changes), cv (transparent composite with the hover highlight).
-// The page gradient shows through both canvases: there is no backdrop to paint.
+// Layers: layer (ground plate, towers, leader lines; rebuilt when the yaw, the size or the focus changes), cv (transparent composite with the hover highlight).
+// The page gradient shows through both canvases: there is no backdrop to paint. The callout cards are buttons over the canvas.
 function mk(){var c=d.createElement('canvas');return[c,c.getContext('2d')];}
 var Y=mk(),yl=Y[0],lx=Y[1];
-var TW=G.w,P=G.pitch,SX=G.sx,PY=G.py,HX=G.gx||8,HY=G.gy||3,Y0=G.yaw*Math.PI/180,ARC=(G.arc==null?90:G.arc)*Math.PI/180,IDLE=G.idle==null?.7:G.idle,ZOOM=G.zoom||.85;
+var cos=d.createElement('div');cos.className='cos';stage.appendChild(cos);
+var fp=d.getElementById('fpanel'),fpt=d.getElementById('fp-title'),fpb=d.getElementById('fp-body'),fback=d.getElementById('fp-back');
+var TW=G.w,P=G.pitch,SX=G.sx,PY=G.py,HX=G.gx||8,HY=G.gy||3,Y0=G.yaw*Math.PI/180,ARC=(G.arc==null?90:G.arc)*Math.PI/180,ZOOM=G.zoom||.85;
+var EDGE=G.edge==null?8:G.edge,GAP=G.gap==null?8:G.gap,MINSLOT=G.minSlot||110,FMS=G.ms||600,FILL=G.fill||.7,LGAP=G.layerGap||.8;
 var yaw=Y0;
-var W=0,H=0,dpr=1,K=0,LH=5,CX=0,CY=0,bandTop=0,bandBottom=0,compact=false,short=false;
-var hover=null,hits=[],labelHits=[],col={},mc={};
+var W=0,H=0,dpr=1,K=0,LH=5,LZ=5,CX=0,CY=0,bandTop=4,bandBottom=0,CH=61,cmp=false,tiny=false;
+var hover=null,hits=[],col={},mc={},cards=[],slots=[],slotKey='';
 var reduce=!!(window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches);
-var auto=!reduce,raf=0,last=0,lastDraw=-1e9,ph=0,inside=false,drag=null,vis=true;
+var raf=0,lastDraw=-1e9,drag=null,down=null,vis=true,GM=1;
 var sceneDirty=true,rz=false,sceneYaw=NaN,ordYaw=NaN,ord=[],VF=[];
-var Q=.008,PERIOD=42000,MS=30;
-// the pan stays inside Y0 +/- ARC (a 180 degree arc): drag, keys and the idle ease all go through clampYaw
+var MS=30;
+// focus: fi = focused tower (-1 none), fslug its slug, fe = eased progress 0..1 of the transition (1 = focused), fanim = the transition is running
+var fi=-1,fslug='',fe=0,fb=0,fdir=0,fanim=false,ft0=0,fcard=-1,cz=1,cdx=0,cdy=0,tz=1,tdx=0,tdy=0;
+// the pan stays inside Y0 +/- ARC (a 180 degree arc): drag and keys go through clampYaw. Rotation is manual only.
 function clampYaw(v){return Math.max(Y0-ARC,Math.min(Y0+ARC,v));}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function hex(s){var m=/^#([0-9a-f]{6})$/i.exec((s||'').trim());if(!m)return[128,128,128];var n=parseInt(m[1],16);return[n>>16&255,n>>8&255,n&255];}
 function mix(c,t,a){return[0,1,2].map(function(i){return Math.round(c[i]+(t[i]-c[i])*a);});}
 function rgb(c){return'rgb('+c[0]+','+c[1]+','+c[2]+')';}
 function rgba(c,a){return'rgba('+c[0]+','+c[1]+','+c[2]+','+a+')';}
 function readColors(){var cs=getComputedStyle(d.documentElement);function v(n){return hex(cs.getPropertyValue(n));}
 var ink=v('--ink');
-col={ink:rgb(ink),page:rgb(v('--page')),soft:rgb(v('--soft')),good:rgb(v('--good')),bad:rgb(v('--bad')),st:{},surface:(cs.getPropertyValue('--surface')||'').trim()||'#fff',plate:rgba(ink,.07),plateEdge:rgba(ink,.2)};
+col={ink:rgb(ink),page:rgb(v('--page')),soft:rgb(v('--soft')),good:rgb(v('--good')),bad:rgb(v('--bad')),st:{},plate:rgba(ink,.07),plateEdge:rgba(ink,.2)};
 var W3=[255,255,255],B3=[0,0,0];
 S.forEach(function(s){var c=v(s.v);col.st[s.k]={ghost:!!s.ghost,c:rgb(c),g:rgba(c,.16),gh:rgba(c,.2),l:rgb(c),t:rgb(mix(c,W3,.32)),r:rgb(mix(c,B3,.34)),
 ht:rgb(mix(c,W3,.6)),hl:rgb(mix(c,W3,.38)),hr:rgb(mix(c,W3,.16))};});}
@@ -1542,13 +1630,16 @@ var r=stage.getBoundingClientRect(),w=Math.max(200,Math.round(r.width)),h=Math.m
 if(K&&w===W&&h===H&&dp===dpr)return false;
 W=w;H=h;dpr=dp;
 [cv,yl].forEach(function(c){c.width=Math.round(W*dpr);c.height=Math.round(H*dpr);});
-compact=W<=360||(W<=540&&innerWidth<900);short=!compact&&H<300;bandTop=4;EX=HC&&!compact&&!short?15:0;bandBottom=bandTop+(compact?40:short?52:124)+2*EX;
+tiny=W<=360||(W<=540&&innerWidth<900);cmp=tiny||(W-2*EDGE)/Math.max(1,N)<MINSLOT;EX=HC&&!cmp?15:0;
+CH=tiny?36:cmp?46:61+EX;bandBottom=bandTop+CH+10;
 var mh=0,a,e;for(a=0;a<Math.PI;a+=Math.PI/36){e=ext(a,1,0,true);mh=Math.max(mh,Math.abs(e[0]),Math.abs(e[1]));}
 var avail=H-bandBottom-18;K=(W-16)/(2*mh);
 for(;;){LH=K*.9;while(LH>K*.25){e=extArc(K,LH);if(e[3]-e[2]<=avail)break;LH*=.97;}if(LH>K*.25||K<3)break;K*=.97;}
 K*=ZOOM;LH*=ZOOM;e=extArc(K,LH);CX=W/2;CY=bandBottom+8+(H-6-bandBottom-8-(e[3]-e[2]))/2-e[2];
 sceneDirty=true;return true;}
-function pj(x,y,z){var c=Math.cos(sceneYaw),s=Math.sin(sceneYaw),xr=x*c-y*s,yr=x*s+y*c;return[CX+(xr-yr)*SX*K,CY+(xr+yr)*PY*K-z*LH,xr+yr];}
+// pr: the projection of the resting scene; pj: the same through the focus camera (zoom cz about the centre, then a shift)
+function pr(x,y,z){var c=Math.cos(sceneYaw),s=Math.sin(sceneYaw),xr=x*c-y*s,yr=x*s+y*c;return[CX+(xr-yr)*SX*K,CY+(xr+yr)*PY*K-z*LH,xr+yr];}
+function pj(x,y,z){var p=pr(x,y,z);return[CX+(p[0]-CX)*cz+cdx,CY+(p[1]-CY)*cz+cdy,p[2]];}
 var CORN=[[-1,-1],[1,-1],[1,1],[-1,1]],NORM=[[0,-1],[1,0],[0,1],[-1,0]];
 // ---- layer: everything that depends on the yaw (the ground plate turns with it). Painter order and visible faces are cached per yaw.
 function order(){if(ordYaw===sceneYaw)return;ordYaw=sceneYaw;var c=Math.cos(sceneYaw),s=Math.sin(sceneYaw);VF=[];
@@ -1557,97 +1648,167 @@ ord=[];var i;for(i=0;i<N;i++)ord.push({d:pj((i-(N-1)/2)*P,0,0)[2],i:i});
 ord.sort(function(a,b){return a.d-b.d;});}
 // a unit square (u,v) mapped onto the parallelogram (a; a+u; a+v): a face, a ground plate or a tower top is one fillRect
 function tf(x,ux,uy,vx,vy,ox,oy){x.setTransform(dpr*ux,dpr*uy,dpr*vx,dpr*vy,dpr*ox,dpr*oy);}
-function path(x,q){x.beginPath();q.forEach(function(p,i){if(i)x.lineTo(p[0],p[1]);else x.moveTo(p[0],p[1]);});x.closePath();}
 function bbox(q){var a=1e9,b=1e9,c=-1e9,e=-1e9;q.forEach(function(p){a=Math.min(a,p[0]);b=Math.min(b,p[1]);c=Math.max(c,p[0]);e=Math.max(e,p[1]);});return[a,b,c,e];}
+function path(x,q){x.beginPath();q.forEach(function(p,i){if(i)x.lineTo(p[0],p[1]);else x.moveTo(p[0],p[1]);});x.closePath();}
 function drawGround(x){var q=[[-HX,-HY],[HX,-HY],[HX,HY],[-HX,HY]],gq=q.map(function(c){return pj(c[0],c[1],0);});
 x.setTransform(dpr,0,0,dpr,0,0);path(x,gq);x.fillStyle=col.plate;x.fill();x.strokeStyle=col.plateEdge;x.lineWidth=1;x.lineJoin='round';x.stroke();}
 // grid of one face run (z0..z1): the horizontal seams are one dashed stroke down the face, each vertical seam is a thin fillRect
-function grid(x,z0,z1,colour,alpha,us,ex){var dv=.75/Math.max(.5,Math.abs(ex)),dl=.75/LH;x.globalAlpha=alpha;
-if(LH>=2.2){x.strokeStyle=colour;x.lineWidth=1;x.setLineDash([dl,1-dl]);x.beginPath();x.moveTo(.5,z0-dl/2);x.lineTo(.5,z1+dl*.6);x.stroke();x.setLineDash([]);}
-x.fillStyle=colour;us.forEach(function(u){x.fillRect(u-dv/2,z0,dv,z1-z0);});x.globalAlpha=1;}
-function drawTower(x,i){var t=T[i],L=t.layers,nl=L.length;if(!nl)return;
-var x0=(i-(N-1)/2)*P,h=TW/2,z=[0],k,ns=0;for(k=0;k<nl;k++){z.push(z[k]+L[k].h);if(!col.st[L[k].k].ghost&&ns===k)ns=k+1;}
-VF.forEach(function(F){var a=CORN[F[0]],b=CORN[(F[0]+1)%4],p0=pj(x0+a[0]*h,a[1]*h,0),p1=pj(x0+b[0]*h,b[1]*h,0),ex=p1[0]-p0[0],ey=p1[1]-p0[1];
-tf(x,ex,ey,0,-LH,p0[0],p0[1]);
-for(k=0;k<nl;k++){var cc=col.st[L[k].k];x.fillStyle=cc.ghost?cc.g:cc[F[1]];x.fillRect(0,z[k],1,L[k].h);
-var q=[[p0[0],p0[1]-z[k]*LH],[p1[0],p1[1]-z[k]*LH],[p1[0],p1[1]-z[k+1]*LH],[p0[0],p0[1]-z[k+1]*LH]];
-hits.push({q:q,bb:bbox(q),t:i,l:k,s:F[1],m:[dpr*ex,dpr*ey,0,-dpr*LH,dpr*p0[0],dpr*p0[1]],r:[0,z[k],1,L[k].h]});}
-if(ns)grid(x,0,z[ns],col.page,.8,[.5],ex);
-if(ns<nl)grid(x,z[ns],z[nl],col.ink,.4,[0,.5,1],ex);});
-var cc=col.st[L[nl-1].k],c0=pj(x0-h,-h,z[nl]),c1=pj(x0+h,-h,z[nl]),c2=pj(x0+h,h,z[nl]),c3=pj(x0-h,h,z[nl]),q=[c0,c1,c2,c3];
+function grid(x,z0,z1,colour,alpha,us,ex){var dv=.75/Math.max(.5,Math.abs(ex)),dl=.75/LZ;x.globalAlpha=alpha*GM;
+if(LZ>=2.2){x.strokeStyle=colour;x.lineWidth=1;x.setLineDash([dl,1-dl]);x.beginPath();x.moveTo(.5,z0-dl/2);x.lineTo(.5,z1+dl*.6);x.stroke();x.setLineDash([]);}
+x.fillStyle=colour;us.forEach(function(u){x.fillRect(u-dv/2,z0,dv,z1-z0);});x.globalAlpha=GM;}
+// the layers of the focused tower stand apart by gu (in layers) once it is exploded (xp 0..1)
+function gapOf(t){return Math.max(LGAP,t.height*.03);}
+function drawTower(x,i,m,xp,hit){var t=T[i],L=t.layers,nl=L.length;if(!nl)return;
+var x0=(i-(N-1)/2)*P,h=TW/2,z=[0],k,ns=0,gu=gapOf(t)*xp;GM=m;x.globalAlpha=m;
+for(k=0;k<nl;k++){z.push(z[k]+L[k].h);if(!col.st[L[k].k].ghost&&ns===k)ns=k+1;}
+function zb(k){return z[k]+k*gu;}function zt(k){return z[k+1]+k*gu;}
+// the side faces of the runs k0..k1-1 and their grid: one group is one grid stroke (the seam between two runs is drawn once)
+function side(k0,k1){if(k1<=k0)return;var sol=!col.st[L[k0].k].ghost;
+VF.forEach(function(F){var a=CORN[F[0]],b=CORN[(F[0]+1)%4],p0=pj(x0+a[0]*h,a[1]*h,0),p1=pj(x0+b[0]*h,b[1]*h,0),ex=p1[0]-p0[0],ey=p1[1]-p0[1],kk;
+tf(x,ex,ey,0,-LZ,p0[0],p0[1]);
+for(kk=k0;kk<k1;kk++){var cc=col.st[L[kk].k];x.fillStyle=cc.ghost?cc.g:cc[F[1]];x.fillRect(0,zb(kk),1,L[kk].h);
+if(hit){var q=[[p0[0],p0[1]-zb(kk)*LZ],[p1[0],p1[1]-zb(kk)*LZ],[p1[0],p1[1]-zt(kk)*LZ],[p0[0],p0[1]-zt(kk)*LZ]];
+hits.push({q:q,bb:bbox(q),t:i,l:kk,s:F[1],m:[dpr*ex,dpr*ey,0,-dpr*LZ,dpr*p0[0],dpr*p0[1]],r:[0,zb(kk),1,L[kk].h]});}}
+if(sol)grid(x,zb(k0),zt(k1-1),col.page,.8,[.5],ex);else grid(x,zb(k0),zt(k1-1),col.ink,.4,[0,.5,1],ex);});}
+function top(k){var cc=col.st[L[k].k],zz=zt(k),c0=pj(x0-h,-h,zz),c1=pj(x0+h,-h,zz),c2=pj(x0+h,h,zz),c3=pj(x0-h,h,zz),q=[c0,c1,c2,c3];
 tf(x,c1[0]-c0[0],c1[1]-c0[1],c3[0]-c0[0],c3[1]-c0[1],c0[0],c0[1]);x.fillStyle=cc.ghost?cc.g:cc.t;x.fillRect(0,0,1,1);
-hits.push({q:q,bb:bbox(q),t:i,l:nl-1,s:'t',m:[dpr*(c1[0]-c0[0]),dpr*(c1[1]-c0[1]),dpr*(c3[0]-c0[0]),dpr*(c3[1]-c0[1]),dpr*c0[0],dpr*c0[1]],r:[0,0,1,1]});
+if(hit)hits.push({q:q,bb:bbox(q),t:i,l:k,s:'t',m:[dpr*(c1[0]-c0[0]),dpr*(c1[1]-c0[1]),dpr*(c3[0]-c0[0]),dpr*(c3[1]-c0[1]),dpr*c0[0],dpr*c0[1]],r:[0,0,1,1]});
 if(cc.ghost){x.strokeStyle=cc.c;x.lineWidth=2/(Math.hypot(c1[0]-c0[0],c1[1]-c0[1])+Math.hypot(c3[0]-c0[0],c3[1]-c0[1]));x.strokeRect(0,0,1,1);}}
-function fitText(x,f,s,w){var k=f+'|'+s+'|'+Math.round(w),v=mc[k];if(v!==undefined)return v;x.font=f;var o=s;
-if(x.measureText(o).width>w){while(o.length>1&&x.measureText(o+'…').width>w)o=o.slice(0,-1);o+='…';}return mc[k]=o;}
+if(xp>0){for(k=0;k<nl;k++){side(k,k+1);top(k);}}
+else{side(0,ns);side(ns,nl);top(nl-1);}
+x.globalAlpha=1;GM=1;}
 function tw(x,f,s){var k='w|'+f+'|'+s,v=mc[k];if(v!==undefined)return v;x.font=f;return mc[k]=x.measureText(s).width;}
 function txt(x,s,px,py,f){x.lineWidth=3;x.lineJoin='round';x.strokeStyle=col.page;x.strokeText(s,px,py);x.fillStyle=f;x.fillText(s,px,py);}
 function sh(v){return v<1000?String(v):(v/1000).toFixed(1)+'k';}
-var F1='400 14px Anton,Impact,sans-serif',F2='500 12px Roboto,Arial,sans-serif',F3='400 12px Roboto,Arial,sans-serif',F4='400 22px Anton,Impact,sans-serif';
-// callouts in two staggered rows (one row on narrow screens); each text lies between the leaders of the other row
-var PX=10;   // inner padding between a callout's text and its box edge (8 above and below: SCENE_PAD_Y)
-function drawLabels(x){x.setTransform(dpr,0,0,dpr,0,0);x.textBaseline='alphabetic';labelHits=[];
-var tops=T.map(function(t,i){var p=pj((i-(N-1)/2)*P,0,t.height);return{i:i,x:p[0],y:p[1]};});tops.sort(function(a,b){return a.x-b.x;});
-var swd=(W-16)/N,cs=tops.map(function(o,k){return 8+(k+.5)*swd;}),L=[];
-tops.forEach(function(o,k){var t=T[o.i],c=cs[k],low=!compact&&!short&&(N-1-k)%2===0,ra,rb;
-if(compact||short){ra=c+5;rb=k+1<N?c+swd-6:W-8;}else if(low){ra=k>=1?cs[k-1]+5:8;rb=k+1<N?cs[k+1]-6:W-8;}else{ra=c+5;rb=k+2<N?cs[k+2]-6:W-8;}
-ra+=PX;rb-=PX;var y0=bandTop+(compact?26:low?82+EX:21),px=ra,w=0,nm=t.name,l2,l3,l4='';
-if(compact){w=tw(x,F4,String(t.open));}
-else{nm=fitText(x,F1,t.name,rb-ra);w=tw(x,F1,nm);l2=t.open+' open · '+t.unreviewed+' unreviewed';if(tw(x,F2,l2)>rb-ra)l2=t.open+' open · '+t.unreviewed+' unrev.';
-l2=fitText(x,F2,l2,rb-ra);w=Math.max(w,tw(x,F2,l2));if(!short){l3='+'+sh(t.add)+' −'+sh(t['del']);w=Math.max(w,tw(x,F2,l3));}
-if(EX){l4=t.merged+' merged · '+t.closed+' closed (' +DAYS+')';if(tw(x,F3,l4)>rb-ra)l4=t.merged+' merged · '+t.closed+' closed';l4=fitText(x,F3,l4,rb-ra);w=Math.max(w,tw(x,F3,l4));}}
-if(low)px=Math.max(ra,Math.min(c-18,rb-w));
-L.push({o:o,t:t,c:c,low:low,y0:y0,x:px,w:w,nm:nm,l2:l2,l4:l4});});
-x.beginPath();L.forEach(function(e){x.moveTo(e.o.x,e.o.y-3);
-if(e.low)x.lineTo(Math.min(Math.max(e.c,e.x+4),e.x+e.w-4),e.y0+36+EX);else{x.lineTo(e.c,bandBottom+(compact?4:8));x.lineTo(e.c,e.y0-(compact?24:19));}});
-x.strokeStyle=col.ink;x.lineWidth=1;x.stroke();
-L.forEach(function(e){var t=e.t,bh=compact?35:short?46:61+EX,by=e.y0-(compact?24:19);x.fillStyle=col.surface;x.fillRect(e.x-PX,by,e.w+2*PX,bh);labelHits.push({x:e.x-PX,y:by,w:e.w+2*PX,h:bh,i:e.o.i});
-if(compact){x.font=F4;txt(x,String(t.open),e.x,e.y0,col.ink);return;}
-x.font=F1;txt(x,e.nm,e.x,e.y0,col.ink);x.font=F2;txt(x,e.l2,e.x,e.y0+16,col.ink);
-if(short)return;x.font=F3;var pl='+'+sh(t.add);txt(x,pl,e.x,e.y0+31,col.good);txt(x,'−'+sh(t['del']),e.x+tw(x,F3,pl+' '),e.y0+31,col.bad);
-if(e.l4)txt(x,e.l4,e.x,e.y0+46,col.ink);});}
+var F2='500 12px Roboto,Arial,sans-serif';
+function narrow(){return W<560;}
+function panelW(){return narrow()?0:Math.min(380,Math.round(W*.42));}
+// callout cards in one row, ordered by the towers' x on screen (calloutLayout mirrors callout_layout in pr-scan.py)
+function crosses(a,b,c,e){function o(p,q,r){return(q[0]-p[0])*(r[1]-p[1])-(q[1]-p[1])*(r[0]-p[0]);}return o(a,b,c)*o(a,b,e)<0&&o(c,e,a)*o(c,e,b)<0;}
+function calloutLayout(xs,ys,pw,cy){var n=xs.length,sw=(pw-2*EDGE)/Math.max(1,n),od=[],cx=[],k,m,i,ch=true;
+for(i=0;i<n;i++)od.push(i);od.sort(function(a,b){return xs[a]-xs[b]||a-b;});
+for(k=0;k<n;k++)cx.push(EDGE+(k+.5)*sw);
+function sg(k){return[[cx[k],cy],[xs[od[k]],ys[od[k]]]];}
+while(ch){ch=false;for(k=0;k<n;k++)for(m=k+1;m<n;m++){var a=sg(k),b=sg(m);if(crosses(a[0],a[1],b[0],b[1])){var tmp=od[k];od[k]=od[m];od[m]=tmp;ch=true;}}}
+return od.map(function(i,k){return{i:i,x0:EDGE+k*sw,cx:cx[k],w:sw,compact:sw<MINSLOT};});}
+// card text: the longest variant that fits the card's inner width (about 6.3 px a character), as the SVG does
+function ew(s){return s.length*6.3;}
+function cardHtml(t,inner){var base=t.open+' open',full=' · '+t.unreviewed+' unreviewed',ab=' · '+t.unreviewed+' unrev.',us=ew(base+full)<=inner?full:ew(base+ab)<=inner?ab:'',m='';
+if(HC){m=t.merged+' merged · '+t.closed+' closed ('+DAYS+')';if(ew(m)>inner)m=t.merged+' merged · '+t.closed+' closed';if(ew(m)>inner)m=t.merged+' merged';m='<span class="cd-m">'+esc(m)+'</span>';}
+return '<span class="cd-nm">'+esc(t.name)+'</span><span class="cd-n"><b>'+t.open+'</b><span class="cd-w"> open</span><span class="cd-s">'+us+'</span></span>'
++'<span class="cd-d"><i class="add">+'+sh(t.add)+'</i> <i class="del">−'+sh(t['del'])+'</i></span>'+m;}
+function mkCards(){cos.innerHTML='';slotKey='';
+cards=T.map(function(t,i){var b=d.createElement('button'),sum=t.name+' · '+t.open+' open · '+t.unreviewed+' unreviewed'+(HC?' · '+t.merged+' merged · '+t.closed+' closed ('+DAYS+')':'');
+b.type='button';b.className='cd';b.setAttribute('data-i',String(i));b.setAttribute('data-tip',sum);b.setAttribute('aria-label','Focus '+sum);
+b.innerHTML=cardHtml(t,1e9);
+b.addEventListener('click',function(){fcard=i;enter(i);});cos.appendChild(b);return b;});}
+// the cards stay in their slots while the yaw changes; when the on-screen order changes they slide to the new slots (CSS transform ease)
+function placeCards(){var geo=W+'|'+CH+'|'+(cmp?1:0)+(tiny?1:0)+'|'+N,key=slots.map(function(s){return s.i;}).join(',')+'|'+geo;
+if(key===slotKey)return;var same=slotKey.slice(slotKey.indexOf('|')+1)===geo;slotKey=key;
+cos.className='cos'+(tiny?' t':cmp?' c':'');
+if(!same&&slots.length){var inner=slots[0].w-GAP-2*10;cards.forEach(function(b,i){if(T[i])b.innerHTML=cardHtml(T[i],inner);});}
+slots.forEach(function(s){var b=cards[s.i];if(!b)return;b.style.transition=same&&!reduce?'transform .28s ease-out':'none';
+b.style.width=Math.max(0,s.w-GAP)+'px';b.style.height=CH+'px';b.style.transform='translate('+(s.x0+GAP/2)+'px,'+bandTop+'px)';});
+if(!(d.activeElement&&d.activeElement.parentNode===cos))slots.forEach(function(s){if(cards[s.i])cos.appendChild(cards[s.i]);});}
+// leader lines: card bottom centre to the tower top. Drawn in the layer; they fade out while a tower is focused.
+function drawLeaders(x){if(fe>=1||!N)return;x.setTransform(dpr,0,0,dpr,0,0);x.globalAlpha=1-fe;x.beginPath();
+slots.forEach(function(s){var t=T[s.i],p=pj((s.i-(N-1)/2)*P,0,t.height);x.moveTo(s.cx,bandTop+CH);x.lineTo(p[0],p[1]-3);});
+x.strokeStyle=col.ink;x.lineWidth=1;x.stroke();x.globalAlpha=1;}
+// the focused tower: a label beside each layer once the layers stand apart
+function sideLabels(x){var t=T[fi],L=t.layers,x0=(fi-(N-1)/2)*P,h=TW/2,gu=gapOf(t)*fe,z=0,lim=W-panelW()-8,k;
+x.setTransform(dpr,0,0,dpr,0,0);x.textBaseline='alphabetic';x.globalAlpha=Math.max(0,(fe-.5)*2);
+for(k=0;k<L.length;k++){var zm=z+k*gu+L[k].h/2,ps=CORN.map(function(c){return pj(x0+c[0]*h,c[1]*h,zm);}),xr=-1e9,xl=1e9,yc=pj(x0,0,zm)[1],s=L[k].label+' · '+L[k].n,w=tw(x,F2,s),lx0;
+ps.forEach(function(p){xr=Math.max(xr,p[0]);xl=Math.min(xl,p[0]);});z+=L[k].h;
+x.strokeStyle=col.st[L[k].k].c;x.lineWidth=2;x.beginPath();
+if(xr+16+w>lim){x.moveTo(xl-2,yc);x.lineTo(xl-10,yc);lx0=xl-14-w;}else{x.moveTo(xr+2,yc);x.lineTo(xr+10,yc);lx0=xr+14;}
+x.stroke();x.font=F2;txt(x,s,Math.max(4,lx0),yc+4,col.ink);}
+x.globalAlpha=1;}
+// the camera of the focused tower at the end of the transition: it fills FILL of the stage height, centred left of the panel
+function camTarget(){var t=T[fi],x0=(fi-(N-1)/2)*P,h=TW/2,top=t.height+(t.layers.length-1)*gapOf(t),b=[1e9,-1e9,1e9,-1e9],nw=narrow(),
+rw=W-panelW(),rh=nw?H*.42:H,Z;
+[[-h,-h],[h,-h],[h,h],[-h,h]].forEach(function(q){[0,top].forEach(function(z){var p=pr(x0+q[0],q[1],z);b[0]=Math.min(b[0],p[0]);b[1]=Math.max(b[1],p[0]);b[2]=Math.min(b[2],p[1]);b[3]=Math.max(b[3],p[1]);});});
+Z=Math.max(1,Math.min(4,FILL*rh/(b[3]-b[2]),.5*rw/(b[1]-b[0])));
+tz=Z;tdx=rw/2-(CX+((b[0]+b[1])/2-CX)*Z);tdy=rh/2-(CY+((b[2]+b[3])/2-CY)*Z);}
 function buildScene(){sceneDirty=false;sceneYaw=yaw;hits=[];order();
+if(fi>=0)camTarget();else{tz=1;tdx=0;tdy=0;}
+cz=1+(tz-1)*fe;cdx=tdx*fe;cdy=tdy*fe;LZ=LH*cz;
+var tx=[],ty=[],i;for(i=0;i<N;i++){var p=pr((i-(N-1)/2)*P,0,T[i].height);tx.push(p[0]);ty.push(p[1]-3);}
+slots=calloutLayout(tx,ty,W,bandTop+CH);placeCards();
 var x=lx;x.setTransform(1,0,0,1,0,0);x.clearRect(0,0,yl.width,yl.height);
-drawGround(x);
-ord.forEach(function(it){drawTower(x,it.i);});
-drawLabels(x);x.setTransform(1,0,0,1,0,0);x.globalAlpha=1;}
+x.globalAlpha=1-.65*fe;drawGround(x);x.globalAlpha=1;
+ord.forEach(function(it){var f=it.i===fi;drawTower(x,it.i,f?1:1-.86*fe,f?fe:0,fi<0||f);});
+if(fi>=0&&fe>.5)sideLabels(x);
+drawLeaders(x);x.setTransform(1,0,0,1,0,0);x.globalAlpha=1;}
 // ---- composite: the only thing a normal frame does. The canvas is cleared, so the page gradient shows through.
 function composite(){g.setTransform(1,0,0,1,0,0);g.clearRect(0,0,cv.width,cv.height);g.drawImage(yl,0,0);
 if(hover){hits.forEach(function(h){if(h.t!==hover.t||h.l!==hover.l)return;var cc=col.st[T[h.t].layers[h.l].k];
 g.setTransform(h.m[0],h.m[1],h.m[2],h.m[3],h.m[4],h.m[5]);g.fillStyle=cc.ghost?cc.gh:cc['h'+h.s];g.fillRect(h.r[0],h.r[1],h.r[2],h.r[3]);});g.setTransform(1,0,0,1,0,0);}}
 function shown(){return vis&&!d.hidden&&N>0;}
-// only the idle pan animates: it runs until the first user input and pauses while the pointer is over the map
-function animating(){return auto&&!reduce&&!inside&&!drag;}
+// the loop runs only while the focus transition plays (a pan or a hover draws one frame and stops); at rest nothing is scheduled
 function sched(){if(!raf&&shown())raf=requestAnimationFrame(frame);}
+function eo(u){return 1-Math.pow(1-u,3);}
 function frame(ts){raf=0;
-if(!shown()){last=0;return;}
+if(!shown())return;
 if(ts-lastDraw<MS){raf=requestAnimationFrame(frame);return;}
-var dt=last?Math.min(100,ts-last):0;last=ts;lastDraw=ts;
+lastDraw=ts;
 if(rz){rz=false;layout();}
-if(animating()){ph+=dt*2*Math.PI/PERIOD;yaw=clampYaw(Y0+Math.round(Math.sin(ph)*ARC*IDLE/Q)*Q);}
+if(fanim){if(!ft0)ft0=ts;var u=Math.min(1,(ts-ft0)/FMS),tg=fdir>0?1:0;fe=fb+(tg-fb)*eo(u);sceneDirty=true;
+if(u>=1){fanim=false;ft0=0;fe=tg;if(!tg)finishLeave();}}
 if(sceneDirty||sceneYaw!==yaw)buildScene();
 composite();
-if(animating())sched();else last=0;}
+if(fanim)sched();}
+// ---- focus
+function idx(s){for(var i=0;i<N;i++)if(T[i].slug===s)return i;return -1;}
+function setHash(s){try{d.dispatchEvent(new CustomEvent('prscan-focus-set',{detail:s}));}catch(e){}}
+function panelHtml(t){var o=[],L=t.layers.slice().reverse(),k;
+if(t.members&&t.members.length)o.push('<p class="fp-mem">'+esc(t.members.length+' areas: '+t.members.join(', '))+'</p>');
+o.push('<ul class="fp-counts">');
+L.forEach(function(l){o.push('<li><i class="fp-sw v-'+esc(l.k)+'"></i><span>'+esc(l.label)+'</span><b>'+l.n+'</b></li>');});
+if(HC)o.push('<li><i class="fp-sw"></i><span>Closed, not merged</span><b>'+t.closed+'</b></li>');
+o.push('</ul>');
+if(t.files&&t.files.length){o.push('<h4>Top files</h4><ul class="fp-files">');t.files.forEach(function(f){o.push('<li>'+esc(f[0])+(f[1]>1?' ×'+f[1]:'')+'</li>');});o.push('</ul>');}
+o.push('<div class="fp-prs">');
+L.forEach(function(l){var ns=(t.prs&&t.prs[l.k])||[];if(!ns.length)return;o.push('<h4>'+esc(l.label)+' · '+ns.length+'</h4><ol>');
+ns.forEach(function(n){var e=TL[n]||['','#',''];o.push('<li><a href="'+e[1]+'">#'+n+'</a> '+e[0]+'</li>');});o.push('</ol>');});
+if(!L.length)o.push('<p class="fp-mem">No PRs.</p>');
+o.push('</div>');return o.join('');}
+function fillPanel(){if(fi<0||!fp)return;if(fpt)fpt.textContent=T[fi].name;if(fpb)fpb.innerHTML=panelHtml(T[fi]);}
+function enter(i,inst){if(i<0||i>=N)return;fi=i;fslug=T[i].slug;stage.classList.add('foc');hover=null;if(tip)tip.hidden=true;fillPanel();
+if(fp){fp.hidden=false;fp.offsetWidth;fp.classList.add('on');if(fback&&!inst&&fback.focus)fback.focus();}
+if(reduce||inst||!K){fe=1;fanim=false;}else{fb=fe;fdir=1;fanim=true;ft0=0;}
+setHash(fslug);sceneDirty=true;sched();}
+function finishLeave(){fi=-1;fslug='';sceneDirty=true;if(fp&&!fp.classList.contains('on'))fp.hidden=true;}
+function leave(inst){if(fi<0)return;setHash('');stage.classList.remove('foc');if(fp)fp.classList.remove('on');
+var c=cards[fcard];fcard=-1;if(c&&c.focus)c.focus();
+if(reduce||inst||!K){fe=0;fanim=false;finishLeave();}else{fb=fe;fdir=-1;fanim=true;ft0=0;}
+sceneDirty=true;sched();}
+if(fback)fback.addEventListener('click',function(){leave();});
+d.addEventListener('keydown',function(e){if(e.key==='Escape'&&fi>=0){e.preventDefault();leave();}});
+d.addEventListener('prscan-focus',function(e){var s=e.detail||'',j=s?idx(s):-1;
+if(!s){leave();return;}if(j<0||j===fi)return;layout();
+if(fi>=0){fi=j;fslug=s;fillPanel();sceneDirty=true;sched();}else enter(j);});
+// ---- pointer and keys
 function pos(e){var r=cv.getBoundingClientRect();return[e.clientX-r.left,e.clientY-r.top];}
 function place(e){var x=e.clientX+12,y=e.clientY+14,w=tip.offsetWidth,h=tip.offsetHeight;
 if(x+w>innerWidth-8)x=Math.max(8,e.clientX-w-12);if(y+h>innerHeight-8)y=Math.max(8,e.clientY-h-12);tip.style.left=x+'px';tip.style.top=y+'px';}
 function inQ(q,px,py){var s=0;for(var i=0;i<q.length;i++){var a=q[i],b=q[(i+1)%q.length],c=(b[0]-a[0])*(py-a[1])-(b[1]-a[1])*(px-a[0]);
 if(c!==0){if(s&&(c>0)!==(s>0))return false;s=c;}}return true;}
 // hit-test on the polygons cached when the layer was built; the canvas is repainted only when the hovered layer changes
-function pick(e){var p=pos(e),f=null,i;
-for(i=hits.length-1;i>=0;i--){var h=hits[i],b=h.bb;if(p[0]<b[0]||p[0]>b[2]||p[1]<b[1]||p[1]>b[3])continue;if(inQ(h.q,p[0],p[1])){f=h;break;}}
-var lab=null;if(!f)for(var j=0;j<labelHits.length;j++){var L=labelHits[j];if(p[0]>=L.x&&p[0]<=L.x+L.w&&p[1]>=L.y&&p[1]<=L.y+L.h){lab=T[L.i];break;}}
-var ch=(f?f.t:-1)!==(hover?hover.t:-1)||(f?f.l:-1)!==(hover?hover.l:-1);hover=f?{t:f.t,l:f.l}:null;
+function hitAt(e){var p=pos(e),i;
+for(i=hits.length-1;i>=0;i--){var h=hits[i],b=h.bb;if(p[0]<b[0]||p[0]>b[2]||p[1]<b[1]||p[1]>b[3])continue;if(inQ(h.q,p[0],p[1]))return h;}
+return null;}
+function pick(e){var f=hitAt(e),ch=(f?f.t:-1)!==(hover?hover.t:-1)||(f?f.l:-1)!==(hover?hover.l:-1);hover=f?{t:f.t,l:f.l}:null;
 if(f&&tip){var t=T[f.t],ly=t.layers[f.l];tip.textContent=t.name+' · '+ly.label.toLowerCase()+' · '+ly.n+' PR'+(ly.n===1?'':'s');tip.hidden=false;place(e);}
-else if(lab&&tip){tip.textContent=lab.name+' · '+lab.open+' open · '+lab.unreviewed+' unreviewed'+(HC?' · '+lab.merged+' merged · '+lab.closed+' closed ('+DAYS+')':'');tip.hidden=false;place(e);}
 else if(tip)tip.hidden=true;if(ch)sched();}
-cv.addEventListener('pointerdown',function(e){drag={x:e.clientX};auto=false;if(cv.setPointerCapture)try{cv.setPointerCapture(e.pointerId);}catch(x){}});
-cv.addEventListener('pointermove',function(e){inside=true;if(drag){yaw=clampYaw(yaw+(e.clientX-drag.x)*.01);drag.x=e.clientX;hover=null;if(tip)tip.hidden=true;sched();}else pick(e);});
-function up(){drag=null;sched();}
-cv.addEventListener('pointerup',up);cv.addEventListener('pointercancel',up);
-cv.addEventListener('pointerenter',function(){inside=true;});
-cv.addEventListener('pointerleave',function(){inside=false;hover=null;if(tip)tip.hidden=true;sched();});
-cv.addEventListener('keydown',function(e){var k=e.key==='ArrowLeft'?-1:e.key==='ArrowRight'?1:0;if(!k)return;e.preventDefault();auto=false;yaw=clampYaw(yaw+k*.12);sched();});
+cv.addEventListener('pointerdown',function(e){drag={x:e.clientX};down={x:e.clientX,y:e.clientY,m:0};if(cv.setPointerCapture)try{cv.setPointerCapture(e.pointerId);}catch(x){}});
+cv.addEventListener('pointermove',function(e){if(drag){down.m=Math.max(down.m,Math.abs(e.clientX-down.x)+Math.abs(e.clientY-down.y));
+if(down.m>3){yaw=clampYaw(yaw+(e.clientX-drag.x)*.01);hover=null;if(tip)tip.hidden=true;sched();}drag.x=e.clientX;}else pick(e);});
+// a press that did not move is a click: a tower focuses it, empty stage leaves the focus
+cv.addEventListener('pointerup',function(e){var c=down&&down.m<=3;drag=null;down=null;
+if(c){var f=hitAt(e);if(f&&fi<0){fcard=-1;enter(f.t);}else if(fi>=0&&!(f&&f.t===fi))leave();}sched();});
+cv.addEventListener('pointercancel',function(){drag=null;down=null;sched();});
+cv.addEventListener('pointerleave',function(){hover=null;if(tip)tip.hidden=true;sched();});
+cv.addEventListener('keydown',function(e){var k=e.key==='ArrowLeft'?-1:e.key==='ArrowRight'?1:0;if(!k)return;e.preventDefault();yaw=clampYaw(yaw+k*.12);sched();});
 // the size is re-read in the next frame, so a burst of resize events costs one layout
 function resized(){rz=true;sched();}
 if(window.ResizeObserver)new ResizeObserver(resized).observe(stage);else addEventListener('resize',resized);
@@ -1657,16 +1818,18 @@ function recolor(){readColors();sceneDirty=true;sched();}
 if(window.MutationObserver)new MutationObserver(recolor).observe(d.documentElement,{attributes:true,attributeFilter:['data-theme']});
 if(window.matchMedia)try{matchMedia('(prefers-color-scheme: dark)').addEventListener('change',recolor);}catch(e){}
 if(d.fonts&&d.fonts.ready)d.fonts.ready.then(function(){mc={};sceneDirty=true;sched();});
-// a range change swaps the towers: the layout is recomputed (plate and labels depend on them) and nothing else is rebuilt
+// a range change swaps the towers: the layout is recomputed (plate and cards depend on them); a focused tower stays focused when the new range has it
 var semp=d.getElementById('scene-empty'),skey=d.querySelector('.scene-key');
 function setRange(k){var R=RG[k];if(!R)return;T=R.towers||[];N=T.length;HX=R.gx||8;HY=R.gy||3;DAYS=R.rl||DAYS;HC=!!R.hasClosed;
-hover=null;hits=[];labelHits=[];if(tip)tip.hidden=true;stage.hidden=!N;
+hover=null;hits=[];if(tip)tip.hidden=true;stage.hidden=!N;mkCards();
 if(semp){semp.textContent='No PRs in the last '+DAYS+'.';semp.hidden=!!N;}
 if(skey)skey.innerHTML=R.key||'';
+if(fi>=0){var j=idx(fslug);if(j<0){leave(true);}else{fi=j;fillPanel();}}
 K=0;sceneDirty=true;if(N)layout();sched();}
 d.addEventListener('prscan-range',function(e){setRange(e.detail);});
 readColors();var r0=d.documentElement.getAttribute('data-range');
-if(r0&&RG[r0])setRange(r0);else{layout();sched();}
+if(r0&&RG[r0])setRange(r0);else{mkCards();layout();sched();}
+var f0=d.documentElement.getAttribute('data-focus'),j0=f0?idx(f0):-1;if(j0>=0)enter(j0,true);
 })();
 """
 
@@ -1737,10 +1900,10 @@ def standings_html(view, rl, spark_hist):
         chips = "".join('<span class="fchip" title="%s">%s</span>' % (
             esc("%s: %d PR%s, %d changed lines" % (f, n, "" if n == 1 else "s", ln)), esc(f + (" ×%d" % n if n > 1 else "")))
             for f, n, ln in files)
-        o.append('<li class="st"><span class="rank">%d</span><div class="who"><b>%s</b><small title="%s">%s</small></div>'
-                 '<span class="track"><span class="fill" style="width:%.1f%%">%s</span></span>'
+        o.append('<li class="st" data-slug="%s"><span class="rank">%d</span><div class="who"><b>%s</b><small title="%s">%s</small></div>'
+                 '<span class="track" role="button" tabindex="0" aria-label="Focus %s on the effort map"><span class="fill" style="width:%.1f%%">%s</span></span>'
                  '<div class="where"><b>%d</b>%s</div>%s</li>' % (
-                     i, who, esc(sub), esc(sub),
+                     esc(entry_slug(e)), i, who, esc(sub), esc(sub), esc(a),
                      100.0 * (len(ps) + nm) / biggest, segs, len(ps),
                      sparkline(series, "%s: open PRs over %d days" % (a, SPARK_DAYS)),
                      '<div class="stf">%s</div>' % chips if chips else ""))
@@ -1761,6 +1924,9 @@ def select_counts(top, view):
             out[slug(m)] = n(m)
     return out
 
+
+FOCUS_PANEL = ('<aside class="fpanel" id="fpanel" role="region" aria-label="Area detail" hidden><div class="fp-head">'
+               '<button type="button" class="fp-back" id="fp-back">Back</button><h3 id="fp-title"></h3></div><div class="fp-body" id="fp-body"></div></aside>')
 
 PAGES = [("effort", "Effort"), ("areas", "Areas"), ("trends", "Trends"), ("stats", "Stats")]
 CHART_WIDE, CHART_HALF = (640, 240), (320, 240)   # viewBox of the large trend charts: a wide one and two half-width ones
@@ -1851,12 +2017,13 @@ def render_html(an, repo, now, hist=None):
                  " has-stage" if any_tower else "", n_open, n_un, n_done, n_clusters, "" if n_clusters == 1 else "s",
                  n_dr, "" if n_dr == 1 else "s", delta_text(d_open), esc(rdata[DEFAULT_RANGE]["line"])))
     if any_tower:
-        o.append('<div class="stage" id="stage"%s>%s</div><p class="empty-block" id="scene-empty"%s>%s</p>'
+        sranges = {k: scene_range(sc) for k, sc in scenes.items()}
+        o.append('<div class="stage" id="stage"%s>%s%s</div><p class="empty-block" id="scene-empty"%s>%s</p>'
                  '<div class="scene-foot">%s</div>'
                  '<ol class="scene-key">%s</ol><script type="application/json" id="scene-data">%s</script>' % (
-                     "" if scene["towers"] else " hidden", scene_svg(scene), "" if not scene["towers"] else " hidden", esc(empty_range(rl0)),
+                     "" if scene["towers"] else " hidden", scene_svg(scene), FOCUS_PANEL, "" if not scene["towers"] else " hidden", esc(empty_range(rl0)),
                      legend([(n, "k-" + k) for k, n, _ in SCENE_STATES if has_closed or k != "merged"]),
-                     scene_key_html(scene), scene_json(scene, {k: scene_range(sc) for k, sc in scenes.items()})))
+                     scene_key_html(scene), scene_json(scene, sranges, scene_titles(by_num, sranges))))
     else:
         o.append('<p class="empty-block">No data yet</p><p class="sec-note">The effort map needs at least one open pull request.</p>')
     o.append("</div></section>")

@@ -3,8 +3,12 @@
 import datetime as dt
 import importlib.util
 import json
+import math
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 _spec = importlib.util.spec_from_file_location("pr_scan", os.path.join(os.path.dirname(os.path.abspath(__file__)), "pr-scan.py"))
@@ -12,6 +16,74 @@ ps = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ps)
 
 NOW = dt.datetime(2026, 11, 23, 12, 0, 0, tzinfo=dt.timezone.utc)
+
+
+JSC = "/System/Library/Frameworks/JavaScriptCore.framework/Versions/Current/Helpers/jsc"
+
+# A mock DOM, canvas and rAF for jsc: the page's two inline scripts run against it, then a test-specific tail. The tail
+# drives the page with fire(target, event), runs the queued animation frames with frames() and print()s one JSON line.
+JSC_MOCK = r"""
+var ops=0,rafcb=null,TS=1000,W0=@W@,H0=@H@;
+function CustomEvent(t,o){this.type=t;this.detail=o&&o.detail;}
+function tgt(o){o._l={};o.addEventListener=function(t,f){(o._l[t]=o._l[t]||[]).push(f);};
+o.dispatchEvent=function(e){(o._l[e.type]||[]).slice().forEach(function(f){f(e);});return true;};return o;}
+function cls(){var s={};return{add:function(c){s[c]=1;},remove:function(c){delete s[c];},contains:function(c){return !!s[c];}};}
+var ctx={_p:0,fillStyle:'',strokeStyle:'',lineWidth:1,globalAlpha:1,font:'',textBaseline:'',lineJoin:'',lineDashOffset:0,
+measureText:function(s){return{width:s.length*6.5};}};
+['setTransform','setLineDash','clearRect','fillRect','strokeRect','fillText','strokeText','beginPath','moveTo','lineTo','closePath','fill','stroke','drawImage'].forEach(function(n){ctx[n]=function(){ops++;};});
+function el(tag){var e=tgt({tag:tag,style:{},children:[],attrs:{},classList:cls(),hidden:false,textContent:'',offsetWidth:100,offsetHeight:20,parentNode:null,className:'',
+setAttribute:function(k,v){this.attrs[k]=String(v);},getAttribute:function(k){return k in this.attrs?this.attrs[k]:null;},removeAttribute:function(k){delete this.attrs[k];},
+appendChild:function(c){c.parentNode=this;var i=this.children.indexOf(c);if(i>=0)this.children.splice(i,1);this.children.push(c);return c;},
+replaceChild:function(n,o){var i=this.children.indexOf(o);if(i>=0)this.children[i]=n;n.parentNode=this;},
+querySelector:function(q){return q==='svg'&&this.svg?this.svg:null;},querySelectorAll:function(){return[];},closest:function(){return null;},
+getBoundingClientRect:function(){return{left:0,top:0,width:W0,height:H0};},focus:function(){doc.activeElement=this;},getContext:function(){return ctx;}});
+var h='';Object.defineProperty(e,'innerHTML',{get:function(){return h;},set:function(v){h=v;if(v==='')this.children=[];}});return e;}
+var byId={};
+var doc=tgt({hidden:false,activeElement:null,documentElement:el('html'),
+getElementById:function(i){return byId[i]||null;},createElement:function(t){return el(t);},querySelector:function(){return null;},querySelectorAll:function(){return[];}});
+var document=doc;
+var stage=el('div'),svgEl=el('svg');svgEl.attrs['aria-label']='Effort map';stage.svg=svgEl;stage.children.push(svgEl);
+byId.stage=stage;byId['scene-data']={textContent:@SCENE@};byId['range-data']={textContent:@RANGE@};byId.tip=el('div');
+['fpanel','fp-title','fp-body','fp-back'].forEach(function(i){byId[i]=el(i==='fpanel'?'aside':'div');});
+var TOK={'--ink':'#10141c','--page':'#ffffff','--soft':'#566070','--good':'#4f7f16','--bad':'#c4261d','--accent':'#1546e0','--partial':'#e8770c','--merged':'#7a3fd0'};
+function getComputedStyle(){return{getPropertyValue:function(n){return TOK[n]||'#888888';}};}
+var location={hash:'@HASH@',pathname:'/',search:''},writes=[];
+var history={replaceState:function(a,b,u){writes.push(u);location.hash=u.charAt(0)==='#'?u:'';}};
+var window=tgt({devicePixelRatio:2,matchMedia:function(){return{matches:false};}});
+var innerWidth=1440,innerHeight=900;
+function matchMedia(){return{matches:false};}
+function requestAnimationFrame(f){rafcb=f;return 1;}
+function addEventListener(){}
+function fire(t,e){e.preventDefault=function(){};e.target=e.target||t;t.dispatchEvent(e);}
+function frames(){var n=0,drawn=[];while(rafcb&&n<400){var f=rafcb,o0=ops;rafcb=null;TS+=17;f(TS);n++;if(ops>o0)drawn.push(ops-o0);}return{raf:n,drawn:drawn.length,ops:drawn};}
+function cards(){var c=stage.children.filter(function(x){return String(x.className).indexOf('cos')===0;})[0];return c?c.children:[];}
+"""
+
+
+def jsc_available():
+    return os.path.exists(JSC)
+
+
+def jsc_run(src, tail="", html=None, w=900, h=560, hash_=""):
+    """Runs src (a script) in jsc and returns its output. With html, runs the page's inline scripts against JSC_MOCK first
+    (its scene-data and range-data blocks are fed to the mock), then tail."""
+    parts = []
+    if html is not None:
+        scene = re.search(r'id="scene-data">(.*?)</script>', html, re.S).group(1)
+        rng = re.search(r'id="range-data">(.*?)</script>', html, re.S).group(1)
+        parts.append(JSC_MOCK.replace("@W@", str(w)).replace("@H@", str(h)).replace("@SCENE@", json.dumps(scene))
+                     .replace("@RANGE@", json.dumps(rng)).replace("@HASH@", hash_))
+    parts.append(src)
+    parts.append(tail)
+    d = tempfile.mkdtemp()
+    try:
+        path = os.path.join(d, "t.js")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(parts))
+        r = subprocess.run([JSC, path], capture_output=True, text=True, encoding="utf-8", timeout=60)
+        return r.stdout + r.stderr
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def pr(number, title="x", files=(), **kw):
@@ -454,7 +526,7 @@ class TopAreaTests(unittest.TestCase):
         an = analysis_of({"A%d" % i: 10 - i for i in range(9)})
         out = ps.render_html(an, "o/r", NOW)
         st = out.split('class="a-standings"')[1].split("</section>")[0]
-        self.assertEqual(st.count('<li class="st">'), 8)
+        self.assertEqual(st.count('<li class="st" '), 8)
         self.assertIn('<span class="nm">Other</span>', st)
         self.assertNotIn("Everything else", out)
         self.assertIn("2 areas: A7, A8", st)
@@ -698,7 +770,7 @@ class SpacingTests(unittest.TestCase):
     def test_callout_padding_constants(self):
         self.assertGreaterEqual(ps.SCENE_PAD_X, 10)
         self.assertGreaterEqual(ps.SCENE_PAD_Y, 8)
-        self.assertIn("var PX=%d;" % ps.SCENE_PAD_X, ps.SCENE_JS)
+        self.assertRegex(ps.SCENE_CSS, r"\.cd\{[^}]*padding:var\(--sp-2\) %dpx;" % ps.SCENE_PAD_X)  # the callout cards are buttons
 
     def test_svg_callout_text_is_inset_from_its_box(self):
         svg = ps.scene_svg(ps.effort_scene(analysis_of({"Alpha": 3, "Beta": 2, "Gamma": 1})))
@@ -726,9 +798,11 @@ class FitTests(unittest.TestCase):
         self.assertNotIn("min-height:660px", ps.CSS + ps.SCENE_CSS)
 
     def test_scene_panel_never_scrolls(self):
-        self.assertNotIn("overflow:auto", ps.SCENE_CSS)
-        self.assertNotIn("overflow-y:auto", ps.SCENE_CSS)
-        self.assertNotIn("overflow:scroll", ps.SCENE_CSS)
+        # only the PR list of the focus panel scrolls (its own scroll, spec)
+        css = re.sub(r"\.fp-prs\{[^}]*\}", "", ps.SCENE_CSS)
+        self.assertNotIn("overflow:auto", css)
+        self.assertNotIn("overflow-y:auto", css)
+        self.assertNotIn("overflow:scroll", css)
         self.assertIn(".js .a-city,.js .a-trends,.js .a-road,.js .a-standings,.js .a-feed{overflow:hidden", self.desktop())
 
     def test_only_long_lists_scroll(self):
@@ -738,7 +812,7 @@ class FitTests(unittest.TestCase):
             if "overflow:auto" in rule or "overflow-y:auto" in rule:
                 scrolling.add(rule.split("{")[0])
         for sel in scrolling:
-            self.assertTrue(all(x in (".st-list", ".feed-body") for x in sel.split(",")), sel)
+            self.assertTrue(all(x in (".st-list", ".feed-body", ".fp-prs") for x in sel.split(",")), sel)
 
     def test_mobile_scene_height_and_single_column(self):
         self.assertIn(".stage{position:relative;flex:none;width:100%;height:min(60vh,420px)}", ps.SCENE_CSS)
@@ -790,26 +864,24 @@ class RendererSourceTests(unittest.TestCase):
         self.assertIn("function composite()", ps.SCENE_JS)
         self.assertIn("ordYaw===sceneYaw", ps.SCENE_JS)  # painter order is sorted once per yaw
 
-    def test_reduced_motion_stops_the_idle_pan(self):
+    def test_reduced_motion_skips_the_focus_animation(self):
         self.assertIn("prefers-reduced-motion: reduce", ps.SCENE_JS)
-        self.assertIn("var auto=!reduce", ps.SCENE_JS)
-        self.assertIn("function animating(){return auto&&!reduce&&!inside&&!drag;}", ps.SCENE_JS)
+        self.assertIn("if(reduce||inst||!K){fe=1;fanim=false;}", ps.SCENE_JS)  # straight to the end state
+        self.assertIn("if(reduce||inst||!K){fe=0;fanim=false;finishLeave();}", ps.SCENE_JS)
+        self.assertIn("@media (prefers-reduced-motion:reduce){.fpanel,.cd{transition:none}}", ps.SCENE_CSS)
 
     def test_yaw_is_clamped_everywhere_it_changes(self):
         js = ps.SCENE_JS
         self.assertIn("function clampYaw(v){return Math.max(Y0-ARC,Math.min(Y0+ARC,v));}", js)
         self.assertIn("yaw=clampYaw(yaw+(e.clientX-drag.x)*.01)", js)  # drag
         self.assertIn("yaw=clampYaw(yaw+k*.12)", js)  # keys
-        self.assertIn("yaw=clampYaw(Y0+Math.round(Math.sin(ph)*ARC*IDLE/Q)*Q)", js)  # idle ease
-        self.assertEqual(len(re.findall(r"\byaw\s*(?:\+|-)?=(?!=)", js.replace("var yaw=Y0;", ""))), 3)  # no other write to yaw
+        self.assertEqual(len(re.findall(r"\byaw\s*(?:\+|-)?=(?!=)", js.replace("var yaw=Y0;", ""))), 2)  # no other write to yaw
 
-    def test_input_stops_the_idle_pan(self):
-        self.assertIn("drag={x:e.clientX};auto=false;", ps.SCENE_JS)
-        self.assertIn("e.preventDefault();auto=false;", ps.SCENE_JS)
-
-    def test_only_the_idle_pan_keeps_the_loop_running(self):
-        self.assertIn("if(animating())sched();else last=0;", ps.SCENE_JS)
-        self.assertNotIn("function animating(){return !reduce;}", ps.SCENE_JS)
+    def test_the_loop_runs_only_during_the_focus_transition(self):
+        js = ps.SCENE_JS
+        self.assertIn("if(fanim)sched();}", js)  # the one place a frame schedules the next
+        self.assertEqual(js.count("requestAnimationFrame("), 2)  # sched() and the 30 ms cap re-queue
+        self.assertIn("function sched(){if(!raf&&shown())raf=requestAnimationFrame(frame);}", js)
 
     def test_zoom_is_applied_and_centred(self):
         self.assertIn("K*=ZOOM;LH*=ZOOM;", ps.SCENE_JS)
@@ -895,8 +967,7 @@ class SceneTests(unittest.TestCase):
         self.assertEqual(ps.clamp_yaw(lo + 1), lo + 1)
         geom = json.loads(ps.scene_json(ps.effort_scene(analysis_of({"A": 3}))))["geom"]
         self.assertEqual((geom["yaw"], geom["arc"], geom["zoom"]), (ps.SCENE_YAW, 90.0, 0.85))
-        self.assertLess(0, geom["idle"])
-        self.assertLessEqual(geom["idle"], 1)  # the idle ease stays inside the arc
+        self.assertNotIn("idle", geom)
 
     def test_scene_has_no_backdrop_decor(self):
         self.assertFalse(hasattr(ps, "scene_decor"))
@@ -975,6 +1046,320 @@ class SceneTests(unittest.TestCase):
         out = ps.render_html(analysis_of({}), "o/r", NOW)
         self.assertNotIn('id="stage"', out)
         self.assertIn("No data yet", out.split('class="a-city"')[1].split("</section>")[0])
+
+
+def sweep_tops(heights, panel_w, yaw_deg):
+    """Screen position (x, y) of every tower top at a yaw, with the projection of scene_svg and the canvas: scale from the
+    panel width, centred on x, and one fixed vertical offset over the whole pan (the lowest top of the sweep sits just below
+    the card row), as the canvas does."""
+    n = len(heights)
+    gx, _ = ps.scene_plate(n)
+    k = (panel_w - 24) / (2 * gx * ps.SCENE_SX * 1.3) * 1.0
+    lh = k * 0.9 * ps.SCENE_ZOOM
+    xs = [(i - (n - 1) / 2.0) * ps.TOWER_PITCH for i in range(n)]
+    tops = [ps._pj(x, 0, h, math.radians(yaw_deg), k, lh) for x, h in zip(xs, heights)]
+    return [(panel_w / 2.0 + t[0], t[1]) for t in tops]
+
+
+class CalloutLayoutTests(unittest.TestCase):
+    YAWS = [ps.SCENE_YAW + a for a in range(-90, 91)]  # the whole +/-90 degree arc, every degree
+    SHAPES = {2: [30, 4], 3: [27, 22, 10], 4: [27, 22, 10, 8], 5: [40, 3, 25, 1, 12], 6: [40, 30, 20, 10, 5, 1],
+              7: [12, 12, 12, 12, 12, 12, 12], 8: [40, 22, 10, 9, 8, 6, 3, 1]}
+
+    def crossing(self, n, heights, width, yaw, uncross=True):
+        tops = sweep_tops(heights, width, yaw)
+        base = min(y for _, y in sweep_tops(heights, width, ps.SCENE_YAW))
+        card_y = ps.SCENE_BAND_TOP + ps.SCENE_COMPACT_H
+        off = card_y + ps.SCENE_LEAD + 8 - min(y for y in [t[1] for t in tops] + [base])
+        pts = [(x, y + off - 3) for x, y in tops]
+        slots = ps.callout_layout([p[0] for p in pts], width, [p[1] for p in pts] if uncross else None, card_y)
+        segs = [((s["cx"], card_y), pts[s["i"]]) for s in slots]
+        return [(a, b) for a in range(n) for b in range(a + 1, n) if ps._crosses(*segs[a], *segs[b])], slots
+
+    def test_leader_segments_never_intersect_over_the_yaw_sweep(self):
+        for n, heights in self.SHAPES.items():
+            for width in (420, 720, 900, 1200):
+                for yaw in self.YAWS:
+                    bad, slots = self.crossing(n, heights, width, yaw)
+                    self.assertEqual(bad, [], (n, width, yaw))
+                    self.assertEqual(sorted(s["i"] for s in slots), list(range(n)))  # every tower has exactly one card
+
+    def test_order_by_x_alone_is_not_enough_for_towers_in_line_with_the_camera(self):
+        # why the layout also uncrosses: near yaw 45 degrees the tops share one screen x and differ only in height
+        found = [(n, w, yaw) for n, heights in self.SHAPES.items() for w in (420, 900) for yaw in self.YAWS
+                 if self.crossing(n, heights, w, yaw, uncross=False)[0]]
+        self.assertTrue(found)
+
+    def test_slots_are_equal_ordered_by_x_and_span_the_panel(self):
+        slots = ps.callout_layout([300, 100, 200], 616)
+        self.assertEqual([s["i"] for s in slots], [1, 2, 0])  # left to right by tower x
+        self.assertEqual([round(s["w"], 6) for s in slots], [200.0] * 3)
+        self.assertEqual(slots[0]["x0"], ps.SCENE_EDGE)
+        self.assertEqual(slots[-1]["x0"] + slots[-1]["w"], 616 - ps.SCENE_EDGE)
+        self.assertEqual([s["cx"] for s in slots], [108.0, 308.0, 508.0])
+        self.assertEqual([s["i"] for s in ps.callout_layout([5, 5, 5], 300)], [0, 1, 2])  # ties by index
+        self.assertEqual(ps.callout_layout([], 300), [])
+
+    def test_compact_below_110_px_slots(self):
+        n = 8
+        at = n * ps.SCENE_MIN_SLOT + 2 * ps.SCENE_EDGE
+        self.assertEqual(ps.SCENE_MIN_SLOT, 110)
+        self.assertFalse(any(s["compact"] for s in ps.callout_layout(list(range(n)), at)))  # a slot of exactly 110 px is not compact
+        self.assertTrue(all(s["compact"] for s in ps.callout_layout(list(range(n)), at - 1)))
+        self.assertTrue(all(s["compact"] for s in ps.callout_layout(list(range(n)), 300)))
+        svg_full = ps.scene_svg(ps.effort_scene(analysis_of({"A": 3, "B": 2, "C": 1})))  # 232 px slots in the 720 px viewBox
+        svg_comp = ps.scene_svg(ps.effort_scene(analysis_of({"A%d" % i: 8 - i for i in range(8)})))  # 87 px slots
+        self.assertIn("co-sub", svg_full)
+        self.assertNotIn("co-sub", svg_comp)  # name and open count only
+        self.assertEqual(svg_comp.count('<g class="callout">'), 8)
+        self.assertIn("slotKey", ps.SCENE_JS)
+        self.assertIn("compact:sw<MINSLOT", ps.SCENE_JS)
+
+    def test_svg_leaders_start_at_the_card_bottom_centre_and_never_cross(self):
+        for counts in ({"A": 5, "B": 4, "C": 3}, {"A%d" % i: 9 - i for i in range(8)}, {"A": 30, "B": 2, "C": 1, "D": 20}):
+            svg = ps.scene_svg(ps.effort_scene(analysis_of(counts)))
+            segs = []
+            for g in svg.split('<g class="callout">')[1:]:
+                a = [float(v) for v in re.search(r'<polyline points="([^"]+)"', g).group(1).replace(",", " ").split()]
+                rect = re.search(r'<rect class="co-bg" x="([\d.-]+)" y="(-?\d+)" width="([\d.]+)" height="(\d+)"', g)
+                rx, ry, rw, rh = float(rect.group(1)), int(rect.group(2)), float(rect.group(3)), int(rect.group(4))
+                self.assertAlmostEqual(a[0], rx + rw / 2.0, delta=0.11)  # card bottom centre
+                self.assertEqual(a[1], ry + rh)
+                segs.append(((a[0], a[1]), (a[2], a[3])))
+            for i in range(len(segs)):
+                for j in range(i + 1, len(segs)):
+                    self.assertFalse(ps._crosses(*segs[i], *segs[j]), (counts, i, j))
+
+    @unittest.skipUnless(jsc_available(), "jsc not available")
+    def test_js_layout_matches_python(self):
+        import random
+        m = re.search(r"function crosses.*?(?=function mkCards)", ps.SCENE_JS, re.S).group(0)
+        rnd = random.Random(7)
+        cases = []
+        for _ in range(60):
+            n = rnd.randint(1, 8)
+            cases.append({"xs": [round(rnd.uniform(40, 800), 1) for _ in range(n)], "ys": [round(rnd.uniform(90, 400), 1) for _ in range(n)],
+                          "w": rnd.choice([360, 600, 900, 1200])})
+        cases.append({"xs": [100, 100, 100], "ys": [200, 150, 300], "w": 600})
+        out = jsc_run("var EDGE=%d,MINSLOT=%d;%s\nvar C=%s;print(JSON.stringify(C.map(function(c){return calloutLayout(c.xs,c.ys,c.w,%d).map(function(s){return[s.i,s.cx,s.compact];});})));" % (
+            ps.SCENE_EDGE, ps.SCENE_MIN_SLOT, m, json.dumps(cases), ps.SCENE_BAND_TOP + ps.SCENE_COMPACT_H))
+        got = json.loads(out.strip().splitlines()[-1])
+        for c, g in zip(cases, got):
+            want = ps.callout_layout(c["xs"], c["w"], c["ys"], ps.SCENE_BAND_TOP + ps.SCENE_COMPACT_H)
+            self.assertEqual([(s["i"], round(s["cx"], 6), s["compact"]) for s in want], [(i, round(x, 6), cp) for i, x, cp in g], c)
+
+
+class FocusTests(unittest.TestCase):
+    def page(self, an=None, hist=None):
+        return ps.render_html(an or analysis_of({"A": 6, "B": 4, "C": 2}), "o/r", NOW, hist)
+
+    def scene(self, out):
+        return json.loads(re.search(r'id="scene-data">(.*?)</script>', out, re.S).group(1))
+
+    def test_no_idle_rotation_remains(self):
+        js = ps.SCENE_JS
+        for gone in ("idle", "IDLE", "PERIOD", "animating(", "auto=", "var auto", "ph+=", "Math.sin(ph)", "SCENE_IDLE"):
+            self.assertNotIn(gone, js, gone)
+        self.assertFalse(hasattr(ps, "SCENE_IDLE"))
+        self.assertNotIn("idle", json.dumps(self.scene(self.page())["geom"]))
+        self.assertNotIn("idle", ps.SCENE_CSS.lower())
+        self.assertIn("e.key==='ArrowLeft'", js)  # rotation stays manual: drag and arrow keys
+        self.assertIn("cv.addEventListener('pointerdown'", js)
+
+    def test_focus_markup_and_button_cards(self):
+        out = self.page()
+        stage = out.split('id="stage"')[1].split("</div><p")[0]
+        self.assertIn('<aside class="fpanel" id="fpanel"', stage)  # the detail panel sits over the stage
+        self.assertIn("hidden", stage.split('id="fpanel"')[1].split(">")[0])
+        self.assertIn('id="fp-back"', stage)
+        self.assertIn(">Back</button>", stage)
+        for i in ('id="fp-title"', 'id="fp-body"'):
+            self.assertIn(i, stage)
+        js = ps.SCENE_JS
+        self.assertIn("d.createElement('button')", js)  # the cards are buttons: Tab and Enter work
+        self.assertIn("b.type='button';b.className='cd'", js)
+        self.assertIn("b.addEventListener('click',function(){fcard=i;enter(i);});", js)
+        self.assertIn("e.key==='Escape'&&fi>=0", js)
+        self.assertIn("fback.addEventListener('click'", js)
+        self.assertIn("else if(fi>=0&&!(f&&f.t===fi))leave();", js)  # a click on empty stage leaves
+        self.assertRegex(ps.SCENE_CSS, r"\.cd\{[^}]*cursor:pointer")
+        self.assertIn(".foc .cd{opacity:0;visibility:hidden", ps.SCENE_CSS)
+        for part in ("Top files", "Closed, not merged", "fp-prs"):
+            self.assertIn(part, js)
+        self.assertEqual(ps.SCENE_FOCUS_MS, 600)
+        self.assertEqual(ps.SCENE_FOCUS_FILL, 0.7)
+        geom = self.scene(out)["geom"]
+        self.assertEqual((geom["ms"], geom["fill"], geom["minSlot"]), (600, 0.7, 110))
+        self.assertIn("transform .6s cubic-bezier", ps.SCENE_CSS)
+        self.assertIn("Math.min(4,FILL*rh/(b[3]-b[2])", js)
+        # the SVG fallback has no focus markup of its own and shows the same one-row cards
+        self.assertEqual(out.count('<g class="callout">'), 3)
+
+    def test_areas_rows_link_to_the_tower(self):
+        out = self.page()
+        rows = re.findall(r'<li class="st" data-slug="([^"]+)"', out)
+        self.assertEqual(rows, [t["slug"] for t in self.scene(out)["towers"]])
+        self.assertEqual(out.count('class="track" role="button" tabindex="0"'), 3)
+        self.assertIn("tr=e.target.closest&&e.target.closest('.st .track')", ps.JS)
+        self.assertIn("fcs=sg;showPage('effort');write();sendFocus();", ps.JS)
+
+    def test_hash_focus_is_parsed_written_and_sent(self):
+        js = ps.JS
+        self.assertIn("else if(k==='focus'){fcs=v;}", js)
+        self.assertIn("if(fcs)p.push('focus='+encodeURIComponent(fcs));", js)
+        self.assertIn("d.addEventListener('prscan-focus-set'", js)
+        self.assertIn("new CustomEvent('prscan-focus',{detail:fcs})", js)
+
+    def test_per_tower_pr_numbers_per_range(self):
+        an = RangeTests().an()
+        expect = {"1h": {"merged": [10], "open": [1]}, "12h": {"merged": [10], "open": [1, 2]}, "24h": {"merged": [12, 10], "open": [1, 2]},
+                  "7d": {"merged": [13, 12, 10], "open": [1, 2, 3]}, "30d": {"merged": [13, 12, 10], "open": [1, 2, 3, 4]}}
+        for key, secs, rl in ps.RANGES:
+            sc = ps.effort_scene(ps.range_view(an, secs, NOW), rl=rl)
+            got_m, got_o = [], []
+            for t in sc["towers"]:
+                self.assertEqual(set(t["prs"]) - {k for k, _, _ in ps.SCENE_STATES}, set())
+                for k, nums in t["prs"].items():
+                    self.assertEqual(nums, sorted(nums, reverse=True))
+                    (got_m if k == "merged" else got_o).extend(nums)
+                for ly in t["layers"]:  # a list per state has as many numbers as the layer has PRs
+                    self.assertEqual(len(t["prs"][ly["k"]]), ly["n"])
+                self.assertEqual(sum(len(v) for k, v in t["prs"].items() if k != "merged"), t["open"])
+                self.assertEqual(len(t["prs"].get("merged", [])), t["merged"])
+            self.assertEqual((sorted(got_m, reverse=True), sorted(got_o)), (expect[key]["merged"], expect[key]["open"]), key)
+        data = self.scene(self.page(an))
+        self.assertEqual(sorted(n for t in data["ranges"]["1h"]["towers"] for n in t["prs"]["merged"]), [10])
+        self.assertEqual(sorted(n for t in data["ranges"]["30d"]["towers"] for n in t["prs"]["merged"]), [10, 12, 13])
+        self.assertEqual(sorted(n for t in data["towers"] for n in t["prs"]["merged"]), [10, 12, 13])  # the default range is 7 d
+        for t in data["towers"]:
+            self.assertEqual(t["slug"], ps.ROLLUP_SLUG if t["name"] == ps.ELSE_NAME else ps.slug(t["name"]) if not t["members"] else ps.slug(t["name"]))
+            self.assertLessEqual(len(t["files"]), 3)
+
+    def test_shared_title_map_is_escaped(self):
+        an = analysis_of({"A": 2})
+        an["prs"][0]["title"] = '</script><img src=x onerror=1>"&'
+        an["prs"][0]["author"] = "<b>me</b>"
+        an["prs"][0]["url"] = "javascript:alert(1)"
+        out = self.page(an)
+        block = re.search(r'id="scene-data">(.*?)</script>', out, re.S).group(1)
+        self.assertNotIn("<", block)  # nothing can close the script block
+        titles = json.loads(block)["titles"]
+        n = str(an["prs"][0]["number"])
+        self.assertEqual(titles[n][0], "&lt;/script&gt;&lt;img src=x onerror=1&gt;&quot;&amp;")
+        self.assertEqual(titles[n][2], "&lt;b&gt;me&lt;/b&gt;")
+        self.assertEqual(titles[n][1], "#")  # not a GitHub link
+        self.assertEqual(titles[str(an["prs"][1]["number"])][1], "https://github.com/o/r/pull/%d" % an["prs"][1]["number"])
+        self.assertEqual(len(titles), 2)  # one entry per PR, however many ranges list it
+        self.assertEqual(sum(block.count('"%s":[' % n) for n in titles), 2)
+        # every title the panel prints comes from this map (markup) and every other string goes through esc()
+        self.assertIn("e[0]+'</li>'", ps.SCENE_JS)
+        self.assertIn("esc(l.label)", ps.SCENE_JS)
+        self.assertIn("esc(f[0])", ps.SCENE_JS)
+        self.assertIn("esc(t.name)", ps.SCENE_JS)
+
+    @unittest.skipUnless(jsc_available(), "jsc not available")
+    def test_inline_scripts_parse_in_jsc(self):
+        out = self.page()
+        for src in re.findall(r"<script>(.*?)</script>", out, re.S)[1:]:
+            self.assertEqual(jsc_run("function __chk(){" + src + "}\nprint('ok');").strip(), "ok")
+
+    @unittest.skipUnless(jsc_available(), "jsc not available")
+    def test_focus_round_trips_through_the_hash_in_jsc(self):
+        out = self.page()
+        sl = [t["slug"] for t in self.scene(out)["towers"]]
+        tail = r"""
+var SC=JSON.parse(byId['scene-data'].textContent),SL=SC.towers.map(function(t){return t.slug;}),res={};
+function st(){return{foc:stage.classList.contains('foc'),hidden:byId.fpanel.hidden,on:byId.fpanel.classList.contains('on'),title:byId['fp-title'].textContent,hash:location.hash,attr:doc.documentElement.getAttribute('data-focus')};}
+res.nameOfSlug0=SC.towers[0].name;res.nameOfSlug1=SC.towers[1].name;
+res.cards=cards().length;res.cardTag=cards()[0].tag;res.cardType=cards()[0].type;
+res.start=st();res.startFrames=frames();
+fire(doc,{type:'keydown',key:'Escape'});res.esc=st();res.escFrames=frames();res.escAfter=st();
+fire(cards().filter(function(c){return c.getAttribute('data-i')==='1';})[0],{type:'click'});res.click=st();res.clickFrames=frames();res.clickAfter=st();
+fire(byId['fp-back'],{type:'click'});res.back=st();res.backFrames=frames();res.backAfter=st();
+res.rest=frames();
+location.hash='#focus='+SL[0];fire(window,{type:'hashchange'});frames();res.hc=st();
+location.hash='#range=30d&focus='+SL[0];fire(window,{type:'hashchange'});frames();res.range=st();
+fire(doc,{type:'keydown',key:'Escape'});frames();res.end=st();
+var li={getAttribute:function(){return SL[2];}},tr={closest:function(q){return q==='.st .track'?tr:li;}};
+fire(doc,{type:'click',target:tr});frames();res.bar=st();
+fire(doc,{type:'keydown',key:'Escape'});frames();
+location.hash='#focus=nonsense';fire(window,{type:'hashchange'});frames();res.bad=st();
+print(JSON.stringify(res));
+"""
+        res = json.loads(jsc_run(ps.JS + "\n" + ps.SCENE_JS, tail, html=out, hash_="#focus=" + sl[1]).strip().splitlines()[-1])
+        self.assertEqual((res["cards"], res["cardTag"], res["cardType"]), (3, "button", "button"))
+        # loaded with focus=<slug>: focused straight away (no animation), panel open, attribute set
+        self.assertTrue(res["start"]["foc"] and not res["start"]["hidden"] and res["start"]["on"])
+        self.assertEqual(res["start"]["title"], res["nameOfSlug1"])
+        self.assertEqual(res["start"]["attr"], sl[1])
+        # Esc leaves: the hash loses focus=, the panel hides after the reverse animation
+        self.assertEqual(res["esc"]["hash"], "")
+        self.assertFalse(res["esc"]["foc"] or res["esc"]["on"])
+        self.assertTrue(res["escAfter"]["hidden"])
+        self.assertGreater(res["escFrames"]["drawn"], 5)  # a real transition, not a jump
+        # a click on a card focuses its tower and writes focus=<slug>
+        self.assertEqual(res["click"]["hash"], "#focus=" + sl[1])
+        self.assertTrue(res["click"]["foc"] and not res["click"]["hidden"])
+        self.assertEqual(res["clickAfter"]["title"], res["nameOfSlug1"])
+        self.assertGreater(res["clickFrames"]["drawn"], 5)
+        self.assertEqual(res["backAfter"]["hash"], "")  # Back leaves too
+        self.assertTrue(res["backAfter"]["hidden"])
+        self.assertEqual(res["rest"]["raf"], 0)  # nothing is scheduled at rest: no loop
+        # the hash drives the focus: a hashchange focuses; a range change keeps the focus on a tower that is still there
+        self.assertEqual(res["hc"]["title"], res["nameOfSlug0"])
+        self.assertEqual(res["range"]["title"], res["nameOfSlug0"])
+        self.assertEqual(res["range"]["hash"], "#range=30d&focus=" + sl[0])
+        self.assertFalse(res["end"]["foc"])
+        self.assertEqual(res["end"]["hash"], "#range=30d")
+        self.assertEqual(res["bar"]["hash"], "#range=30d&focus=" + sl[2])  # a bar on the Areas page focuses its tower
+        self.assertTrue(res["bar"]["foc"])
+        self.assertFalse(res["bad"]["foc"])  # an unknown slug focuses nothing
+
+    @unittest.skipUnless(jsc_available(), "jsc not available")
+    def test_click_on_a_tower_focuses_and_empty_stage_leaves_in_jsc(self):
+        out = self.page()
+        rec = r"""
+var cur=[],prev=[],mm=[1,0,0,1,0,0];
+ctx.setTransform=function(a,b,c,d,e,f){mm=[a,b,c,d,e,f];};
+ctx.clearRect=function(){prev=cur;cur=[];};  // the layer is cleared, drawn, then the composite is cleared
+ctx.fillRect=function(x,y,w,h){cur.push({m:mm.slice(),r:[x,y,w,h]});};
+"""
+        tail = r"""
+var res={};frames();
+var o=prev.filter(function(x){return x.r[2]===1&&x.r[3]>1;})[3],m=o.m,cx=o.r[0]+.5,cy=o.r[1]+o.r[3]/2,px=(m[0]*cx+m[2]*cy+m[4])/2,py=(m[1]*cx+m[3]*cy+m[5])/2,cv=stage.children[0];
+function click(x,y){fire(cv,{type:'pointerdown',clientX:x,clientY:y});fire(cv,{type:'pointerup',clientX:x,clientY:y});frames();}
+click(px,py);res.in={foc:stage.classList.contains('foc'),hash:location.hash};
+click(2,H0-2);res.out={foc:stage.classList.contains('foc'),hash:location.hash};
+fire(cv,{type:'pointerdown',clientX:px,clientY:py});fire(cv,{type:'pointermove',clientX:px+40,clientY:py});fire(cv,{type:'pointerup',clientX:px+40,clientY:py});frames();
+res.drag=stage.classList.contains('foc');
+print(JSON.stringify(res));
+"""
+        res = json.loads(jsc_run(rec + ps.JS + "\n" + ps.SCENE_JS, tail, html=out).strip().splitlines()[-1])
+        self.assertTrue(res["in"]["foc"])
+        self.assertRegex(res["in"]["hash"], r"^#focus=area-")
+        self.assertFalse(res["out"]["foc"])
+        self.assertEqual(res["out"]["hash"], "")
+        self.assertFalse(res["drag"])  # a drag pans, it does not focus
+
+    @unittest.skipUnless(jsc_available(), "jsc not available")
+    def test_reduced_motion_jumps_straight_to_the_end_state_in_jsc(self):
+        out = self.page()
+        pre = "function matchMedia(){return{matches:true};}\nwindow.matchMedia=matchMedia;\n"
+        tail = r"""
+var res={};frames();
+fire(cards()[0],{type:'click'});var f=frames();
+res.in={foc:stage.classList.contains('foc'),on:byId.fpanel.classList.contains('on'),drawn:f.drawn,raf:f.raf,hash:location.hash};
+fire(doc,{type:'keydown',key:'Escape'});var g=frames();
+res.out={foc:stage.classList.contains('foc'),hidden:byId.fpanel.hidden,drawn:g.drawn,hash:location.hash};
+print(JSON.stringify(res));
+"""
+        res = json.loads(jsc_run(pre + ps.JS + "\n" + ps.SCENE_JS, tail, html=out).strip().splitlines()[-1])
+        self.assertTrue(res["in"]["foc"] and res["in"]["on"])
+        self.assertEqual(res["in"]["drawn"], 1)  # one frame: no transition
+        self.assertTrue(res["in"]["hash"].startswith("#focus="))
+        self.assertFalse(res["out"]["foc"])
+        self.assertTrue(res["out"]["hidden"])
+        self.assertEqual((res["out"]["drawn"], res["out"]["hash"]), (1, ""))
 
 
 class ClusterLabelTests(unittest.TestCase):
@@ -1591,7 +1976,6 @@ class NavFontTests(unittest.TestCase):
         self.assertNotIn("Condensed", out)
         self.assertIn("Anton,Impact", ps.CSS)
         self.assertIn("font:400 15px/1.45 Roboto", ps.CSS)  # body text stays Roboto
-        self.assertIn("Anton", ps.SCENE_JS)  # tower callout names on the canvas
         self.assertIn("Anton", ps.SCENE_CSS)
 
     def test_no_scene_caption_but_legend_stays(self):

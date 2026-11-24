@@ -469,3 +469,31 @@ Keep every version of ivall/xcl even if upstream or the whole fork network is ta
 - **Text never touches** a border, rule or colour bar. The duplicate group's left colour bar gets 14 px of space before its text.
 - Line-height is at least 1.35 for body text in lists.
 - The viewport fit stays: when space is tight, fonts and gaps shrink through `clamp()` before padding falls below the minimums above.
+
+### Non-crossing callouts, manual rotation only, click-to-focus tower (user request, 2026-11-24)
+- **Callout cards in one row, ordered by on-screen tower position:**
+  - At every yaw, the towers' projected top-centre x is computed, and the cards are laid out left to right in that order across the full panel width, with equal slots.
+  - Each leader line runs from the card's bottom centre to its tower top.
+  - Because the order matches, no two leader lines cross.
+  - Cards are re-ordered with a short ease when a pan changes the order.
+  - When a slot is under about 110 px wide, the cards switch to compact mode (name and open count only), still in one row.
+  - The SVG fallback uses the same algorithm at the default yaw.
+  - A test checks that the leader segments never intersect, over a sweep of yaws within the ±90° arc.
+- **No auto-rotation:** the idle ease and spin are removed. Rotation is manual only, by drag and arrow keys.
+- **Click to focus a tower:**
+  - Triggers: clicking a tower or its callout card. Cards become `<button>`s, so Tab plus Enter also works. Clicking an area row's bar on the Areas page switches to Effort and focuses that tower.
+  - Animation, about 600 ms ease-out, done in our own canvas code:
+    1. the camera pans and zooms so the tower is centred and fills about 70% of the stage height;
+    2. the other towers fade to faint ghosts;
+    3. the focused tower's state layers separate vertically ("exploded" view) with small gaps, each with a side label "Merged in 7 d · 40", "Looks done · 32", and so on.
+  - A detail panel slides in over the right part of the stage, on the surface background. It shows:
+    - the area name and member areas;
+    - per-state counts for the current range;
+    - the top 3 files;
+    - the PRs grouped by state (number, title and a link), with their own scroll.
+  - Leaving focus: Esc, a "Back" button, or a click on empty stage plays the reverse animation.
+  - Under reduced motion there is no animation: the view switches straight to the end state.
+  - Focus state goes in the hash as `focus=<slug>`, so a focused view can be linked.
+  - It follows the time range: changing the range while focused updates the counts and the list.
+- **Data:** the per-range scene data carries, for each tower, the PR numbers per state. Titles come from a single shared `{number: [title, url, author]}` map in the JSON, escaped, so they are not duplicated per range.
+- Performance stays the same: no animation loop at rest, and drawing only during the focus transition or a pan.
