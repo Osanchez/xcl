@@ -451,16 +451,80 @@ class TopAreaTests(unittest.TestCase):
         self.assertEqual(ps.top_areas(analysis_of({}), 6), [])
 
     def test_standings_use_top_and_filters_keep_all(self):
-        an = analysis_of({"A%d" % i: 10 - i for i in range(8)})
+        an = analysis_of({"A%d" % i: 10 - i for i in range(9)})
         out = ps.render_html(an, "o/r", NOW)
         st = out.split('class="a-standings"')[1].split("</section>")[0]
-        self.assertEqual(st.count('<li class="st">'), 7)
+        self.assertEqual(st.count('<li class="st">'), 8)
         self.assertIn("Everything else", st)
-        self.assertIn("2 areas: A6, A7", st)
+        self.assertIn("2 areas: A7, A8", st)
         sel = out.split('<select id="area">')[1].split("</select>")[0]
-        for i in range(8):
+        for i in range(9):
             self.assertIn(">A%d (" % i, sel)
         self.assertNotIn('class="chip"', out)
+
+
+class GroupTests(unittest.TestCase):
+    CORE = ["kernelx", "xcl run", "Runtime", "VFS", "TLS", "PE loader", "Memory"]
+    TOOLING = ["Scripts", "CI", "README", "Docs"]
+
+    def test_membership(self):
+        for a in self.CORE:
+            self.assertEqual(ps.group_of(a), "Core runtime", a)
+        for a in self.TOOLING:
+            self.assertEqual(ps.group_of(a), "Tooling", a)
+        for a in ("Recompiler", "D3D12.X", "Tests/e2e", "XGameRuntime", "HLE", "GPU", "Other", "XAudio2", "Input", "Shaders"):
+            self.assertEqual(ps.group_of(a), a, a)
+        self.assertEqual(ps.TOP_AREAS, 7)
+
+    def test_top_7_ranking_with_groups(self):
+        counts = {"Recompiler": 30, "D3D12.X": 28, "kernelx": 6, "VFS": 5, "TLS": 4, "Memory": 3, "Scripts": 8, "CI": 4, "Docs": 3,
+                  "Tests/e2e": 12, "XGameRuntime": 11, "HLE": 10, "GPU": 9, "Input": 2, "Other": 1}
+        t = ps.top_areas(analysis_of(counts))
+        self.assertEqual([(e["name"], len(e["prs"])) for e in t],
+                         [("Recompiler", 30), ("D3D12.X", 28), ("Core runtime", 18), ("Tooling", 15), ("Tests/e2e", 12),
+                          ("XGameRuntime", 11), ("HLE", 10), (ps.ELSE_NAME, 12)])
+        self.assertEqual(t[2]["members"], ["kernelx", "VFS", "TLS", "Memory"])  # only member areas with PRs, ranked
+        self.assertEqual(t[3]["members"], ["Scripts", "CI", "Docs"])
+        self.assertIsNone(t[0]["members"])
+
+    def test_everything_else_contents(self):
+        counts = {"Recompiler": 30, "D3D12.X": 28, "kernelx": 6, "VFS": 5, "Scripts": 8, "Tests/e2e": 12, "XGameRuntime": 11,
+                  "HLE": 10, "GPU": 9, "Input": 2, "Other": 1, "README": 1}
+        t = ps.top_areas(analysis_of(counts))
+        self.assertEqual([e["name"] for e in t][:-1], ["Recompiler", "D3D12.X", "Tests/e2e", "Core runtime", "XGameRuntime", "HLE", "GPU"])
+        last = t[-1]
+        self.assertEqual(last["name"], ps.ELSE_NAME)
+        self.assertEqual(last["members"], ["Scripts", "Input", "Other", "README"])
+        self.assertEqual(len(last["prs"]), 8 + 2 + 1 + 1)
+
+    def test_a_group_can_land_in_everything_else_as_its_member_areas(self):
+        counts = {"A%d" % i: 20 - i for i in range(7)}
+        counts.update({"Docs": 2, "README": 1})
+        t = ps.top_areas(analysis_of(counts))
+        self.assertEqual(t[-1]["members"], ["Docs", "README"])
+        self.assertEqual(t[-1]["name"], ps.ELSE_NAME)
+        self.assertNotIn("Tooling", [e["name"] for e in t])
+
+    def test_other_label(self):
+        self.assertEqual(ps.area_label("Other"), "Other (unmapped paths)")
+        self.assertEqual(ps.area_label("VFS"), "VFS")
+        out = ps.render_html(analysis_of({"Other": 2, "A": 1}), "o/r", NOW)
+        self.assertIn("Other (unmapped paths)", out)
+        self.assertNotIn(">Other<", out)
+
+    def test_select_optgroups_and_member_filter(self):
+        out = ps.render_html(analysis_of({"Recompiler": 9, "kernelx": 4, "VFS": 3, "Scripts": 2}), "o/r", NOW)
+        sel = out.split('<select id="area">')[1].split("</select>")[0]
+        self.assertIn('<optgroup label="Core runtime"><option value="%s" data-members="%s,%s">All Core runtime (7)</option>' % (
+            ps.slug("Core runtime"), ps.slug("kernelx"), ps.slug("VFS")), sel)
+        self.assertIn('<option value="%s">kernelx (4)</option>' % ps.slug("kernelx"), sel)
+        self.assertIn('<option value="%s">VFS (3)</option>' % ps.slug("VFS"), sel)
+        self.assertIn('<optgroup label="Tooling">', sel)
+        # the filter on one member area: rows carry the area slug, the option has no data-members, so only that area matches
+        self.assertEqual(out.count('class="row pr" data-area="%s"' % ps.slug("kernelx")), 4)
+        self.assertNotIn('value="%s" data-members' % ps.slug("kernelx"), sel)
+        self.assertIn("a===st.area", ps.JS)
+        self.assertIn("data-members", ps.JS)  # a group option matches any of its members
 
 
 class ToolbarTests(unittest.TestCase):
@@ -471,17 +535,17 @@ class ToolbarTests(unittest.TestCase):
         return out.split('<select id="area">')[1].split("</select>")[0]
 
     def test_select_lists_every_area_once(self):
-        counts = {"A%d" % i: 10 - i for i in range(9)}
+        counts = {"A%d" % i: 12 - i for i in range(10)}
         out = self.page(counts)
         sel = self.select(out)
         self.assertTrue(sel.startswith('<option value="">All areas</option>'))
         for a in counts:
             self.assertEqual(sel.count('value="%s"' % ps.slug(a)), 1, a)
-        self.assertEqual(sel.count("<option "), 1 + 6 + 1 + 3)  # All, top 6, Everything else, the 3 inside it
-        self.assertIn('value="%s" data-members="%s"' % (ps.slug(ps.ELSE_NAME), ",".join(ps.slug(a) for a in ("A6", "A7", "A8"))), sel)
+        self.assertEqual(sel.count("<option "), 1 + 7 + 1 + 3)  # All, top 7, "All Everything else", the 3 inside it
+        self.assertIn('value="%s" data-members="%s"' % (ps.slug(ps.ELSE_NAME), ",".join(ps.slug(a) for a in ("A7", "A8", "A9"))), sel)
         grp = sel.split("<optgroup")[1]
-        self.assertEqual(grp.count("<option "), 3)
-        self.assertLess(sel.index('value="%s"' % ps.slug("A5")), sel.index(ps.slug(ps.ELSE_NAME)))
+        self.assertEqual(grp.count("<option "), 4)
+        self.assertLess(sel.index('value="%s"' % ps.slug("A6")), sel.index(ps.slug(ps.ELSE_NAME)))
 
     def test_select_without_rollup(self):
         sel = self.select(self.page({"A": 2, "B": 1}))
@@ -722,9 +786,9 @@ class SceneTests(unittest.TestCase):
             self.assertIn("--%s:%s;" % (name, b), dark)
             self.assertNotEqual(a, b)
         tok = {n: (a, b) for n, a, b in ps.GRADIENT_TOKENS}
-        self.assertEqual([tok["dusk-%d" % i][0] for i in (1, 2, 3, 4)], ["#ffd8a8", "#ff9f80", "#e9849c", "#b39ddb"])
-        self.assertEqual([tok["dusk-%d" % i][1] for i in (1, 2, 3, 4)], ["#3b2a5a", "#5a2f55", "#2a1f3d", "#0e1219"])
-        self.assertEqual(tok["surface"], ("rgba(255,255,255,.78)", "rgba(14,18,25,.74)"))
+        self.assertEqual([tok["dusk-%d" % i][0] for i in (1, 2, 3, 4)], ["#ffb000", "#ff5e3a", "#e0307a", "#6a35c9"])
+        self.assertEqual([tok["dusk-%d" % i][1] for i in (1, 2, 3, 4)], ["#ff7a1a", "#c2185b", "#4a148c", "#120b2e"])
+        self.assertEqual(tok["surface"], ("rgba(255,255,255,.9)", "rgba(14,18,25,.7)"))
         out = ps.render_html(analysis_of({"A": 1}), "o/r", NOW)
         self.assertIn(":root[data-theme=dark]{color-scheme:dark;" + dark.split(";")[0], out)
         self.assertIn("linear-gradient(180deg,var(--dusk-1),var(--dusk-2),var(--dusk-3),var(--dusk-4))", out)

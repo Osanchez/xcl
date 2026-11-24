@@ -59,6 +59,10 @@ AREA_TABLE = [
     (re.compile(SRC), "Runtime"),
 ]
 OTHER = "Other"
+OTHER_LABEL = "Other (unmapped paths)"
+# Areas shown together as one tower / standings row; a PR's group comes from its primary area.
+AREA_GROUPS = [("Core runtime", ("kernelx", "xcl run", "Runtime", "VFS", "TLS", "PE loader", "Memory")),
+               ("Tooling", ("Scripts", "CI", "README", "Docs"))]
 ALL_AREAS = [a for _, a in AREA_TABLE] + [OTHER]
 _TITLE_ALIASES = {a.lower(): a for a in ALL_AREAS}
 _TITLE_ALIASES.update({"tests": TESTS_AREA, "e2e": TESTS_AREA, "ci": "CI"})
@@ -75,6 +79,18 @@ def area_for_path(path):
         if rx.search(path):
             return area
     return OTHER
+
+
+def group_of(area):
+    """The group an area belongs to, or the area itself when it is ungrouped."""
+    for name, members in AREA_GROUPS:
+        if area in members:
+            return name
+    return area
+
+
+def area_label(area):
+    return OTHER_LABEL if area == OTHER else area
 
 
 def title_prefix_area(title):
@@ -610,9 +626,9 @@ def category_css():
 
 # Page tokens (light, dark): the fixed sunset gradient, top to bottom, and the translucent surface of panels, top bar
 # and callouts. The scene itself has no backdrop: the canvas is transparent and sits on this gradient.
-GRADIENT_TOKENS = [("dusk-1", "#ffd8a8", "#3b2a5a"), ("dusk-2", "#ff9f80", "#5a2f55"),
-                   ("dusk-3", "#e9849c", "#2a1f3d"), ("dusk-4", "#b39ddb", "#0e1219"),
-                   ("surface", "rgba(255,255,255,.78)", "rgba(14,18,25,.74)")]
+GRADIENT_TOKENS = [("dusk-1", "#ffb000", "#ff7a1a"), ("dusk-2", "#ff5e3a", "#c2185b"),
+                   ("dusk-3", "#e0307a", "#4a148c"), ("dusk-4", "#6a35c9", "#120b2e"),
+                   ("surface", "rgba(255,255,255,.9)", "rgba(14,18,25,.7)")]
 _LIGHT_SCENE = "".join("--%s:%s;" % (n, a) for n, a, _ in GRADIENT_TOKENS)
 _DARK_SCENE = "".join("--%s:%s;" % (n, b) for n, _, b in GRADIENT_TOKENS)
 _LIGHT_CAT, _DARK_CAT = category_css()
@@ -854,9 +870,9 @@ def stat(label, value, delta=None, show_delta=True, cls=""):
 
 
 def ptype(area, link=False):
-    inner = '<i></i><span class="nm">%s</span>' % esc(area)
+    inner = '<i></i><span class="nm">%s</span>' % esc(area_label(area))
     if link:
-        inner = '<a class="ptype" title="%s" href="#area=%s">%s</a>' % (esc(area), esc(urllib.parse.quote(slug(area), safe="-")), inner)
+        inner = '<a class="ptype" title="%s" href="#area=%s">%s</a>' % (esc(area_label(area)), esc(urllib.parse.quote(slug(area), safe="-")), inner)
         return '<span style="%s">%s</span>' % (cat_style(area), inner)
     return '<span class="ptype" style="%s">%s</span>' % (cat_style(area), inner)
 
@@ -899,7 +915,7 @@ def cat_style(area):
 
 # ---- top areas and the effort map
 
-TOP_AREAS = 6
+TOP_AREAS = 7
 ELSE_NAME = "Everything else"
 SCENE_CAP = 40          # tallest tower in layers; above it the layers are scaled
 SCENE_W, SCENE_H = 720, 520   # viewBox of the static SVG
@@ -919,14 +935,24 @@ SCENE_STATES = [("done", "Looks done", "--good"), ("rev", "Reviewed", "--accent"
 
 
 def top_areas(an, n=TOP_AREAS):
-    """The n areas with the most open PRs (ties by name) as [{"name", "prs", "members"}], plus one rolled-up
-    "Everything else" entry (members = the areas in it, sorted like the ranking) when there are more than n areas.
-    members is None for a real area."""
-    ranked = sorted(an["areas"], key=lambda a: (-len(an["areas"][a]), a))
-    out = [{"name": a, "prs": an["areas"][a], "members": None} for a in ranked[:n]]
-    rest = ranked[n:]
+    """The n groups or ungrouped areas with the most open PRs (ties by name) as [{"name", "prs", "members"}], plus one
+    rolled-up "Everything else" entry (members = the areas in it, sorted like the area ranking) when there are more
+    than n. members is None for an ungrouped area and the member areas that have open PRs for a group."""
+    by_key = {}
+    for a in an["areas"]:
+        by_key.setdefault(group_of(a), []).append(a)
+    grouped = {name for name, _ in AREA_GROUPS}
+    rank = lambda a: (-len(an["areas"][a]), a)
+    entries = []
+    for key, areas in by_key.items():
+        areas = sorted(areas, key=rank)
+        entries.append({"name": key, "prs": [p for a in areas for p in an["areas"][a]],
+                        "members": areas if key in grouped else None})
+    entries.sort(key=lambda e: (-len(e["prs"]), e["name"]))
+    out, rest = entries[:n], entries[n:]
     if rest:
-        out.append({"name": ELSE_NAME, "prs": [p for a in rest for p in an["areas"][a]], "members": rest})
+        members = sorted((a for e in rest for a in (e["members"] or [e["name"]])), key=rank)
+        out.append({"name": ELSE_NAME, "prs": [p for e in rest for p in e["prs"]], "members": members})
     return out
 
 
@@ -946,7 +972,7 @@ def effort_scene(an, n=TOP_AREAS, cap=SCENE_CAP):
             if c:
                 layers.append({"k": k, "label": label, "n": c, "ghost": k in SCENE_GHOST,
                                "h": c if factor == 1.0 else max(1, round(c * factor))})
-        towers.append({"name": e["name"], "members": e["members"] or [], "open": len(ps),
+        towers.append({"name": area_label(e["name"]), "members": e["members"] or [], "open": len(ps),
                        "unreviewed": sum(bool(p["unreviewed"]) for p in ps),
                        "add": sum(p.get("additions", 0) for p in ps), "del": sum(p.get("deletions", 0) for p in ps),
                        "layers": layers, "height": sum(ly["h"] for ly in layers)})
@@ -1218,7 +1244,7 @@ function rgb(c){return'rgb('+c[0]+','+c[1]+','+c[2]+')';}
 function rgba(c,a){return'rgba('+c[0]+','+c[1]+','+c[2]+','+a+')';}
 function readColors(){var cs=getComputedStyle(d.documentElement);function v(n){return hex(cs.getPropertyValue(n));}
 var ink=v('--ink');
-col={ink:rgb(ink),page:rgb(v('--page')),soft:rgb(v('--soft')),good:rgb(v('--good')),bad:rgb(v('--bad')),st:{},surface:(cs.getPropertyValue('--surface')||'').trim()||'rgba(255,255,255,.78)',plate:rgba(ink,.07),plateEdge:rgba(ink,.2)};
+col={ink:rgb(ink),page:rgb(v('--page')),soft:rgb(v('--soft')),good:rgb(v('--good')),bad:rgb(v('--bad')),st:{},surface:(cs.getPropertyValue('--surface')||'').trim()||'rgba(255,255,255,.9)',plate:rgba(ink,.07),plateEdge:rgba(ink,.2)};
 var W3=[255,255,255],B3=[0,0,0];
 S.forEach(function(s){var c=v(s.v);col.st[s.k]={ghost:!!s.ghost,c:rgb(c),g:rgba(c,.16),gh:rgba(c,.2),l:rgb(c),t:rgb(mix(c,W3,.32)),r:rgb(mix(c,B3,.34)),
 ht:rgb(mix(c,W3,.6)),hl:rgb(mix(c,W3,.38)),hr:rgb(mix(c,W3,.16))};});}
@@ -1376,16 +1402,14 @@ def render_html(an, repo, now, hist=None):
         return '<a href="%s">#%d</a> %s' % (esc(safe_url(p["url"])), p["number"], esc(p["title"]))
 
     o = []
-    ranked_top = [e for e in top if not e["members"]]
-    else_entry = next((e for e in top if e["members"]), None)
     area_opts = ['<option value="">All areas</option>']
-    for e in ranked_top:
-        area_opts.append('<option value="%s">%s (%d)</option>' % (esc(slug(e["name"])), esc(e["name"]), len(e["prs"])))
-    if else_entry:
-        area_opts.append('<option value="%s" data-members="%s">%s (%d)</option>' % (
-            esc(slug(ELSE_NAME)), esc(",".join(slug(m) for m in else_entry["members"])), esc(ELSE_NAME), len(else_entry["prs"])))
-        area_opts.append('<optgroup label="Areas inside Everything else">%s</optgroup>' % "".join(
-            '<option value="%s">%s (%d)</option>' % (esc(slug(m)), esc(m), len(an["areas"][m])) for m in else_entry["members"]))
+    for e in top:
+        if not e["members"]:
+            area_opts.append('<option value="%s">%s (%d)</option>' % (esc(slug(e["name"])), esc(area_label(e["name"])), len(e["prs"])))
+            continue
+        area_opts.append('<optgroup label="%s"><option value="%s" data-members="%s">All %s (%d)</option>%s</optgroup>' % (
+            esc(e["name"]), esc(slug(e["name"])), esc(",".join(slug(m) for m in e["members"])), esc(e["name"]), len(e["prs"]),
+            "".join('<option value="%s">%s (%d)</option>' % (esc(slug(m)), esc(area_label(m)), len(an["areas"][m])) for m in e["members"])))
     toolbar = ('<div class="toolbar" id="filters" role="search"><label class="vh" for="q">Search pull requests</label>'
                '<input id="q" type="search" placeholder="Search title, number, author or path" autocomplete="off">'
                '<label class="vh" for="area">Area</label><select id="area">%s</select>'
@@ -1463,9 +1487,9 @@ def render_html(an, repo, now, hist=None):
         ma = members or [a]
         series = downsample([sum(s["areas"].get(m, 0) for m in ma) for s in spark_hist if s["open"] == 0 or s["areas"]], 48)
         who = (ptype(a, link=True) if not members else '<span class="ptype" style="--ac:var(--soft)" title="%s"><i></i><span class="nm">%s</span></span>' % (
-            esc(", ".join(members)), esc(a)))
+            esc(", ".join(area_label(m) for m in members)), esc(a)))
         sub = (" · ".join("%d %s" % (cnt[k], n.lower()) for k, n in BUCKETS if cnt[k]) if not members else
-               "%d areas: %s" % (len(members), ", ".join(members)))
+               "%d areas: %s" % (len(members), ", ".join(area_label(m) for m in members)))
         o.append('<li class="st"><span class="rank">%d</span><div class="who"><b>%s</b><small title="%s">%s</small></div>'
                  '<span class="track"><span class="fill" style="width:%.1f%%">%s</span></span>'
                  '<div class="where"><b>%d</b>%s</div></li>' % (
@@ -1532,7 +1556,7 @@ def render_html(an, repo, now, hist=None):
                 '<div><div class="ttl">%s%s</div><div class="sys">%s<span>%dd</span>'
                 '<span><span class="add">+%d</span> <span class="del">&minus;%d</span></span><span>%s files</span></div></div></div>' % (
                     esc(slug(a)), bool(p["isDraft"]), p["unreviewed"], p["looksDone"], esc(q), avatar(p["author"]),
-                    pr_line(p), ' <span class="small">(also %s)</span>' % esc(", ".join(also)) if also else "",
+                    pr_line(p), ' <span class="small">(also %s)</span>' % esc(", ".join(area_label(x) for x in also)) if also else "",
                     state_pills(p), p["ageDays"], p["additions"], p["deletions"], esc(pr_files_note(p))))
         allp.append('<details class="area" id="%s"><summary>%s <span class="cnt">%d</span></summary>%s</details>' % (
             esc(slug(a)), ptype(a), len(ps), "".join(rows)))
@@ -1596,7 +1620,7 @@ def render_md(an, repo, now, hist=None):
         ps = an["areas"][a]
         c = [sum(bucket(p) == k for p in ps) for k, _ in BUCKETS]
         o.append("| [%s](#%s) | %d | %d | %d | %d | %d | %d | %d |" % (
-            md_esc(a), slug(a), len(ps), c[0], c[1], c[2], c[3], sum(p["additions"] for p in ps), sum(p["deletions"] for p in ps)))
+            md_esc(area_label(a)), slug(a), len(ps), c[0], c[1], c[2], c[3], sum(p["additions"] for p in ps), sum(p["deletions"] for p in ps)))
     o += ["", "## Possible duplicate work", ""]
     if not an["clusters"]:
         o += ["None.", ""]
@@ -1615,7 +1639,7 @@ def render_md(an, repo, now, hist=None):
     o += ["", "## All PRs by area", ""]
     for a in areas:
         ps = sorted(an["areas"][a], key=lambda p: p["number"])
-        o += ['<a id="%s"></a>' % slug(a), "", "### %s (%d)" % (md_esc(a), len(ps)), ""] + head + [prow(p) for p in ps] + [""]
+        o += ['<a id="%s"></a>' % slug(a), "", "### %s (%d)" % (md_esc(area_label(a)), len(ps)), ""] + head + [prow(p) for p in ps] + [""]
     stale = [p for p in prs if p["stale"]]
     o += ["## Stale", "", "No update in %d days or more." % STALE_DAYS, ""]
     o += (head + [prow(p) for p in sorted(stale, key=lambda p: p["number"])]) if stale else ["None."]

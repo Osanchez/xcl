@@ -385,3 +385,16 @@ Keep every version of ivall/xcl even if upstream or the whole fork network is ta
   - The idle motion is a slow ease back and forth inside the arc. There is no idle motion under reduced motion, and it stops after user input.
 - **Zoom:** the scene is drawn about 15% smaller than it fits now (scale ×0.85), centred.
 - Everything else stays: the fit-to-viewport layout, the toolbar, the performance work and the data rules.
+
+### Area groups and vibrant sunset (user choices, 2026-11-24)
+- **Groups**, used by the effort map, the standings and the Area select's top section:
+  - Core runtime = kernelx, xcl run, Runtime, VFS, TLS, PE loader, Memory;
+  - Tooling = Scripts, CI, README, Docs.
+  - A PR's group comes from its primary area.
+  - The featured towers are the groups and ungrouped areas ranked by open PRs: Recompiler, D3D12.X, Core runtime, Tooling, Tests/e2e, XGameRuntime, HLE (top 7). The rest go into "Everything else".
+  - The Area select keeps every individual area, in an optgroup under each group, so a member area can still be filtered alone.
+  - "Other" is labelled "Other (unmapped paths)" in lists.
+- **Sunset stops, top to bottom:**
+  - light: gold `#ffb000` → hot orange `#ff5e3a` → magenta `#e0307a` → violet `#6a35c9`;
+  - dark: `#ff7a1a` → `#c2185b` → `#4a148c` → `#120b2e`.
+  - The panel surface alpha is tuned so all text keeps WCAG AA on every stop; the contrast test covers the new stops.
