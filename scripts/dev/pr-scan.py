@@ -624,11 +624,13 @@ def category_css():
     return light, dark
 
 
-# Page tokens (light, dark): the fixed sunset gradient, top to bottom, and the translucent surface of panels, top bar
-# and callouts. The scene itself has no backdrop: the canvas is transparent and sits on this gradient.
-GRADIENT_TOKENS = [("dusk-1", "#ffb000", "#ff7a1a"), ("dusk-2", "#ff5e3a", "#c2185b"),
-                   ("dusk-3", "#e0307a", "#4a148c"), ("dusk-4", "#6a35c9", "#120b2e"),
-                   ("surface", "rgba(255,255,255,.9)", "rgba(14,18,25,.7)")]
+# Page tokens (light, dark). Light is a plain white page with flat white panels and rule lines. Dark sits on the fixed
+# sunset gradient (SUNSET_DARK, top to bottom) with a translucent surface for panels, top bar and callouts. The scene
+# itself has no backdrop: the canvas is transparent.
+SUNSET_DARK = ("#ff7a1a", "#c2185b", "#4a148c", "#120b2e")
+GRADIENT_TOKENS = [("sky", "none", "linear-gradient(180deg," + ",".join(SUNSET_DARK) + ")"),
+                   ("surface", "#fff", "rgba(14,18,25,.7)"),
+                   ("edge", "#d9dee6", "transparent")]
 _LIGHT_SCENE = "".join("--%s:%s;" % (n, a) for n, a, _ in GRADIENT_TOKENS)
 _DARK_SCENE = "".join("--%s:%s;" % (n, b) for n, _, b in GRADIENT_TOKENS)
 _LIGHT_CAT, _DARK_CAT = category_css()
@@ -641,7 +643,7 @@ CSS = (":root{color-scheme:light dark;--page:#fff;--ink:#10141c;--soft:#566070;-
        ":root[data-theme=dark]{color-scheme:dark;" + _DARK_TOKENS + "}\n:root[data-theme=light]{color-scheme:light}\n") + """
 *{box-sizing:border-box}
 html{background:var(--page);-webkit-text-size-adjust:100%}
-body::before{content:"";position:fixed;top:0;right:0;bottom:0;left:0;z-index:-1;pointer-events:none;background:linear-gradient(180deg,var(--dusk-1),var(--dusk-2),var(--dusk-3),var(--dusk-4))}
+body::before{content:"";position:fixed;top:0;right:0;bottom:0;left:0;z-index:-1;pointer-events:none;background:var(--sky)}
 body{margin:0;color:var(--ink);font:400 15px/1.45 Roboto,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;font-variant-numeric:tabular-nums}
 h1,h2,h3,p,ol,ul{margin:0;padding:0}ol,ul{list-style:none}
 h1,h2,h3,.cond,.score,.stat b,.rank,.step b,th{font-family:"Roboto Condensed","Arial Narrow",Roboto,system-ui,sans-serif}
@@ -669,7 +671,7 @@ h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:
 .seg button[aria-pressed=true]{background:var(--ink);color:var(--page)}
 .result{font-size:13px;color:var(--soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}.result:empty{display:none}
 .a-city,.a-trends,.a-road,.a-standings,.a-feed{min-width:0;min-height:0;padding:12px}
-.a-trends,.a-road,.a-standings,.a-feed,.a-meta,.foot{background:var(--surface)}
+.a-trends,.a-road,.a-standings,.a-feed,.a-meta,.foot{background:var(--surface);border:1px solid var(--edge)}
 .a-city .score-box,.scene-foot,.scene-key,.a-city>.empty-block,.a-city>.sec-note{background:var(--surface);padding-left:10px;padding-right:10px}
 .a-city{grid-area:city}.a-trends{grid-area:trends;display:flex;flex-direction:column}.a-road{grid-area:road;display:flex;flex-direction:column}.a-standings{grid-area:standings;display:flex;flex-direction:column}
 .a-feed{grid-area:feed;display:flex;flex-direction:column}
@@ -1244,7 +1246,7 @@ function rgb(c){return'rgb('+c[0]+','+c[1]+','+c[2]+')';}
 function rgba(c,a){return'rgba('+c[0]+','+c[1]+','+c[2]+','+a+')';}
 function readColors(){var cs=getComputedStyle(d.documentElement);function v(n){return hex(cs.getPropertyValue(n));}
 var ink=v('--ink');
-col={ink:rgb(ink),page:rgb(v('--page')),soft:rgb(v('--soft')),good:rgb(v('--good')),bad:rgb(v('--bad')),st:{},surface:(cs.getPropertyValue('--surface')||'').trim()||'rgba(255,255,255,.9)',plate:rgba(ink,.07),plateEdge:rgba(ink,.2)};
+col={ink:rgb(ink),page:rgb(v('--page')),soft:rgb(v('--soft')),good:rgb(v('--good')),bad:rgb(v('--bad')),st:{},surface:(cs.getPropertyValue('--surface')||'').trim()||'#fff',plate:rgba(ink,.07),plateEdge:rgba(ink,.2)};
 var W3=[255,255,255],B3=[0,0,0];
 S.forEach(function(s){var c=v(s.v);col.st[s.k]={ghost:!!s.ghost,c:rgb(c),g:rgba(c,.16),gh:rgba(c,.2),l:rgb(c),t:rgb(mix(c,W3,.32)),r:rgb(mix(c,B3,.34)),
 ht:rgb(mix(c,W3,.6)),hl:rgb(mix(c,W3,.38)),hr:rgb(mix(c,W3,.16))};});}

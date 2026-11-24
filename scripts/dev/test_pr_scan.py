@@ -776,31 +776,38 @@ class SceneTests(unittest.TestCase):
         for gone in ("--sky-", "--sun:", "--sand:", "--dune:", "--water:", "--foam:", "--trunk:", "--frond:", ".palm", ".sk0"):
             self.assertNotIn(gone, css, gone)
 
-    def test_page_gradient_tokens_in_both_themes(self):
+    def test_light_is_plain_white_and_only_dark_has_the_sunset(self):
         light = ps.CSS.split("@media")[0]
         dark = ps._DARK_TOKENS
-        names = [n for n, _, _ in ps.GRADIENT_TOKENS]
-        self.assertEqual(names, ["dusk-1", "dusk-2", "dusk-3", "dusk-4", "surface"])
+        tok = {n: (a, b) for n, a, b in ps.GRADIENT_TOKENS}
+        self.assertEqual([n for n, _, _ in ps.GRADIENT_TOKENS], ["sky", "surface", "edge"])
         for name, a, b in ps.GRADIENT_TOKENS:
             self.assertIn("--%s:%s;" % (name, a), light)
             self.assertIn("--%s:%s;" % (name, b), dark)
-            self.assertNotEqual(a, b)
-        tok = {n: (a, b) for n, a, b in ps.GRADIENT_TOKENS}
-        self.assertEqual([tok["dusk-%d" % i][0] for i in (1, 2, 3, 4)], ["#ffb000", "#ff5e3a", "#e0307a", "#6a35c9"])
-        self.assertEqual([tok["dusk-%d" % i][1] for i in (1, 2, 3, 4)], ["#ff7a1a", "#c2185b", "#4a148c", "#120b2e"])
-        self.assertEqual(tok["surface"], ("rgba(255,255,255,.9)", "rgba(14,18,25,.7)"))
+        self.assertIn("--page:#fff;", light)
+        self.assertEqual(tok["sky"][0], "none")  # no gradient in light
+        self.assertEqual(tok["surface"], ("#fff", "rgba(14,18,25,.7)"))  # flat white panels in light
+        self.assertEqual(ps.SUNSET_DARK, ("#ff7a1a", "#c2185b", "#4a148c", "#120b2e"))
+        self.assertEqual(tok["sky"][1], "linear-gradient(180deg,#ff7a1a,#c2185b,#4a148c,#120b2e)")
+        self.assertNotIn("dusk", ps.CSS + ps.SCENE_CSS)
         out = ps.render_html(analysis_of({"A": 1}), "o/r", NOW)
-        self.assertIn(":root[data-theme=dark]{color-scheme:dark;" + dark.split(";")[0], out)
-        self.assertIn("linear-gradient(180deg,var(--dusk-1),var(--dusk-2),var(--dusk-3),var(--dusk-4))", out)
+        # explicit light and auto with the OS in light mode both use the base :root tokens; dark applies only on the
+        # explicit choice or auto + dark OS
+        self.assertIn("@media (prefers-color-scheme:dark){:root:not([data-theme=light]){" + dark, out)
+        self.assertIn(":root[data-theme=dark]{color-scheme:dark;" + dark, out)
+        self.assertIn(":root[data-theme=light]{color-scheme:light}", out)
+        self.assertEqual(out.count("--sky:linear-gradient"), 2)
+        self.assertEqual(out.count("--sky:none"), 1)
+        self.assertIn("background:var(--sky)", out.split("body::before{")[1].split("}")[0])
         self.assertIn("position:fixed", out.split("body::before{")[1].split("}")[0])  # fixed to the viewport
         self.assertNotIn("backdrop-filter", out)
 
-    def test_panels_and_top_bar_use_the_translucent_surface(self):
+    def test_panels_and_top_bar_use_the_surface_token(self):
         css = ps.CSS
-        self.assertIn(".a-trends,.a-road,.a-standings,.a-feed,.a-meta,.foot{background:var(--surface)}", css)
+        self.assertIn(".a-trends,.a-road,.a-standings,.a-feed,.a-meta,.foot{background:var(--surface);border:1px solid var(--edge)}", css)
         self.assertRegex(css, r"\.top\{[^}]*background:var\(--surface\)")
 
-    def test_text_keeps_aa_contrast_on_the_surface(self):
+    def test_text_keeps_aa_contrast(self):
         def lin(c):
             c /= 255.0
             return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
@@ -819,13 +826,14 @@ class SceneTests(unittest.TestCase):
             la, lb = sorted((lum(a), lum(b)), reverse=True)
             return (la + 0.05) / (lb + 0.05)
         tok = {n: (a, b) for n, a, b in ps.GRADIENT_TOKENS}
-        text = {0: ("#10141c", "#566070", "#1546e0", "#a94f00", "#456b12", "#c4261d"),
-                1: ("#eef2f8", "#a2adbc", "#8ca8ff", "#ffab5c", "#b4e06a", "#ff8a80")}
-        for theme in (0, 1):
-            for i in (1, 2, 3, 4):
-                bg = over(tok["surface"][theme], hexrgb(tok["dusk-%d" % i][theme]))
-                for fg in text[theme]:
-                    self.assertGreaterEqual(ratio(hexrgb(fg), bg), 4.5, (theme, i, fg))
+        light_text = ("#10141c", "#566070", "#1546e0", "#a94f00", "#456b12", "#c4261d")
+        dark_text = ("#eef2f8", "#a2adbc", "#8ca8ff", "#ffab5c", "#b4e06a", "#ff8a80")
+        for fg in light_text:  # light: text on the flat white surface and page
+            self.assertGreaterEqual(ratio(hexrgb(fg), [255, 255, 255]), 4.5, ("light", fg))
+        for stop in ps.SUNSET_DARK:  # dark: text on the translucent surface over every sunset stop
+            bg = over(tok["surface"][1], hexrgb(stop))
+            for fg in dark_text:
+                self.assertGreaterEqual(ratio(hexrgb(fg), bg), 4.5, (stop, fg))
 
     def test_page_empty_state_without_prs(self):
         out = ps.render_html(analysis_of({}), "o/r", NOW)

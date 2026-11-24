@@ -398,3 +398,9 @@ Keep every version of ivall/xcl even if upstream or the whole fork network is ta
   - light: gold `#ffb000` → hot orange `#ff5e3a` → magenta `#e0307a` → violet `#6a35c9`;
   - dark: `#ff7a1a` → `#c2185b` → `#4a148c` → `#120b2e`.
   - The panel surface alpha is tuned so all text keeps WCAG AA on every stop; the contrast test covers the new stops.
+
+### Light theme without gradient (user request, 2026-11-24)
+- Light theme: a plain white page (`#fff`), with no gradient and no `body::before` sunset. Panels are flat white, separated by the `--rule` lines, as in the original flat look.
+- The sunset gradient is for the dark theme only, which keeps its current stops and surface.
+- This applies both to the explicit light choice on the theme button and to "auto" when the OS is in light mode.
+- The contrast tests are updated: light text is checked against white.
