@@ -309,3 +309,37 @@ Keep every version of ivall/xcl even if upstream or the whole fork network is ta
 - **Chart tooltip** like their `.city-tip`: inverted colours, square, small text.
 - Trends chart and empty states stay as built, restyled to match.
 - The data rules are unchanged: no fake data, and explicit "no data yet" states.
+
+### Effort map and top areas (user request, 2026-11-24)
+- **Top areas:** the page features the 6 areas with the most open PRs. The rest are rolled into one "Everything else" row (with a list of what it contains) in the standings and the effort map. The All PRs tab keeps a filter for every area.
+- **Effort map**: the new hero visual, a 3D voxel scene in the visual language of gta6pc.meth.dev's rotatable voxel "VI". The renderer is our own: their vi3d.js has no licence and is not copied.
+  - **Scene:** one voxel tower per featured area plus "Everything else", in a row on a ruled ground plane.
+  - **Tower height:** open PRs, one voxel layer per PR. When the tallest tower is over 40, layers are scaled and the scale is stated in the caption.
+  - **Layers, bottom to top:** looks done (green), reviewed (accent), waiting (partial/orange), draft (soft grey). Faces are shaded light, mid and dark from the theme tokens, with square pixels and no gradients.
+  - **Callouts:** label, open count, unreviewed and +/− lines, with thin leader lines from each tower top to its label, as in their callout style. A score box sits over the top-left corner of the scene: open count, with the note line under it.
+- **Interaction (JS):**
+  - our own 2D-canvas painter's-algorithm renderer at a fixed pitch;
+  - yaw rotation by drag or pointer, and by the Left/Right arrow keys when the canvas has focus; a slow idle turn, off under `prefers-reduced-motion`;
+  - HiDPI aware;
+  - hovering a voxel shows an inverted square tooltip ("D3D12.X · waiting for review · 11 PRs");
+  - the canvas has `role="img"` and an aria-label that summarises the data.
+- **Static fallback**, also used for the screenshot checks: Python generates an isometric SVG of the same scene at a fixed angle with the same callouts. JS replaces it with the canvas. It works without JS.
+- Data rules are unchanged: real data only, and "No data yet" where needed.
+
+### Ghost voxels and sunset beach scene (user request, 2026-11-24)
+- Their voxel scene, studied for style only, consists of:
+  - solid voxels for what has been reached and **ghost voxels** for what remains: a faint translucent fill with a thin outline;
+  - a coastal ground with sand and dunes, a water band with animated pixel wave bands and foam, and palm trees;
+  - a warm palette.
+- We write our own renderer with our own palette in that spirit.
+- **Mapping:** a tower's full height is its open PRs.
+  - Solid layers are work that has moved forward: looks done (green), then reviewed (accent).
+  - Ghost layers are work not yet reviewed: waiting and draft, outlined and tinted faintly with the state colour.
+  - The caption explains this. Callouts keep their counts.
+- **Sunset scene:**
+  - a sky band behind the towers; light mode is a peach → coral → lavender dusk, dark mode a violet → deep navy night;
+  - a low, square-pixel sun disc on the horizon;
+  - a sandy ground plane with dune patches, a water strip along the front edge with stepped wave bands, and foam that moves slowly when motion is allowed (static under reduced motion and in the SVG);
+  - a few procedural palm trees made of voxel trunks and pixel fronds, placed by a fixed seed so every render is the same.
+  - The scene's colours are theme tokens (`--sky-1..3`, `--sun`, `--sand`, `--dune`, `--water`, `--deep`, `--foam`, `--trunk`, `--frond`), with light and dark sets.
+- The SVG fallback shows the same scene statically. The page chrome keeps the existing tokens.

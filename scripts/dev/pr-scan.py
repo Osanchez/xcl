@@ -607,12 +607,19 @@ def category_css():
     return light, dark
 
 
+# Scene colours (light, dark): sunset sky (top, middle, horizon), sun, sand, dunes, water, deep water, foam, trunk, frond.
+SCENE_TOKENS = [("sky-1", "#b9a4de", "#0b1233"), ("sky-2", "#f09a86", "#2d1f68"), ("sky-3", "#ffd2a0", "#703b84"),
+                ("sun", "#ff7d4d", "#f5a46c"), ("sand", "#f0dcae", "#4b4560"), ("dune", "#dfc28a", "#5d5775"),
+                ("water", "#79bccb", "#1f4272"), ("deep", "#4592ad", "#142b52"), ("foam", "#fbfeff", "#a9c6ee"),
+                ("trunk", "#7b5836", "#6a5668"), ("frond", "#2e8b57", "#47a885")]
+_LIGHT_SCENE = "".join("--%s:%s;" % (n, a) for n, a, _ in SCENE_TOKENS)
+_DARK_SCENE = "".join("--%s:%s;" % (n, b) for n, _, b in SCENE_TOKENS)
 _LIGHT_CAT, _DARK_CAT = category_css()
 _DARK_TOKENS = ("--page:#0e1219;--ink:#eef2f8;--soft:#a2adbc;--rule:#2a3240;--wash:#1a212c;--accent:#8ca8ff;--partial:#ffab5c;--partial-text:#ffab5c;"
-                "--empty:#39424f;--tip:#eef2f8;--tip-text:#0e1219;--tip-soft:#3a4454;--good:#b4e06a;--bad:#ff8a80;" + _DARK_CAT)
+                "--empty:#39424f;--tip:#eef2f8;--tip-text:#0e1219;--tip-soft:#3a4454;--good:#b4e06a;--bad:#ff8a80;" + _DARK_SCENE + _DARK_CAT)
 CSS = (":root{color-scheme:light dark;--page:#fff;--ink:#10141c;--soft:#566070;--rule:#d9dee6;--wash:#eef1f5;--accent:#1546e0;"
        "--partial:#e8770c;--partial-text:#a94f00;--empty:#c9cfd9;--tip:#10141c;--tip-text:#fff;--tip-soft:#d7dce4;--good:#4f7f16;--bad:#c4261d;"
-       + _LIGHT_CAT + "}\n"
+       + _LIGHT_SCENE + _LIGHT_CAT + "}\n"
        "@media (prefers-color-scheme:dark){:root:not([data-theme=light]){" + _DARK_TOKENS + "}}\n"
        ":root[data-theme=dark]{color-scheme:dark;" + _DARK_TOKENS + "}\n:root[data-theme=light]{color-scheme:light}\n") + """
 *{box-sizing:border-box}
@@ -671,7 +678,7 @@ h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:
 .step b{font-size:22px;line-height:1}.step>span{font-size:12px;font-weight:500;white-space:nowrap}.step small{color:var(--soft);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .step.on{border-bottom-color:var(--sc)}
 .pips{display:flex;gap:2px}.pips i{display:block;flex:1;max-width:9px;height:7px;background:var(--empty)}.pips i.on{background:var(--sc)}
-.st-axis,.st{display:grid;grid-template-columns:22px minmax(128px,1fr) minmax(40px,72px) 56px;gap:0 8px;align-items:center}
+.st-axis,.st{display:grid;grid-template-columns:22px minmax(128px,1fr) minmax(40px,72px) 68px;gap:0 8px;align-items:center}
 .st-axis{position:sticky;top:0;z-index:1;padding:0 4px 4px 2px;background:var(--page);color:var(--soft);font-size:13px;line-height:1.2}
 .st-axis span:last-child{text-align:right}
 .st-list{overflow-y:auto;min-height:0;flex:1;max-height:420px}
@@ -685,7 +692,7 @@ h2{font-size:16px;line-height:1.2;font-weight:700}h3{font-size:15px;line-height:
 .track{display:block;height:12px;background:var(--wash)}.fill{display:flex;height:100%}.fill i{display:block;min-width:2px}
 .fill .draft{background:var(--soft)}.fill .wait{background:var(--partial)}.fill .rev{background:var(--accent)}.fill .done{background:var(--good)}
 .where{display:grid;justify-items:end;gap:2px;color:var(--soft)}.where b{font:700 16px/1 "Roboto Condensed",Arial,sans-serif;color:var(--ink)}
-.spark{display:block;width:100%;height:20px}.spline{vector-effect:non-scaling-stroke;fill:none;stroke:var(--soft);stroke-width:1.5;stroke-linejoin:round}.nodata{font-size:12px;color:var(--soft)}
+.spark{display:block;width:100%;height:20px}.spline{vector-effect:non-scaling-stroke;fill:none;stroke:var(--soft);stroke-width:1.5;stroke-linejoin:round}.nodata{font-size:12px;color:var(--soft);white-space:nowrap}
 .tabs{display:none;gap:14px}.js .tabs{display:flex}
 .tabs button{padding:0 0 2px;border:0;border-bottom:2px solid transparent;background:none;color:var(--soft);font:700 16px/1.2 "Roboto Condensed",Arial,sans-serif;cursor:pointer;border-radius:0}
 .tabs button:hover{color:var(--ink)}.tabs button[aria-pressed=true]{border-bottom-color:var(--partial);color:var(--ink)}
@@ -726,11 +733,11 @@ details.area>summary:before{content:"+";width:12px;color:var(--soft);font-weight
 [hidden]{display:none!important}
 @media (min-width:640px){.a-meta{grid-template-columns:repeat(4,minmax(0,1fr))}}
 @media (max-width:760px){.road{grid-template-columns:1fr}.step{display:grid;grid-template-columns:44px minmax(0,1fr) auto;align-items:center;gap:8px;padding:6px 8px;border-bottom-width:2px}.step .pips{display:none}}
-@media (max-width:560px){.st{grid-template-columns:22px minmax(0,1fr) 56px}.st .track{grid-column:2/4;grid-row:2}.st-axis{display:none}.score{font-size:56px}}
+@media (max-width:560px){.st{grid-template-columns:22px minmax(0,1fr) 68px}.st .track{grid-column:2/4;grid-row:2}.st-axis{display:none}.score{font-size:56px}}
 @media (max-width:620px){.top{flex-wrap:wrap;gap:4px 12px;padding:7px 0}.top-right{width:100%;justify-content:space-between}}
 @media (min-width:1100px) and (min-height:660px){
 .app{height:100dvh;overflow:hidden;column-gap:24px;padding:0 20px;
-grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1.15fr);grid-template-rows:auto auto minmax(0,1fr) 172px auto auto;
+grid-template-columns:minmax(0,1.6fr) minmax(0,1fr) minmax(0,1.1fr);grid-template-rows:auto auto minmax(0,1fr) 172px auto auto;
 grid-template-areas:"top top top" "filters filters filters" "city standings feed" "road standings feed" "meta meta meta" "foot foot foot"}
 .a-city,.a-standings,.a-feed{overflow:auto}.a-city{padding-top:12px}.a-road{overflow:hidden}
 .st-list,.feed-body{max-height:none}.feed-body{overflow:auto}.a-feed,.a-standings{overflow:hidden}
@@ -853,12 +860,531 @@ def cat_style(area):
     return "--ac:var(--cat%d)" % (i % len(CATEGORY))
 
 
+# ---- top areas and the effort map
+
+TOP_AREAS = 6
+ELSE_NAME = "Everything else"
+SCENE_CAP = 40          # tallest tower in layers; above it the layers are scaled
+SCENE_W, SCENE_H = 720, 520   # viewBox of the static SVG
+SCENE_YAW = -22.0       # degrees, fixed angle of the SVG and start angle of the canvas
+SCENE_SX, SCENE_PY = 0.87, 0.36   # screen x per cell, screen y per cell on the ground (fixed pitch)
+TOWER_CELLS, TOWER_PITCH = 2, 3   # footprint of a tower and distance between towers, in cells
+SCENE_MX, SCENE_MY = 2.2, 1.8     # sand margin around the tower row, in cells
+SCENE_SEED = 20261124   # fixed seed of the palms, dunes and waves: every render is the same
+SCENE_GHOST = ("wait", "draft")   # layers not reviewed yet are drawn as ghost voxels
+SCENE_ROWS = (16, 70)   # first text baseline of the upper and lower label rows
+SCENE_BAND_BOTTOM = 106  # bottom of the lower label row
+SCENE_STATES = [("done", "Looks done", "--good"), ("rev", "Reviewed", "--accent"),
+                ("wait", "Waiting for review", "--partial"), ("draft", "Draft", "--soft")]
+
+
+def top_areas(an, n=TOP_AREAS):
+    """The n areas with the most open PRs (ties by name) as [{"name", "prs", "members"}], plus one rolled-up
+    "Everything else" entry (members = the areas in it, sorted like the ranking) when there are more than n areas.
+    members is None for a real area."""
+    ranked = sorted(an["areas"], key=lambda a: (-len(an["areas"][a]), a))
+    out = [{"name": a, "prs": an["areas"][a], "members": None} for a in ranked[:n]]
+    rest = ranked[n:]
+    if rest:
+        out.append({"name": ELSE_NAME, "prs": [p for a in rest for p in an["areas"][a]], "members": rest})
+    return out
+
+
+def effort_scene(an, n=TOP_AREAS, cap=SCENE_CAP):
+    """Tower data for the effort map: one tower per top_areas entry, layers bottom to top (looks done, reviewed,
+    waiting, draft), h = voxel layers of a run. Above cap layers for the tallest tower, h is scaled by cap/tallest
+    (every non-empty run keeps at least one layer) and per = open PRs per layer is stated in the caption."""
+    entries = top_areas(an, n)
+    tallest = max([len(e["prs"]) for e in entries] or [0])
+    factor = cap / tallest if tallest > cap else 1.0
+    towers = []
+    for e in entries:
+        ps = e["prs"]
+        layers = []
+        for k, label, _ in SCENE_STATES:
+            c = sum(bucket(p) == k for p in ps)
+            if c:
+                layers.append({"k": k, "label": label, "n": c, "ghost": k in SCENE_GHOST,
+                               "h": c if factor == 1.0 else max(1, round(c * factor))})
+        towers.append({"name": e["name"], "members": e["members"] or [], "open": len(ps),
+                       "unreviewed": sum(bool(p["unreviewed"]) for p in ps),
+                       "add": sum(p.get("additions", 0) for p in ps), "del": sum(p.get("deletions", 0) for p in ps),
+                       "layers": layers, "height": sum(ly["h"] for ly in layers)})
+    per = tallest / cap if factor != 1.0 else 1.0
+    if not towers:
+        caption = ""
+    elif factor == 1.0:
+        caption = "One layer is one open PR."
+    else:
+        caption = "One layer is about %s open PRs: the layers are scaled so the tallest tower fits in %d." % (
+            ("%.1f" % per).rstrip("0").rstrip("."), cap)
+    if caption:
+        caption += " Solid layers have moved forward (looks done, reviewed); outlined ghost layers still wait for review or are drafts."
+    return {"towers": towers, "scale": factor, "per": per, "cap": cap, "caption": caption}
+
+
+def _rng(seed):
+    """Small linear congruential generator: the same sequence on every Python version and platform."""
+    st = [seed & 0x7FFFFFFF]
+
+    def nxt():
+        st[0] = (st[0] * 1103515245 + 12345) & 0x7FFFFFFF
+        return st[0] / float(0x7FFFFFFF)
+    return nxt
+
+
+def scene_plate(n):
+    """Half sizes (gx, gy) of the sand plate in cells for n towers."""
+    hw = TOWER_CELLS / 2.0
+    return (n - 1) * TOWER_PITCH / 2.0 + hw + SCENE_MX, hw + SCENE_MY
+
+
+def scene_decor(n, seed=SCENE_SEED):
+    """Seeded beach decor for n towers, in plate cells: palms (trunk pixels, lean, frond angles in degrees), dune
+    patches, wave rows (screen fractions) and the sun. Deterministic: the same n always gives the same decor."""
+    r = _rng(seed + n)
+    hw = TOWER_CELLS / 2.0
+    gx, gy = scene_plate(n)
+    row = gx - SCENE_MX
+    zones = [(-gx + 0.5, -row - 0.5, -gy + 0.5, -0.2), (-gx + 0.5, -row - 0.5, 0.2, gy - 0.5),
+             (row + 0.5, gx - 0.5, -gy + 0.5, -0.2), (row + 0.5, gx - 0.5, 0.2, gy - 0.5),
+             (-row + 0.5, -0.5, -gy + 0.4, -hw - 0.5), (0.5, row - 0.5, -gy + 0.4, -hw - 0.5)]
+    palms = []
+    for x0, x1, y0, y1 in zones:
+        fr = [int(k * 60 + r() * 24 - 12) for k in range(6)]
+        palms.append({"x": round(x0 + (x1 - x0) * r(), 2), "y": round(y0 + (y1 - y0) * r(), 2), "h": 5 + int(r() * 4),
+                      "lean": round(r() * 2 - 1, 2), "fr": fr})
+    dunes = []
+    for _ in range(8):
+        w, h = 1.5 + r() * 2.0, 0.6 + r() * 0.6
+        dunes.append([round(-gx + 0.4 + (2 * gx - w - 0.8) * r(), 2), round(-gy + 0.3 + (2 * gy - h - 0.6) * r(), 2), round(w, 2), round(h, 2)])
+    waves = []
+    for j in range(7):
+        segs = [[round(r(), 3), round(0.03 + r() * 0.06, 3), 1 if k % 3 == 0 else 0] for k in range(5)]
+        waves.append([round((j / 7.0) ** 1.5 * 0.92 + 0.04, 3), segs])
+    return {"palms": palms, "dunes": dunes, "waves": waves, "sun": {"x": 0.6, "r": 4}, "gx": gx, "gy": gy}
+
+
+def scene_summary(scene):
+    ts = scene["towers"]
+    return "Effort map, open pull requests per area: " + "; ".join(
+        "%s %d open, %d unreviewed" % (t["name"], t["open"], t["unreviewed"]) for t in ts) + "."
+
+
+def scene_json(scene):
+    """Inline JSON for the canvas renderer; every '<' is escaped so nothing can close the script block."""
+    data = {"towers": scene["towers"], "per": scene["per"], "caption": scene["caption"],
+            "states": [{"k": k, "label": lb, "v": v, "ghost": k in SCENE_GHOST} for k, lb, v in SCENE_STATES],
+            "geom": {"w": TOWER_CELLS, "pitch": TOWER_PITCH, "sx": SCENE_SX, "py": SCENE_PY, "yaw": SCENE_YAW},
+            "decor": scene_decor(len(scene["towers"]))}
+    return json.dumps(data, separators=(",", ":")).replace("<", "\\u003c")
+
+
+def _num(v):
+    return "%.1f" % v if abs(v - round(v)) > 0.05 else "%d" % round(v)
+
+
+def _short(v):
+    return "%.1fk" % (v / 1000.0) if v >= 10000 else (str(v) if v < 1000 else "%.1fk" % (v / 1000.0))
+
+
+def _pj(x, y, z, yaw, k, lh):
+    c, s = math.cos(yaw), math.sin(yaw)
+    xr, yr = x * c - y * s, x * s + y * c
+    return ((xr - yr) * SCENE_SX * k, (xr + yr) * SCENE_PY * k - z * lh, xr + yr)
+
+
+_FACE_CORNERS = [(-1, -1), (1, -1), (1, 1), (-1, 1)]
+_FACE_NORMALS = [(0, -1), (1, 0), (0, 1), (-1, 0)]
+
+
+def _visible_faces(yaw):
+    """[(corner index, 'l' or 'r')] of the side faces that look at the camera (same rule as the canvas)."""
+    c, s = math.cos(yaw), math.sin(yaw)
+    out = []
+    for f, (nx, ny) in enumerate(_FACE_NORMALS):
+        xr, yr = nx * c - ny * s, nx * s + ny * c
+        if xr + yr > 0.001:
+            out.append((f, "l" if xr - yr < 0 else "r"))
+    return out
+
+
+def scene_svg(scene):
+    """Static isometric SVG of the scene at the fixed angle: shaded squares (classes use the theme tokens),
+    one <g class="tower"> per tower, callouts with leader lines. Empty string when there are no towers."""
+    ts = scene["towers"]
+    n = len(ts)
+    if not n:
+        return ""
+    yaw = math.radians(SCENE_YAW)
+    hw = TOWER_CELLS / 2.0
+    xs = [(i - (n - 1) / 2.0) * TOWER_PITCH for i in range(n)]
+    gx, gy = scene_plate(n)
+    maxl = max([t["height"] for t in ts] or [0])
+    pad, band_bottom = 12, SCENE_BAND_BOTTOM
+    ground = [(-gx, -gy), (gx, -gy), (gx, gy), (-gx, gy)]
+
+    def bbox(k, lh):
+        pts = [_pj(x, y, 0, yaw, k, lh) for x, y in ground] + [
+            _pj(xs[i] + cx * hw, cy * hw, t["height"], yaw, k, lh) for i, t in enumerate(ts) for cx, cy in _FACE_CORNERS]
+        return min(p[0] for p in pts), max(p[0] for p in pts), min(p[1] for p in pts), max(p[1] for p in pts)
+
+    # width fixes the scale; the layer height then takes all the height left under the callouts
+    gxs = [_pj(x, y, 0, yaw, 1.0, 0)[0] for x, y in ground]
+    k = (SCENE_W - 2 * pad) / (max(gxs) - min(gxs))
+    avail = SCENE_H - band_bottom - 18
+    while True:
+        lh = k * 0.9
+        while lh > k * 0.25:
+            x0, x1, y0, y1 = bbox(k, lh)
+            if y1 - y0 <= avail:
+                break
+            lh *= 0.97
+        if lh > k * 0.25 or k < 3:
+            break
+        k *= 0.97
+    x0, x1, y0, y1 = bbox(k, lh)
+    ox, oy = SCENE_W / 2.0 - (x0 + x1) / 2.0, SCENE_H - 8 - y1
+
+    def P(x, y, z):
+        px, py, depth = _pj(x, y, z, yaw, k, lh)
+        return px + ox, py + oy, depth
+
+    def pt(p):
+        return "%.1f,%.1f" % (p[0], p[1])
+
+    o = ['<svg class="scene-svg" viewBox="0 0 %d %d" preserveAspectRatio="xMidYMax meet" role="img" aria-label="%s">' % (
+        SCENE_W, SCENE_H, esc(scene_summary(scene)))]
+    gp = [P(x, y, 0) for x, y in ground]
+    dec = scene_decor(n)
+    hor = min(p[1] for p in gp) - 16
+    sc = max(4.0, round(k * 0.55))     # sun / wave pixel size
+    pp = max(3.0, round(k * 0.4))      # palm pixel size
+    big = 3000
+    o.append('<g class="sky">')
+    for j in range(5):
+        top = -big if j == 0 else hor * j / 5.0
+        o.append('<rect class="sk sk%d" x="%d" y="%.1f" width="%d" height="%.1f"/>' % (j, -big, top, 2 * big + SCENE_W, hor * (j + 1) / 5.0 - top + 0.5))
+    sx0 = round(SCENE_W * dec["sun"]["x"] / sc) * sc
+    for j in range(1, dec["sun"]["r"] + 1):
+        half = int(math.sqrt(dec["sun"]["r"] ** 2 - (j - 0.5) ** 2) + 0.5)
+        o.append('<rect class="sun" x="%.1f" y="%.1f" width="%.1f" height="%.1f"/>' % (sx0 - half * sc, hor - j * sc, 2 * half * sc, sc))
+    o.append('</g><g class="sea"><rect class="water" x="%d" y="%.1f" width="%d" height="%d"/>' % (-big, hor, 2 * big + SCENE_W, 2 * big))
+    for f, segs in dec["waves"]:
+        y = hor + f * (SCENE_H - hor)
+        for x, ln, foam in segs:
+            o.append('<rect class="%s" x="%.1f" y="%.1f" width="%.1f" height="%.1f"/>' % (
+                "wv foam" if foam else "wv", x * SCENE_W, round(y / (sc / 2)) * sc / 2, max(sc, ln * SCENE_W), sc / 2))
+    o.append("</g>")
+    rim = " ".join(pt(P(x + (0.5 if x > 0 else -0.5), y + (0.5 if y > 0 else -0.5), 0)) for x, y in ground)
+    o.append('<g class="ground"><polygon class="rim" points="%s" style="stroke-dasharray:%.0f %.0f"/><polygon class="sand" points="%s"/>' % (
+        rim, sc, sc * 1.5, " ".join(pt(p) for p in gp)))
+    for dx, dy, dw, dh in dec["dunes"]:
+        o.append('<polygon class="dune" points="%s"/>' % " ".join(pt(P(dx + a_, dy + b_, 0)) for a_, b_ in ((0, 0), (dw, 0), (dw, dh), (0, dh))))
+    o.append("</g>")
+    faces = _visible_faces(yaw)
+    items = [(P(xs[i], 0, 0)[2], 0, i) for i in range(n)] + [(P(pm["x"], pm["y"], 0)[2], 1, j) for j, pm in enumerate(dec["palms"])]
+    tops = {}
+
+    def palm(pm):
+        bx, by, _ = P(pm["x"], pm["y"], 0)
+        g = ['<g class="palm">']
+        for j in range(pm["h"]):
+            g.append('<rect class="trunk" x="%.1f" y="%.1f" width="%.1f" height="%.1f"/>' % (
+                round((bx + pm["lean"] * j * pp * 0.3) / pp) * pp - pp / 2, by - (j + 1) * pp, pp, pp))
+        tx_, ty_ = bx + pm["lean"] * pm["h"] * pp * 0.3, by - pm["h"] * pp
+        seen = set()
+        for ang in pm["fr"]:
+            for t_ in range(0, 5):
+                px_ = round((tx_ + math.cos(math.radians(ang)) * t_ * pp) / pp) * pp
+                py_ = round((ty_ - math.sin(math.radians(ang)) * t_ * pp * 0.45 + t_ * t_ * pp * 0.14) / pp) * pp
+                if (px_, py_) not in seen:
+                    seen.add((px_, py_))
+                    g.append('<rect class="frond" x="%.1f" y="%.1f" width="%.1f" height="%.1f"/>' % (px_ - pp / 2, py_, pp, pp))
+        g.append("</g>")
+        return "".join(g)
+
+    def run_seams(i, ax, ay, bx, by, z0, z1):
+        d = ["M%s L%s" % (pt(P(xs[i] + ax * hw, ay * hw, zz)), pt(P(xs[i] + bx * hw, by * hw, zz))) for zz in range(z0, z1 + 1)]
+        for c in range(1, TOWER_CELLS):
+            f0 = c / float(TOWER_CELLS)
+            mx, my = ax + (bx - ax) * f0, ay + (by - ay) * f0
+            d.append("M%s L%s" % (pt(P(xs[i] + mx * hw, my * hw, z0)), pt(P(xs[i] + mx * hw, my * hw, z1))))
+        return " ".join(d)
+
+    for _, kind, i in sorted(items):
+        if kind == 1:
+            o.append(palm(dec["palms"][i]))
+            continue
+        t = ts[i]
+        o.append('<g class="tower" data-area="%s">' % esc(t["name"]))
+        for f, side in faces:
+            (ax, ay), (bx, by) = _FACE_CORNERS[f], _FACE_CORNERS[(f + 1) % 4]
+            z = 0
+            for ly in t["layers"]:
+                z1 = z + ly["h"]
+                quad = [P(xs[i] + ax * hw, ay * hw, z), P(xs[i] + bx * hw, by * hw, z),
+                        P(xs[i] + bx * hw, by * hw, z1), P(xs[i] + ax * hw, ay * hw, z1)]
+                tip = "%s · %s · %d PR%s" % (t["name"], ly["label"].lower(), ly["n"], "" if ly["n"] == 1 else "s")
+                o.append('<polygon class="vx v-%s f-%s%s" points="%s" data-tip="%s"/>' % (
+                    ly["k"], side, " ghost" if ly["ghost"] else "", " ".join(pt(p) for p in quad), esc(tip)))
+                o.append('<path class="%s v-%s" d="%s"/>' % ("gseam" if ly["ghost"] else "seam", ly["k"], run_seams(i, ax, ay, bx, by, z, z1)))
+                z = z1
+        if t["layers"]:
+            top = t["layers"][-1]
+            quad = [P(xs[i] + cx * hw, cy * hw, t["height"]) for cx, cy in _FACE_CORNERS]
+            tip = "%s · %s · %d PR%s" % (t["name"], top["label"].lower(), top["n"], "" if top["n"] == 1 else "s")
+            o.append('<polygon class="vx v-%s f-t%s" points="%s" data-tip="%s"/>' % (
+                top["k"], " ghost" if top["ghost"] else "", " ".join(pt(p) for p in quad), esc(tip)))
+        o.append("</g>")
+        tx, ty, _ = P(xs[i], 0, t["height"])
+        tops[i] = (tx, ty)
+    # callouts in two staggered rows: a label's text lies between the leader lines of its neighbours in the other row
+    sw = (SCENE_W - 2 * pad) / float(n)
+    cs = [pad + (i + 0.5) * sw for i in range(n)]
+    o.append('<g class="callouts">')
+    for i, t in enumerate(ts):
+        low = (n - 1 - i) % 2 == 0
+        if low:
+            ra, rb = (cs[i - 1] + 5 if i >= 1 else pad), (cs[i + 1] - 6 if i + 1 < n else SCENE_W - pad)
+        else:
+            ra, rb = cs[i] + 5, (cs[i + 2] - 6 if i + 2 < n else SCENE_W - pad)
+        room = rb - ra
+        name, shown = t["name"], t["name"]
+        while len(shown) > 1 and len(shown) * 7.8 > room:
+            shown = shown[:-1]
+        if shown != name:
+            shown = shown[:-1] + "\u2026"
+        l2 = "%d open \u00b7 %d unreviewed" % (t["open"], t["unreviewed"])
+        l2_s = "%d open \u00b7 %d unrev." % (t["open"], t["unreviewed"])
+        if len(l2) * 6.4 > room:
+            l2 = l2_s
+        w = max(len(shown) * 7.8, len(l2) * 6.4)
+        y0 = SCENE_ROWS[1] if low else SCENE_ROWS[0]
+        x = min(max(ra, cs[i] - 18), rb - w) if low else ra
+        x = max(ra, x) if low else x
+        tx, ty = tops[i]
+        if low:
+            xe = min(max(cs[i], x + 4), x + w - 4)
+            pts = "%.1f,%.1f %.1f,%d" % (tx, ty - 3, xe, y0 + 36)
+        else:
+            pts = "%.1f,%.1f %.1f,%d %.1f,%d" % (tx, ty - 3, cs[i], band_bottom + 8, cs[i], y0 - 11)
+        o.append('<g class="callout"><title>%s</title><polyline points="%s"/>' % (
+            esc("%s: %d open, %d unreviewed" % (name, t["open"], t["unreviewed"])), pts))
+        o.append('<text x="%.1f" y="%d"><tspan class="co-nm" x="%.1f">%s</tspan>'
+                 '<tspan class="co-n" x="%.1f" dy="16"><tspan class="co-num">%d</tspan><tspan class="co-w"> open</tspan>'
+                 '<tspan class="co-sub">%s</tspan></tspan>'
+                 '<tspan class="co-sub" x="%.1f" dy="15"><tspan class="add">+%s</tspan> <tspan class="del">\u2212%s</tspan></tspan></text></g>' % (
+                     x, y0, x, esc(shown), x, t["open"], esc(l2[len("%d open" % t["open"]):]), x, _short(t["add"]), _short(t["del"])))
+    o.append("</g></svg>")
+    return "".join(o)
+
+
+SCENE_CSS = """
+.scene{position:relative;min-width:0;container-type:inline-size}
+.stage{position:relative;width:100%;aspect-ratio:720/520;padding-top:84px}
+.scene-svg,.scene-cv{display:block;position:absolute;left:0;top:84px;width:100%;height:calc(100% - 84px)}
+.scene-cv{touch-action:pan-y;cursor:grab;outline-offset:-2px}.scene-cv:active{cursor:grabbing}
+.scene .score-box{margin-bottom:6px}
+.has-stage .score-box{position:absolute;top:0;left:0;z-index:2;margin:0}
+.sk0{fill:var(--sky-1)}.sk1{fill:color-mix(in srgb,var(--sky-1) 50%,var(--sky-2))}.sk2{fill:var(--sky-2)}.sk3{fill:color-mix(in srgb,var(--sky-2) 50%,var(--sky-3))}.sk4{fill:var(--sky-3)}
+.sun{fill:var(--sun)}.water{fill:var(--water)}.wv{fill:var(--deep)}.wv.foam{fill:var(--foam);opacity:.8}
+.rim{fill:none;stroke:var(--foam);stroke-width:4;stroke-linejoin:round}.sand{fill:var(--sand);stroke:var(--dune);stroke-width:1}.dune{fill:var(--dune)}
+.trunk{fill:var(--trunk)}.frond{fill:var(--frond)}
+.vx{--c:var(--ink)}.v-done{--c:var(--good)}.v-rev{--c:var(--accent)}.v-wait{--c:var(--partial)}.v-draft{--c:var(--soft)}
+.vx{fill:var(--c);stroke:none}
+.f-t{fill:color-mix(in srgb,var(--c) 68%,#fff)}.f-l{fill:var(--c)}.f-r{fill:color-mix(in srgb,var(--c) 66%,#000)}
+.vx.ghost{fill:var(--c);fill-opacity:.16;stroke:var(--c);stroke-width:1;stroke-linejoin:round}
+.seam{fill:none;stroke:var(--page);stroke-width:.7;opacity:.85}.gseam{fill:none;stroke:var(--c);stroke-width:.7;opacity:.5}
+.callout polyline{fill:none;stroke:var(--ink);stroke-width:1}
+.scene-svg text{font:400 12px Roboto,Arial,sans-serif;fill:var(--ink);paint-order:stroke;stroke:var(--page);stroke-width:3px;stroke-linejoin:round}
+.scene-svg .co-nm{font:700 14px "Roboto Condensed",Arial,sans-serif;fill:var(--ink)}.scene-svg .co-n{font-weight:500;fill:var(--ink)}
+.scene-svg .add{fill:var(--good)}.scene-svg .del{fill:var(--bad)}
+.scene-cap{color:var(--soft);font-size:13px;line-height:1.35;margin:2px 0 4px}
+.scene .legend{margin:0 0 2px}
+.scene .legend .sw.k-wait{background:color-mix(in srgb,var(--partial) 18%,transparent);box-shadow:inset 0 0 0 1px var(--partial)}
+.scene .legend .sw.k-draft{background:color-mix(in srgb,var(--soft) 18%,transparent);box-shadow:inset 0 0 0 1px var(--soft)}
+.scene-key{display:none;margin:6px 0 0}.scene-key li{display:flex;justify-content:space-between;gap:8px;padding:4px 0;border-top:1px solid var(--rule);font-size:13px}
+.scene-key small{color:var(--soft)}
+@media (min-width:1100px) and (min-height:660px){.stage{box-sizing:border-box;aspect-ratio:auto;height:max(440px,calc(100dvh - 300px))}}
+@container (max-width:540px){
+.has-stage .score-box{position:static;margin-bottom:8px}
+.stage{box-sizing:content-box;aspect-ratio:720/560;height:auto;padding-top:0}
+.scene-svg,.scene-cv{top:0;height:100%}
+.scene-svg .co-nm,.scene-svg .co-sub,.scene-svg .co-w{display:none}.scene-svg .co-n{font:700 30px "Roboto Condensed",Arial,sans-serif}
+.scene-key{display:block}}
+"""
+
+SCENE_JS = r"""
+(function(){
+var d=document,stage=d.getElementById('stage'),dEl=d.getElementById('scene-data'),tip=d.getElementById('tip');
+if(!stage||!dEl)return;
+var svg=stage.querySelector('svg'),data;
+try{data=JSON.parse(dEl.textContent);}catch(e){return;}
+var T=data.towers||[],N=T.length,S=data.states||[],G=data.geom||{},D=data.decor||{palms:[],dunes:[],waves:[],sun:{x:.6,r:4},gx:8,gy:3};
+if(!N||!svg)return;
+var cv=d.createElement('canvas'),g=cv.getContext&&cv.getContext('2d');
+if(!g)return;
+cv.className='scene-cv';cv.tabIndex=0;cv.setAttribute('role','img');
+cv.setAttribute('aria-label',(svg.getAttribute('aria-label')||'Effort map')+' Drag or press Left and Right to rotate.');
+stage.replaceChild(cv,svg);
+var TW=G.w,P=G.pitch,SX=G.sx,PY=G.py,yaw=G.yaw*Math.PI/180,HX=D.gx,HY=D.gy;
+var W=0,H=0,dpr=1,K=10,LH=5,CX=0,CY=0,HOR=0,bandTop=0,bandBottom=0,compact=false,hover=null,hits=[],labelHits=[];
+var reduce=!!(window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)').matches);
+var spin=!reduce,raf=0,last=0,lastDraw=0,phase=0,inside=false,drag=null,vis=true,col={};
+var maxL=0;T.forEach(function(t){maxL=Math.max(maxL,t.height||0);});
+var TOK=['sky-1','sky-2','sky-3','sun','sand','dune','water','deep','foam','trunk','frond'];
+function hex(s){var m=/^#([0-9a-f]{6})$/i.exec((s||'').trim());if(!m)return[128,128,128];var n=parseInt(m[1],16);return[n>>16&255,n>>8&255,n&255];}
+function mix(c,t,a){return[0,1,2].map(function(i){return Math.round(c[i]+(t[i]-c[i])*a);});}
+function rgb(c){return'rgb('+c[0]+','+c[1]+','+c[2]+')';}
+function rgba(c,a){return'rgba('+c[0]+','+c[1]+','+c[2]+','+a+')';}
+function readColors(){var cs=getComputedStyle(d.documentElement);function v(n){return hex(cs.getPropertyValue(n));}
+col={ink:rgb(v('--ink')),page:rgb(v('--page')),soft:rgb(v('--soft')),good:rgb(v('--good')),bad:rgb(v('--bad')),st:{},t:{}};
+TOK.forEach(function(n){col.t[n]=rgb(v('--'+n));});
+var a=v('--sky-1'),b=v('--sky-2'),c=v('--sky-3');col.sky=[rgb(a),rgb(mix(a,b,.5)),rgb(b),rgb(mix(b,c,.5)),rgb(c)];
+var W3=[255,255,255],B3=[0,0,0];
+S.forEach(function(s){var c=v(s.v);col.st[s.k]={ghost:!!s.ghost,c:c,t:rgb(mix(c,W3,.32)),l:rgb(c),r:rgb(mix(c,B3,.34)),ht:rgb(mix(c,W3,.6)),hl:rgb(mix(c,W3,.38)),hr:rgb(mix(c,W3,.16))};});}
+function ext(y,k,lh,gOnly){var c=Math.cos(y),s=Math.sin(y),r=[1e9,-1e9,1e9,-1e9],h=TW/2;
+function add(px,py,z){var xr=px*c-py*s,yr=px*s+py*c,sx=(xr-yr)*SX*k,sy=(xr+yr)*PY*k-z*lh;
+r[0]=Math.min(r[0],sx);r[1]=Math.max(r[1],sx);r[2]=Math.min(r[2],sy);r[3]=Math.max(r[3],sy);}
+[[-HX,-HY],[HX,-HY],[HX,HY],[-HX,HY]].forEach(function(q){add(q[0],q[1],0);});
+if(!gOnly)T.forEach(function(t,i){var x0=(i-(N-1)/2)*P;[[-h,-h],[h,-h],[h,h],[-h,h]].forEach(function(q){add(x0+q[0],q[1],t.height);});});
+return r;}
+function fitY(e){var top=bandBottom+8,bot=H-6;return(e[3]-e[2]<=bot-top)?bot-e[3]:top-e[2];}
+function layout(){
+var r=cv.getBoundingClientRect();W=Math.max(200,Math.round(r.width));H=Math.max(200,Math.round(r.height));
+dpr=Math.min(3,window.devicePixelRatio||1);cv.width=Math.round(W*dpr);cv.height=Math.round(H*dpr);
+compact=W<=540;bandTop=4;bandBottom=bandTop+(compact?28:102);
+var mh=0,a,e;for(a=0;a<Math.PI;a+=Math.PI/36){e=ext(a,1,0,true);mh=Math.max(mh,Math.abs(e[0]),Math.abs(e[1]));}
+var y0=G.yaw*Math.PI/180,avail=H-bandBottom-18;K=(W-16)/(2*mh);
+for(;;){LH=K*.9;while(LH>K*.25){e=ext(y0,K,LH);if(e[3]-e[2]<=avail)break;LH*=.97;}if(LH>K*.25||K<3)break;K*=.97;}
+CX=W/2;HOR=fitY(ext(y0,K,LH))+ext(y0,K,LH,true)[2]-16;CY=0;}
+function place0(){CY=fitY(ext(yaw,K,LH));}
+function pj(x,y,z){var c=Math.cos(yaw),s=Math.sin(yaw),xr=x*c-y*s,yr=x*s+y*c;return[CX+(xr-yr)*SX*K,CY+(xr+yr)*PY*K-z*LH,xr+yr];}
+var CORN=[[-1,-1],[1,-1],[1,1],[-1,1]],NORM=[[0,-1],[1,0],[0,1],[-1,0]];
+function poly(pts,fill){g.beginPath();pts.forEach(function(p,i){if(i)g.lineTo(p[0],p[1]);else g.moveTo(p[0],p[1]);});g.closePath();g.fillStyle=fill;g.fill();}
+function line(a,b){g.moveTo(a[0],a[1]);g.lineTo(b[0],b[1]);}
+function inside4(p,x,y){var s=0;for(var i=0;i<p.length;i++){var a=p[i],b=p[(i+1)%p.length],c=(b[0]-a[0])*(y-a[1])-(b[1]-a[1])*(x-a[0]);
+if(c!==0){if(s&&(c>0)!==(s>0))return false;s=c;}}return true;}
+function sq(x,y,w,h,f){g.fillStyle=f;g.fillRect(x,y,w,h);}
+function drawSky(){var sc=Math.max(4,Math.round(K*.55)),i;
+for(i=0;i<5;i++){var y0=i?HOR*i/5:0,y1=HOR*(i+1)/5;sq(0,y0,W,y1-y0+.5,col.sky[i]);}
+var sx0=Math.round(W*D.sun.x/sc)*sc,R=D.sun.r;
+for(i=1;i<=R;i++){var half=Math.floor(Math.sqrt(R*R-(i-.5)*(i-.5))+.5);sq(sx0-half*sc,HOR-i*sc,2*half*sc,sc,col.t.sun);}
+sq(0,HOR,W,H-HOR,col.t.water);
+D.waves.forEach(function(w,j){var y=Math.round((HOR+w[0]*(H-HOR))/(sc/2))*sc/2;
+w[1].forEach(function(s){var len=Math.max(sc,s[1]*W),x=((s[0]*W+phase*(5+j*2)*(j%2?-1:1))%(W+2*len)+(W+2*len))%(W+2*len)-len;
+g.globalAlpha=s[2]?.8:1;sq(x,y,len,sc/2,s[2]?col.t.foam:col.t.deep);g.globalAlpha=1;});});}
+function drawGround(){var sc=Math.max(4,Math.round(K*.55)),q=[[-HX,-HY],[HX,-HY],[HX,HY],[-HX,HY]];
+var rim=q.map(function(c){return pj(c[0]+(c[0]>0?.5:-.5),c[1]+(c[1]>0?.5:-.5),0);}),gq=q.map(function(c){return pj(c[0],c[1],0);});
+g.beginPath();rim.forEach(function(p,i){if(i)g.lineTo(p[0],p[1]);else g.moveTo(p[0],p[1]);});g.closePath();
+g.strokeStyle=col.t.foam;g.lineWidth=4;g.lineJoin='round';g.setLineDash([sc,sc*1.5]);g.lineDashOffset=-phase*6;g.stroke();g.setLineDash([]);
+poly(gq,col.t.sand);g.beginPath();gq.forEach(function(p,i){if(i)g.lineTo(p[0],p[1]);else g.moveTo(p[0],p[1]);});g.closePath();g.strokeStyle=col.t.dune;g.lineWidth=1;g.stroke();
+D.dunes.forEach(function(u){poly([pj(u[0],u[1],0),pj(u[0]+u[2],u[1],0),pj(u[0]+u[2],u[1]+u[3],0),pj(u[0],u[1]+u[3],0)],col.t.dune);});}
+function drawPalm(pm){var pp=Math.max(3,Math.round(K*.4)),b=pj(pm.x,pm.y,0),j,seen={};
+for(j=0;j<pm.h;j++)sq(Math.round((b[0]+pm.lean*j*pp*.3)/pp)*pp-pp/2,b[1]-(j+1)*pp,pp,pp,col.t.trunk);
+var tx=b[0]+pm.lean*pm.h*pp*.3,ty=b[1]-pm.h*pp;
+pm.fr.forEach(function(a){var r=a*Math.PI/180;for(var t=0;t<5;t++){var px=Math.round((tx+Math.cos(r)*t*pp)/pp)*pp,py=Math.round((ty-Math.sin(r)*t*pp*.45+t*t*pp*.14)/pp)*pp,k=px+','+py;
+if(!seen[k]){seen[k]=1;sq(px-pp/2,py,pp,pp,col.t.frond);}}});}
+function face(q,cc,side,ghost,hv){
+if(ghost){g.beginPath();q.forEach(function(p,i){if(i)g.lineTo(p[0],p[1]);else g.moveTo(p[0],p[1]);});g.closePath();
+g.fillStyle=rgba(cc.c,hv?.32:.16);g.fill();g.strokeStyle=rgb(cc.c);g.lineWidth=1;g.lineJoin='round';g.stroke();}
+else poly(q,side==='t'?(hv?cc.ht:cc.t):side==='l'?(hv?cc.hl:cc.l):(hv?cc.hr:cc.r));}
+function drawTower(i){
+var t=T[i],x0=(i-(N-1)/2)*P,h=TW/2,c=Math.cos(yaw),s=Math.sin(yaw),faces=[];
+NORM.forEach(function(n,f){var xr=n[0]*c-n[1]*s,yr=n[0]*s+n[1]*c;if(xr+yr>.001)faces.push([f,xr-yr<0?'l':'r']);});
+var z=0;
+t.layers.forEach(function(ly,li){
+var z1=z+ly.h,cc=col.st[ly.k],hv=hover&&hover.t===i&&hover.l===li;
+faces.forEach(function(F){var a=CORN[F[0]],b=CORN[(F[0]+1)%4];
+var q=[pj(x0+a[0]*h,a[1]*h,z),pj(x0+b[0]*h,b[1]*h,z),pj(x0+b[0]*h,b[1]*h,z1),pj(x0+a[0]*h,a[1]*h,z1)];
+face(q,cc,F[1],cc.ghost,hv);hits.push({q:q,t:i,l:li});
+g.beginPath();for(var zz=z;zz<=z1;zz++)line(pj(x0+a[0]*h,a[1]*h,zz),pj(x0+b[0]*h,b[1]*h,zz));
+for(var k=1;k<TW;k++){var f0=k/TW,mx=a[0]+(b[0]-a[0])*f0,my=a[1]+(b[1]-a[1])*f0;line(pj(x0+mx*h,my*h,z),pj(x0+mx*h,my*h,z1));}
+g.strokeStyle=cc.ghost?rgba(cc.c,.5):col.page;g.globalAlpha=cc.ghost?1:.8;g.lineWidth=.75;g.stroke();g.globalAlpha=1;});
+z=z1;});
+if(t.layers.length){var ly=t.layers[t.layers.length-1],li=t.layers.length-1,cc=col.st[ly.k],hv=hover&&hover.t===i&&hover.l===li;
+var q=CORN.map(function(k){return pj(x0+k[0]*h,k[1]*h,z);});face(q,cc,'t',cc.ghost,hv);hits.push({q:q,t:i,l:li});
+g.beginPath();q.forEach(function(p,j){line(p,q[(j+1)%4]);});g.strokeStyle=cc.ghost?rgba(cc.c,.5):col.page;g.globalAlpha=cc.ghost?1:.8;g.lineWidth=.75;g.stroke();g.globalAlpha=1;}}
+function fitText(s,w){if(g.measureText(s).width<=w)return s;while(s.length>1&&g.measureText(s+'…').width>w)s=s.slice(0,-1);return s+'…';}
+function txt(s,x,y,f){g.lineWidth=3;g.lineJoin='round';g.strokeStyle=col.page;g.strokeText(s,x,y);g.fillStyle=f;g.fillText(s,x,y);}
+function draw(){
+g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,W,H);hits=[];place0();
+drawSky();drawGround();
+var items=[],i;for(i=0;i<N;i++)items.push({d:pj((i-(N-1)/2)*P,0,0)[2],k:0,i:i});
+D.palms.forEach(function(pm,j){items.push({d:pj(pm.x,pm.y,0)[2],k:1,i:j});});
+items.sort(function(a,b){return a.d-b.d;});
+items.forEach(function(it){if(it.k)drawPalm(D.palms[it.i]);else drawTower(it.i);});
+// callouts in two staggered rows (one row on narrow screens); each text lies between the leaders of the other row
+var tops=T.map(function(t,i){var p=pj((i-(N-1)/2)*P,0,t.height);return{i:i,x:p[0],y:p[1]};});
+tops.sort(function(a,b){return a.x-b.x;});
+var sw=(W-16)/N,cs=tops.map(function(o,k){return 8+(k+.5)*sw;});
+g.textBaseline='alphabetic';labelHits=[];
+tops.forEach(function(o,k){var t=T[o.i],c=cs[k],low=!compact&&(N-1-k)%2===0,ra,rb;
+if(compact){ra=c+5;rb=c+sw-6;}
+else if(low){ra=k>=1?cs[k-1]+5:8;rb=k+1<N?cs[k+1]-6:W-8;}
+else{ra=c+5;rb=k+2<N?cs[k+2]-6:W-8;}
+var y0=bandTop+(compact?22:low?66:12),x=ra,w=0,nm=t.name,l2,l3;
+if(compact){g.font='700 22px "Roboto Condensed",Arial,sans-serif';w=g.measureText(String(t.open)).width;}
+else{g.font='700 14px "Roboto Condensed",Arial,sans-serif';nm=fitText(t.name,rb-ra);w=g.measureText(nm).width;
+g.font='500 12px Roboto,Arial,sans-serif';l2=t.open+' open · '+t.unreviewed+' unreviewed';if(g.measureText(l2).width>rb-ra)l2=t.open+' open · '+t.unreviewed+' unrev.';
+l2=fitText(l2,rb-ra);l3='+'+sh(t.add)+' −'+sh(t['del']);w=Math.max(w,g.measureText(l2).width,g.measureText(l3).width);}
+if(low){x=Math.max(ra,Math.min(c-18,rb-w));}
+g.beginPath();g.moveTo(o.x,o.y-3);
+if(low){g.lineTo(Math.min(Math.max(c,x+4),x+w-4),y0+36);}
+else{g.lineTo(c,bandBottom+(compact?4:8));g.lineTo(c,y0-(compact?20:11));}
+g.strokeStyle=col.ink;g.lineWidth=1;g.stroke();
+labelHits.push({x:x,y:y0-12,w:w,h:compact?26:48,i:o.i});
+if(compact){txt(String(t.open),x,y0,col.ink);return;}
+g.font='700 14px "Roboto Condensed",Arial,sans-serif';txt(nm,x,y0,col.ink);
+g.font='500 12px Roboto,Arial,sans-serif';txt(l2,x,y0+16,col.ink);
+g.font='400 12px Roboto,Arial,sans-serif';var pl='+'+sh(t.add);txt(pl,x,y0+31,col.good);
+txt('−'+sh(t['del']),x+g.measureText(pl+' ').width,y0+31,col.bad);});}
+function sh(v){return v<1000?String(v):(v/1000).toFixed(1)+'k';}
+function moving(){return vis&&!d.hidden&&!reduce;}
+function spinning(){return spin&&!inside&&!drag;}
+function frame(ts){raf=0;var mv=moving();
+if(mv){if(spinning()&&last)yaw+=Math.min(100,ts-last)*1.1e-4;phase=ts/1000;}
+last=mv?ts:0;
+if(mv&&!spinning()&&ts-lastDraw<50){raf=requestAnimationFrame(frame);return;}
+lastDraw=ts;draw();if(mv)raf=requestAnimationFrame(frame);}
+function sched(){if(!raf)raf=requestAnimationFrame(frame);}
+function pos(e){var r=cv.getBoundingClientRect();return[e.clientX-r.left,e.clientY-r.top];}
+function place(e){var x=e.clientX+12,y=e.clientY+14,w=tip.offsetWidth,h=tip.offsetHeight;
+if(x+w>innerWidth-8)x=Math.max(8,e.clientX-w-12);if(y+h>innerHeight-8)y=Math.max(8,e.clientY-h-12);tip.style.left=x+'px';tip.style.top=y+'px';}
+function pick(e){var p=pos(e),f=null;for(var i=hits.length-1;i>=0;i--){if(inside4(hits[i].q,p[0],p[1])){f=hits[i];break;}}
+var lab=null;if(!f)for(var j=0;j<labelHits.length;j++){var L=labelHits[j];if(p[0]>=L.x&&p[0]<=L.x+L.w&&p[1]>=L.y&&p[1]<=L.y+L.h){lab=T[L.i];break;}}
+var ch=(f&&f.t)!==(hover&&hover.t)||(f&&f.l)!==(hover&&hover.l)||!f!==!hover;hover=f;
+if(f&&tip){var t=T[f.t],ly=t.layers[f.l];tip.textContent=t.name+' · '+ly.label.toLowerCase()+' · '+ly.n+' PR'+(ly.n===1?'':'s');tip.hidden=false;place(e);}
+else if(lab&&tip){tip.textContent=lab.name+' · '+lab.open+' open · '+lab.unreviewed+' unreviewed';tip.hidden=false;place(e);}
+else if(tip)tip.hidden=true;if(ch)sched();}
+cv.addEventListener('pointerdown',function(e){drag={x:e.clientX};spin=false;if(cv.setPointerCapture)try{cv.setPointerCapture(e.pointerId);}catch(x){}});
+cv.addEventListener('pointermove',function(e){inside=true;if(drag){yaw+=(e.clientX-drag.x)*.01;drag.x=e.clientX;hover=null;if(tip)tip.hidden=true;sched();}else pick(e);});
+function up(){drag=null;sched();}
+cv.addEventListener('pointerup',up);cv.addEventListener('pointercancel',up);
+cv.addEventListener('pointerenter',function(){inside=true;});
+cv.addEventListener('pointerleave',function(){inside=false;hover=null;if(tip)tip.hidden=true;sched();});
+cv.addEventListener('keydown',function(e){var k=e.key==='ArrowLeft'?-1:e.key==='ArrowRight'?1:0;if(!k)return;e.preventDefault();spin=false;yaw+=k*.12;sched();});
+function relayout(){layout();sched();}
+if(window.ResizeObserver)new ResizeObserver(relayout).observe(stage);else addEventListener('resize',relayout);
+if(window.IntersectionObserver)new IntersectionObserver(function(es){vis=es[es.length-1].isIntersecting;sched();}).observe(cv);
+function recolor(){readColors();sched();}
+if(window.MutationObserver)new MutationObserver(recolor).observe(d.documentElement,{attributes:true,attributeFilter:['data-theme']});
+if(window.matchMedia)try{matchMedia('(prefers-color-scheme: dark)').addEventListener('change',recolor);}catch(e){}
+if(d.fonts&&d.fonts.ready)d.fonts.ready.then(sched);
+readColors();layout();sched();
+})();
+"""
+
+
 def render_html(an, repo, now, hist=None):
     hist = hist or []
     prs = an["prs"]
     by_num = {p["number"]: p for p in prs}
     hot_set = {h["file"] for h in an["hotFiles"]}
     areas = sorted(an["areas"], key=lambda a: (-len(an["areas"][a]), a))
+    top = top_areas(an)
+    scene = effort_scene(an)
     n_open, n_un, n_dr = len(prs), sum(p["unreviewed"] for p in prs), sum(bool(p["isDraft"]) for p in prs)
     n_done, n_stale = sum(p["looksDone"] for p in prs), sum(p["stale"] for p in prs)
     n_fail = sum(p["ci"] in ("FAILURE", "ERROR") for p in prs)
@@ -878,8 +1404,8 @@ def render_html(an, repo, now, hist=None):
              "<meta name=viewport content='width=device-width,initial-scale=1'>"
              "<title>PR scan: %s</title>"
              "<link rel=preconnect href='https://fonts.googleapis.com'><link rel=preconnect href='https://fonts.gstatic.com' crossorigin>"
-             "<link rel=stylesheet href='%s'><script>%s</script><style>%s</style></head><body><div class=\"app\">" % (
-                 esc(repo), FONTS_URL, THEME_JS, CSS))
+             "<link rel=stylesheet href='%s'><script>%s</script><style>%s%s</style></head><body><div class=\"app\">" % (
+                 esc(repo), FONTS_URL, THEME_JS, CSS, SCENE_CSS))
     o.append('<header class="top"><h1>PR scan <span>/ <a href="https://github.com/%s">%s</a></span></h1>'
              '<div class="top-right"><div class="live"><i class="dot" aria-hidden="true"></i>'
              '<span><span id="ago">Updated </span><time id="upd" datetime="%s">%s UTC</time></span></div>'
@@ -888,9 +1414,20 @@ def render_html(an, repo, now, hist=None):
 
     # ---- city panel: score box + trends
     d_open = change_24h(hist, "open", n_open, now)
-    o.append('<section class="a-city" aria-label="Summary and trends"><div class="score-box"><div class="score">%d<small>open</small></div>'
+    o.append('<section class="a-city" aria-label="Effort map and trends"><div class="scene%s"><div class="score-box"><div class="score">%d<small>open</small></div>'
              '<p class="score-note"><b>%d unreviewed &middot; %d look done</b><span>%d possible duplicate group%s &middot; %d draft%s</span>%s</p></div>' % (
-                 n_open, n_un, n_done, n_clusters, "" if n_clusters == 1 else "s", n_dr, "" if n_dr == 1 else "s", delta_text(d_open)))
+                 " has-stage" if scene["towers"] else "", n_open, n_un, n_done, n_clusters, "" if n_clusters == 1 else "s",
+                 n_dr, "" if n_dr == 1 else "s", delta_text(d_open)))
+    if scene["towers"]:
+        o.append('<div class="stage" id="stage">%s</div><p class="scene-cap"><b>Effort map.</b> One tower per area, layer by PR. %s</p>%s'
+                 '<ol class="scene-key">%s</ol><script type="application/json" id="scene-data">%s</script>' % (
+                     scene_svg(scene), esc(scene["caption"]), legend([(n, "k-" + k) for k, n, _ in SCENE_STATES]),
+                     "".join('<li>%s<small>%d open</small></li>' % (
+                         ptype(t["name"]) if not t["members"] else '<span class="ptype" style="--ac:var(--soft)"><i></i><span class="nm">%s</span></span>' % esc(t["name"]),
+                         t["open"]) for t in scene["towers"]), scene_json(scene)))
+    else:
+        o.append('<p class="empty-block">No data yet</p><p class="sec-note">The effort map needs at least one open pull request.</p>')
+    o.append("</div>")
     recent = window(hist, now, TREND_DAYS)
     o.append('<div class="head" style="margin-top:16px"><h2>Trends</h2><span>last %d days, %d snapshot%s</span></div>' % (
         TREND_DAYS, len(recent), "" if len(recent) == 1 else "s"))
@@ -920,21 +1457,25 @@ def render_html(an, repo, now, hist=None):
 
     # ---- standings: areas ranked by open PRs
     spark_hist = window(hist, now, SPARK_DAYS)
-    biggest = max([len(ps) for ps in an["areas"].values()] or [1])
-    o.append('<section class="a-standings" aria-label="Areas"><div class="head"><h2>By area</h2><span>ranked by open PRs, line = %dd</span></div>'
+    biggest = max([len(e["prs"]) for e in top] or [1])
+    o.append('<section class="a-standings" aria-label="Areas"><div class="head"><h2>By area</h2><span>top %d by open PRs, line = %dd</span></div>'
              '<div style="margin-bottom:8px">%s</div><div class="st-list"><div class="st-axis" aria-hidden="true"><span>#</span><span>Area</span>'
-             '<span>State mix</span><span>Open</span></div><ol>' % (SPARK_DAYS, legend([(n, "k-" + k) for k, n in BUCKETS])))
-    for i, a in enumerate(areas, 1):
-        ps = an["areas"][a]
+             '<span>State mix</span><span>Open</span></div><ol>' % (TOP_AREAS, SPARK_DAYS, legend([(n, "k-" + k) for k, n in BUCKETS])))
+    for i, e in enumerate(top, 1):
+        a, ps, members = e["name"], e["prs"], e["members"]
         cnt = {k: sum(bucket(p) == k for p in ps) for k, _ in BUCKETS}
         segs = "".join('<i class="%s" style="flex:%d" data-tip="%s" title="%s"></i>' % (
             k, cnt[k], esc("%s: %d" % (n, cnt[k])), esc("%s: %d" % (n, cnt[k]))) for k, n in BUCKETS if cnt[k])
-        series = downsample([s["areas"].get(a, 0) for s in spark_hist if s["open"] == 0 or s["areas"]], 48)
-        o.append('<li class="st"><span class="rank">%d</span><div class="who"><b>%s</b><small>%s</small></div>'
+        ma = members or [a]
+        series = downsample([sum(s["areas"].get(m, 0) for m in ma) for s in spark_hist if s["open"] == 0 or s["areas"]], 48)
+        who = (ptype(a, link=True) if not members else '<span class="ptype" style="--ac:var(--soft)" title="%s"><i></i><span class="nm">%s</span></span>' % (
+            esc(", ".join(members)), esc(a)))
+        sub = (" · ".join("%d %s" % (cnt[k], n.lower()) for k, n in BUCKETS if cnt[k]) if not members else
+               "%d areas: %s" % (len(members), ", ".join(members)))
+        o.append('<li class="st"><span class="rank">%d</span><div class="who"><b>%s</b><small title="%s">%s</small></div>'
                  '<span class="track"><span class="fill" style="width:%.1f%%">%s</span></span>'
                  '<div class="where"><b>%d</b>%s</div></li>' % (
-                     i, ptype(a, link=True),
-                     esc(" · ".join("%d %s" % (cnt[k], n.lower()) for k, n in BUCKETS if cnt[k])),
+                     i, who, esc(sub), esc(sub),
                      100.0 * len(ps) / biggest, segs, len(ps),
                      sparkline(series, "%s: open PRs over %d days" % (a, SPARK_DAYS))))
     o.append("</ol></div></section>")
@@ -1026,7 +1567,8 @@ def render_html(an, repo, now, hist=None):
         stat("Stale (%dd+)" % STALE_DAYS, n_stale, show_delta=False),
         stat("CI failing", n_fail, show_delta=False, cls="warn" if n_fail else ""))))
     o.append('<footer class="foot">Generated %s UTC for %s. Read-only scan of public PR metadata.</footer></div>'
-             '<div class="tip" id="tip" hidden></div><script>%s</script></body></html>' % (now.strftime("%Y-%m-%d %H:%M"), esc(repo), JS))
+             '<div class="tip" id="tip" hidden></div><script>%s</script><script>%s</script></body></html>' % (
+                 now.strftime("%Y-%m-%d %H:%M"), esc(repo), JS, SCENE_JS))
     return "".join(o)
 
 

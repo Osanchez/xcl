@@ -411,6 +411,150 @@ class PageTests(unittest.TestCase):
         self.assertNotIn("<script src", out)
 
 
+def analysis_of(counts):
+    """Analysis with counts = {area: open PRs}; PR k of an area is a draft when k is even and looks done otherwise."""
+    prs, n = [], 0
+    for area, c in counts.items():
+        for k in range(c):
+            n += 1
+            prs.append(pr(n, "%s: t%d" % (area, n), ["crates/xcl/src/vfs/f%d.rs" % n], isDraft=(k % 2 == 0)))
+    an = ps.build_analysis(prs, NOW)
+    # force the areas: build_analysis groups by path, so regroup by the requested area for the test
+    an["areas"] = {}
+    for p in an["prs"]:
+        a = p["title"].split(":")[0]
+        p["primary"] = a
+        an["areas"].setdefault(a, []).append(p)
+    return an
+
+
+class TopAreaTests(unittest.TestCase):
+    def test_cut_and_else(self):
+        an = analysis_of({"A": 5, "B": 4, "C": 3, "D": 2, "E": 1})
+        t = ps.top_areas(an, 3)
+        self.assertEqual([e["name"] for e in t], ["A", "B", "C", ps.ELSE_NAME])
+        self.assertEqual(t[-1]["members"], ["D", "E"])
+        self.assertEqual(len(t[-1]["prs"]), 3)
+        self.assertIsNone(t[0]["members"])
+
+    def test_ties_by_name(self):
+        an = analysis_of({"Zed": 2, "Abe": 2, "Mid": 2, "Low": 1})
+        t = ps.top_areas(an, 2)
+        self.assertEqual([e["name"] for e in t], ["Abe", "Mid", ps.ELSE_NAME])
+        self.assertEqual(t[-1]["members"], ["Zed", "Low"])
+
+    def test_fewer_or_equal_areas_has_no_else(self):
+        an = analysis_of({"A": 2, "B": 1})
+        self.assertEqual([e["name"] for e in ps.top_areas(an, 6)], ["A", "B"])
+        self.assertEqual([e["name"] for e in ps.top_areas(an, 2)], ["A", "B"])
+        self.assertEqual(ps.top_areas(analysis_of({}), 6), [])
+
+    def test_standings_use_top_and_filters_keep_all(self):
+        an = analysis_of({"A%d" % i: 10 - i for i in range(8)})
+        out = ps.render_html(an, "o/r", NOW)
+        st = out.split('class="a-standings"')[1].split("</section>")[0]
+        self.assertEqual(st.count('<li class="st">'), 7)
+        self.assertIn("Everything else", st)
+        self.assertIn("2 areas: A6, A7", st)
+        chips = out.split('aria-label="Area filters"')[1].split("</div>")[0]
+        self.assertEqual(chips.count('data-area='), 8)
+
+
+class SceneTests(unittest.TestCase):
+    def test_layer_order_and_counts(self):
+        an = analysis_of({"A": 6})
+        for i, p in enumerate(an["prs"]):  # 2 drafts-style variety
+            p["isDraft"], p["looksDone"], p["unreviewed"] = (i == 0), (i in (1, 2)), (i != 3)
+        t = ps.effort_scene(an)["towers"][0]
+        self.assertEqual([(ly["k"], ly["n"]) for ly in t["layers"]], [("done", 2), ("rev", 1), ("wait", 2), ("draft", 1)])
+        self.assertEqual(t["height"], 6)
+        self.assertEqual((t["open"], t["unreviewed"]), (6, 5))
+
+    def test_no_scaling_up_to_cap(self):
+        sc = ps.effort_scene(analysis_of({"A": 40, "B": 3}))
+        self.assertEqual(sc["scale"], 1.0)
+        self.assertEqual(sc["towers"][0]["height"], 40)
+        self.assertTrue(sc["caption"].startswith("One layer is one open PR."))
+        self.assertIn("ghost", sc["caption"])
+
+    def test_scaling_above_cap(self):
+        sc = ps.effort_scene(analysis_of({"A": 80, "B": 1}))
+        a, b = sc["towers"]
+        self.assertEqual(sc["scale"], 0.5)
+        self.assertEqual(a["height"], 40)
+        self.assertEqual(b["height"], 1)  # a non-empty layer keeps one layer
+        self.assertIn("about 2 open PRs", sc["caption"])
+        self.assertIn("40", sc["caption"])
+        self.assertEqual(sum(ly["n"] for ly in a["layers"]), 80)
+
+    def test_svg_one_group_per_tower_and_escapes(self):
+        an = analysis_of({"A": 2, "B<i>": 1})
+        svg = ps.scene_svg(ps.effort_scene(an))
+        self.assertEqual(svg.count('<g class="tower"'), 2)
+        self.assertIn("B&lt;i&gt;", svg)
+        self.assertNotIn("<i>", svg)
+        self.assertEqual(svg.count('<g class="callout">'), 2)
+        self.assertIn('role="img"', svg)
+        self.assertEqual(ps.scene_svg(ps.effort_scene(analysis_of({}))), "")
+
+    def test_json_block_escapes_script_end(self):
+        sc = ps.effort_scene(analysis_of({"</script><b>": 1}))
+        js = ps.scene_json(sc)
+        self.assertNotIn("<", js)
+        self.assertEqual(json.loads(js)["towers"][0]["name"], "</script><b>")
+        out = ps.render_html(analysis_of({"</script><b>": 1}), "o/r", NOW)
+        block = out.split('id="scene-data">')[1].split("</script>")[0]
+        self.assertEqual(json.loads(block)["towers"][0]["open"], 1)
+
+    def test_ghost_split(self):
+        an = analysis_of({"A": 6})
+        for i, p in enumerate(an["prs"]):
+            p["isDraft"], p["looksDone"], p["unreviewed"] = (i == 0), (i in (1, 2)), (i != 3)
+        sc = ps.effort_scene(an)
+        ly = {x["k"]: x["ghost"] for x in sc["towers"][0]["layers"]}
+        self.assertEqual(ly, {"done": False, "rev": False, "wait": True, "draft": True})
+        data = json.loads(ps.scene_json(sc))
+        self.assertEqual({s_["k"]: s_["ghost"] for s_ in data["states"]}, {"done": False, "rev": False, "wait": True, "draft": True})
+        svg = ps.scene_svg(sc)
+        for k, ghost in (("done", False), ("rev", False), ("wait", True), ("draft", True)):
+            polys = [x for x in svg.split("<polygon") if 'class="vx v-%s ' % k in x]
+            self.assertTrue(polys, k)
+            self.assertEqual(all(" ghost" in x.split('"')[1] for x in polys), ghost, k)
+        self.assertIn("ghost", sc["caption"])
+
+    def test_palms_deterministic(self):
+        a, b = ps.scene_decor(7), ps.scene_decor(7)
+        self.assertEqual(a, b)
+        self.assertEqual(json.dumps(a), json.dumps(b))
+        self.assertEqual(len(a["palms"]), 6)
+        self.assertEqual(a["palms"][0], {"x": -11.31, "y": -1.92, "h": 5, "lean": -0.79, "fr": [0, 53, 112, 190, 237, 304]})
+        self.assertEqual(a["dunes"][0], [-4.53, 1.66, 3.39, 0.65])
+        gx, gy = ps.scene_plate(7)
+        for pm in a["palms"]:
+            self.assertLessEqual(abs(pm["x"]), gx)
+            self.assertLessEqual(abs(pm["y"]), gy)
+        self.assertNotEqual(ps.scene_decor(3)["palms"], a["palms"])
+        self.assertEqual(ps.scene_svg(ps.effort_scene(analysis_of({"A": 3, "B": 2}))), ps.scene_svg(ps.effort_scene(analysis_of({"A": 3, "B": 2}))))
+
+    def test_scene_tokens_in_both_themes(self):
+        light = ps.CSS.split("@media")[0]
+        dark = ps._DARK_TOKENS
+        self.assertGreaterEqual(len(ps.SCENE_TOKENS), 11)
+        for name, a, b in ps.SCENE_TOKENS:
+            self.assertIn("--%s:%s;" % (name, a), light)
+            self.assertIn("--%s:%s;" % (name, b), dark)
+            self.assertNotEqual(a, b)
+            self.assertIn("'" + name + "'", ps.SCENE_JS)
+        out = ps.render_html(analysis_of({"A": 1}), "o/r", NOW)
+        self.assertIn(":root[data-theme=dark]{color-scheme:dark;" + dark.split(";")[0], out)
+        self.assertIn("var(--sky-1)", out)
+
+    def test_page_empty_state_without_prs(self):
+        out = ps.render_html(analysis_of({}), "o/r", NOW)
+        self.assertNotIn('id="stage"', out)
+        self.assertIn("No data yet", out.split('class="a-city"')[1].split("</section>")[0])
+
+
 class ClusterLabelTests(unittest.TestCase):
     def m(self, *areas):
         return [{"primary": a, "additions": ln, "deletions": 0} for a, ln in areas]
