@@ -1,0 +1,36 @@
+# name	kind	source	branch	category	platform	notes
+# kind=git: source is the clone URL, folder is tools/<name>. kind=system: source is a read-only check command, branch is -.
+name	kind	source	branch	category	platform	notes
+awesome-gta6-re	git	https://github.com/Ahmet-Dedeler/awesome-gta6-reverse-engineering	main	index	any	CC0-1.0 per README. Index of the ecosystem: reference only
+gta6-asset-info	git	https://github.com/TrinitronClient/GTA6-Asset-Info	main	format-notes	any	GPL-3.0. Reference only: read, do not copy code or text into XCL
+0x52504639	git	https://github.com/SentinelInteractive/0x52504639	main	format-notes	any	MIT. Docs only; publishes no key
+rpf9-research	git	https://github.com/JoshRob297/rpf9-research	main	format-notes	any	GPL-3.0. Reference only: do not copy code into XCL; publishes no key
+gta6-pc-port-hub	git	https://github.com/fishingpvalues/gta6-pc-port-hub	main	coordination	any	CC0-1.0. Archived on GitHub: read-only reference
+rage-tools-vi	git	https://github.com/lynxnathan/rage-tools-vi	main	archive	any	MIT. Python+Rust, needs uv and cargo; has a submodule (rdna2-spirv)
+rage9-re	git	https://github.com/Ahmet-Dedeler/rage9-re	master	archive	any	MIT OR Apache-2.0. PSO data and animations to glTF
+bcpack-rs	git	https://github.com/Ahmet-Dedeler/bcpack-rs	master	texture	any	MIT OR Apache-2.0. BCPack texture decoder
+sixng	git	https://github.com/holdmysocks/SixNG	master	viewer	any	GPL-3.0. Use the tool only: do not copy code into XCL (GPL-2.0-only)
+gta6-explorer	git	https://github.com/HolyRoses/gta6-explorer	main	archive	any	MIT. Read-only browse and extract, Python
+ttpf-studio	git	https://github.com/woreksami/ttpf-studio	main	texture	any	MIT. Build from source, never the unsigned exe
+percystar	git	https://github.com/rpatty-dev/PercyStar	main	archive	any	All rights reserved: use only, no modification or code reuse
+vice-lens	git	https://github.com/Librett0/vice-lens	main	viewer	any	MIT. Build from source (release bundles AGPL ffmpeg)
+6stars	git	https://github.com/meetox80/6stars	main	viewer	macos	No licence: use only, no copying. macOS Metal world viewer
+awc-from-rpf9	git	https://github.com/Albotterin/AWC_from_RPF9_Extractor	main	audio	any	MIT. First run downloads the Leonida decoder; Android station packs not used
+git	system	git --version	-	base	any	brew install git / winget install Git.Git
+gh	system	gh --version	-	base	any	brew install gh / winget install GitHub.cli
+python3	system	python3 -c 'import sys; assert sys.version_info >= (3,11); print(sys.version.split()[0])'	-	base	any	Python 3.11+: brew install python / winget install Python.Python.3.12
+uv	system	uv --version	-	base	any	brew install uv / winget install astral-sh.uv
+rustup	system	rustup --version	-	base	any	brew install rustup / winget install Rustlang.Rustup
+cargo	system	cargo --version	-	base	any	Installed by rustup (stable toolchain)
+xcode-select	system	xcode-select -p	-	base	macos	xcode-select --install (needed by 6stars, Swift)
+imhex	system	command -v imhex || ls /Applications | grep -i imhex	-	reversing	any	brew install --cask imhex / winget install WerWolv.ImHex
+ghidra	system	command -v ghidraRun || ls /Applications | grep -i ghidra	-	reversing	any	brew install --cask ghidra / https://ghidra-sre.org
+rustup-msvc	system	rustup toolchain list | grep stable-x86_64-pc-windows-msvc	-	build	windows	rustup toolchain install stable-x86_64-pc-windows-msvc
+dxc	system	command -v dxc || ls "/c/Program Files (x86)/Windows Kits/10/bin"	-	build	windows	Windows SDK (winget install Microsoft.WindowsSDK.10.0.26100) or VS Build Tools
+pwsh	system	pwsh --version	-	build	windows	winget install Microsoft.PowerShell
+pix	system	command -v pix || ls "/c/Program Files/Microsoft PIX"	-	debug	windows	winget install Microsoft.PIX
+renderdoc	system	command -v renderdoccmd || ls "/c/Program Files/RenderDoc"	-	debug	windows	winget install BaldurKarlsson.RenderDoc
+windbg	system	command -v windbgx || command -v windbg	-	debug	windows	winget install Microsoft.WinDbg
+x64dbg	system	command -v x64dbg || ls "/c/Program Files/x64dbg" || ls "$HOME/x64dbg"	-	debug	windows	winget install x64dbg.x64dbg
+rga	system	rga --version	-	gpu	windows	Radeon GPU Analyzer (RDNA2 ISA): https://gpuopen.com/rga/
+llvm-mc	system	llvm-mc --version	-	gpu	windows	LLVM with the AMDGPU target (match tests/data/llvm-amdgpu): winget install LLVM.LLVM
