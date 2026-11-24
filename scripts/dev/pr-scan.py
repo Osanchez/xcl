@@ -1992,6 +1992,12 @@ def overall_progress(games, ladder):
             "playable": n, "total": len(games)}
 
 
+def in_progress_games(assess):
+    """The assessed games that are not yet Playable, the furthest first (ties by name); finished games are never shown."""
+    gs = [g for g in assess["games"] if not is_playable(g)]
+    return sorted(gs, key=lambda g: (-game_pct(g["levels"], assess["ladder"]), g["name"]))
+
+
 def ladder_markers(games, ladder):
     """One marker per game on the mega ladder, [{"name", "pct", "row", "playable"}]; games at the same % stack in rows (0 = on the bar)."""
     out, seen = [], {}
@@ -2427,9 +2433,10 @@ def progress_games_html(pg, repo):
     readme = {_norm_name(g["name"]): g for g in pg["games"]}
     o, known = [], set()
     if a:
+        known = {_norm_name(g["name"]) for g in a["games"]}
         o.append('<div class="pg-cols" aria-hidden="true">%s</div>' % "".join("<span>%s</span>" % esc(s["label"]) for s in _ladder_sorted(a["ladder"])))
         o.append("<ul class=\"pg-games\">")
-        for g in sorted(a["games"], key=lambda g: (is_playable(g), -game_pct(g["levels"], a["ladder"]))):  # games still in progress first
+        for g in in_progress_games(a):  # finished games are not shown
             r = readme.get(_norm_name(g["name"]))
             known.add(_norm_name(g["name"]))
             pill = ""
@@ -2442,14 +2449,14 @@ def progress_games_html(pg, repo):
                          "https://github.com/%s/blob/main/README.md" % esc(repo),
                          '<p class="small pg-lim"><b>Limit</b> %s</p>' % esc(g["limits"]) if g["limits"] else ""))
         for g in pg["games"]:
-            if _norm_name(g["name"]) not in known:
+            if _norm_name(g["name"]) not in known and g["kind"] != "done":
                 o.append('<li class="pg-game"><div class="pg-gh"><b>%s</b><span class="pg-gp">not assessed yet</span></div><p class="small pg-ev">%s</p></li>' % (
                     esc(g["name"]), esc(g["what"])))
         o.append("</ul>")
     elif pg["games"]:
         o.append('<p class="empty-block">%s</p><ul class="pg-games">%s</ul>' % (NO_DATA, "".join(
             '<li class="pg-game"><div class="pg-gh"><b>%s</b>%s</div><p class="small pg-ev">%s</p></li>' % (
-                esc(g["name"]), '<span class="pill">%s</span>' % esc(g["state"]), esc(g["what"])) for g in pg["games"])))
+                esc(g["name"]), '<span class="pill">%s</span>' % esc(g["state"]), esc(g["what"])) for g in pg["games"] if g["kind"] != "done")))
     else:
         o.append('<p class="empty-block">%s</p>' % NO_DATA)
     if pg["highlights"]:
@@ -2527,12 +2534,15 @@ def progress_hero_html(pg, repo):
     a = pg["assessment"]
     if not a:
         return '<section class="pg-hero a-prog" aria-label="Overall progress"><p class="empty-block">%s</p></section>' % NO_DATA
-    ov = overall_progress(a["games"], a["ladder"])
-    done = "all %d games" % ov["total"] if ov["playable"] == ov["total"] else "%d of %d games" % (ov["playable"], ov["total"])
-    note = ('<p class="score-note"><b>%s</b><span>%s playable</span><span>Assessed %s (%s)</span></p>' % (
-        esc(ov["step"]) if ov["game"] else "Everything playable", done, esc(a["assessedAt"]), esc(a["assessedBy"])))
+    ip = in_progress_games(a)
+    if not ip:
+        return ('<section class="pg-hero a-prog" aria-label="Overall progress"><p class="empty-block">Every listed game is playable.</p>%s</section>' % banner_html(a, pg["live"], repo))
+    g = ip[0]
+    ov = {"pct": game_pct(g["levels"], a["ladder"]), "step": game_reach(g["levels"], a["ladder"])[0]["label"]}
+    note = ('<p class="score-note"><b>%s</b><span>%s</span>%s<span>Assessed %s (%s)</span></p>' % (
+        esc(g["name"]), esc(ov["step"]), '<span>&ldquo;%s&rdquo;</span>' % esc(g["evidence"]) if g["evidence"] else "", esc(a["assessedAt"]), esc(a["assessedBy"])))
     return ('<section class="pg-hero a-prog" aria-label="Overall progress"><div class="pg-score"><div class="score">%s<small>%%</small></div>%s</div>%s%s</section>' % (
-        fmt_pct(ov["pct"]), note, ladder_bar_html(a, ov, ladder_markers(a["games"], a["ladder"])), banner_html(a, pg["live"], repo)))
+        fmt_pct(ov["pct"]), note, ladder_bar_html(a, ov, ladder_markers(ip, a["ladder"])), banner_html(a, pg["live"], repo)))
 
 
 PROGRESS_CSS = """
@@ -2540,7 +2550,7 @@ PROGRESS_CSS = """
 .pg-hero,.pg-panel{background:var(--surface);border:1px solid var(--edge);min-width:0;min-height:0}
 .pg-hero{display:grid;grid-template-columns:minmax(0,1fr);gap:var(--sp-3) var(--sp-5);align-items:end;padding:var(--sp-3) var(--pan-x)}
 .pg-hero>.empty-block{grid-column:1/-1}
-.pg-score{display:flex;align-items:flex-end;gap:var(--sp-2) var(--sp-4);flex-wrap:wrap}.pg-score .score-box,.pg-score .score-note{margin:0}
+.pg-score{min-width:0;display:flex;align-items:flex-end;gap:var(--sp-2) var(--sp-4);flex-wrap:wrap}.pg-score .score-box,.pg-score .score-note{margin:0;min-width:0;flex:1 1 160px}
 .pg-banner{grid-column:1/-1;padding:var(--sp-2) var(--sp-3);border-left:4px solid var(--partial);background:var(--wash);color:var(--ink);font-size:13px;line-height:1.35}
 .pg-bar{position:relative;min-width:0;padding-bottom:calc(var(--sp-5) + var(--sp-1))}
 .pg-marks{position:relative;height:calc(var(--rows)*11px + 6px);margin-bottom:var(--sp-1)}
@@ -2584,7 +2594,7 @@ details.pg-sec>summary::-webkit-details-marker{display:none}
 .pg-areas li{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(24px,1fr) 24px;gap:var(--sp-2);align-items:center;padding:var(--sp-1) 0;font-size:13px}
 .pg-areas li b{text-align:right}
 @media (min-width:900px){
-.pg-hero{grid-template-columns:auto minmax(0,1fr)}
+.pg-hero{grid-template-columns:minmax(0,1.1fr) minmax(0,1fr)}
 .js .pg{flex:1;min-height:0}
 .js .pg-grid{flex:1;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:minmax(0,1.45fr) minmax(0,1fr);grid-template-areas:"games next" "check work"}
 .pg-games-p{grid-area:games}.pg-check-p{grid-area:check}.pg-next-p{grid-area:next}.pg-work-p{grid-area:work}

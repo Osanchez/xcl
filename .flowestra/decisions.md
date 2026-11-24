@@ -545,3 +545,9 @@ The user asked for a Progress tab like portwatch-vi.xyz: milestone steps with pe
 
 ### Scheduled re-assessment
 - A Claude routine is set up with the schedule skill after the page ships. It runs every 6 hours and checks whether the upstream README or HANDOFF blob differs from `progress.json`. If it does, it re-rates the game levels using only README/HANDOFF text and the ladder definitions, updates `progress.json` (`assessedBy: claude-routine`, new blobs, verbatim evidence quotes), commits it to `dev` and pushes. If nothing changed, it does nothing.
+
+### Progress tab shows only games in progress (user request, 2026-11-24)
+- The Progress tab lists only the games that are not yet Playable, which today is the retail game (README row "A newer retail game", 🚧). Finished titles (Minecraft Preview, Unicorn Overlord, Fortnite, XDefiant) are not shown anywhere on the page: no rows, no ladder markers and no "N of M games playable" line.
+- The rule is "not Playable", not a hard-coded name, so a renamed or added in-progress row still shows. If every game is Playable, the page says "Every listed game is playable."
+- The hero is that game's own %, step and evidence. With several in-progress games, it shows the furthest one and lists the others below.
+- progress.json still holds all games (the routine rates every row); the filter applies at render time only.

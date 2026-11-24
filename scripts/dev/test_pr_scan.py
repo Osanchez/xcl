@@ -2336,21 +2336,41 @@ class ProgressPageTests(unittest.TestCase):
     def test_hero_ladder_and_games(self):
         p = self.prog(self.page())
         self.assertIn('<div class="score">60<small>%</small></div>', p)
-        self.assertIn("<b>Menus</b><span>4 of 5 games playable</span><span>Assessed 2026-11-24 (manual)</span>", p)
-        self.assertEqual(p.count('class="pg-mk '), 5)
+        self.assertIn("<b>A newer retail game</b><span>Menus</span><span>&ldquo;starts in ~4 s", p)
+        self.assertIn("Assessed 2026-11-24 (manual)", p)
+        self.assertNotIn("games playable", p)
+        self.assertEqual(p.count('class="pg-mk '), 1)
         self.assertIn('class="pg-mk wip" style="left:60%;bottom:0px"', p)
-        self.assertIn('class="pg-mk ok" style="left:100%;bottom:33px"', p)
         self.assertEqual(re.findall(r'<li style="left:(\d+)%"[^>]*><b>', p), ["15", "30", "45", "60", "80", "100"])
         self.assertIn('<div class="pg-track"><i style="width:60%"></i>', p)
-        self.assertEqual(p.count('class="pg-game"'), 5)
-        self.assertEqual(re.findall(r'<li class="pg-game"><div class="pg-gh"><b>([^<]+)</b>', p),
-                         ["A newer retail game", "Minecraft Preview", "Unicorn Overlord", "Fortnite", "XDefiant"])  # in progress first, then file order
-        self.assertEqual(p.count('class="c full"'), 4 * 6 + 4)  # four playable games, plus groundwork, loads, boots, menus of the fifth
+        self.assertEqual(p.count('class="pg-game"'), 1)
+        self.assertEqual(p.count('class="c full"'), 4)
         self.assertEqual(p.count('class="c none"'), 2)
-        self.assertIn("“fully playable”", p)
         self.assertIn("<b>Limit</b> gameplay not reached yet; its minimap mesh pipelines are refused", p)
-        self.assertIn('class="pg-st">✅</span>', p)
-        self.assertEqual(ps.first_sentence("x `" + "y" * 200 + "`"), "x…")  # a cut never leaves an open code span
+        for done in ("Minecraft Preview", "Unicorn Overlord", "Fortnite", "XDefiant", "fully playable"):
+            self.assertNotIn(done, p)  # finished games appear nowhere on the page
+
+    def test_all_playable_message(self):
+        a = json.loads(json.dumps(ps.load_progress()))
+        a["games"][4]["levels"].update(ingame=1, playable=1)
+        p = self.prog(self.page(assessment=a))
+        self.assertIn("Every listed game is playable.", p)
+        self.assertEqual(p.count('class="pg-game"'), 0)
+        self.assertEqual(p.count('class="pg-mk '), 0)
+        self.assertNotIn("Every listed game", self.prog(self.page()))
+
+    def test_several_in_progress_games_furthest_first(self):
+        a = json.loads(json.dumps(ps.load_progress()))
+        a["games"][0]["levels"].update(ingame=0.5, playable=0)  # Minecraft Preview at 70 %
+        a["games"].append({"name": "Zed", "package": "", "levels": {"loads": 1, "boots": 0, "menus": 0, "ingame": 0, "playable": 0},
+                           "limits": "", "evidence": "boots soon", "source": "README.md#games"})
+        self.assertEqual([g["name"] for g in ps.in_progress_games(a)], ["Minecraft Preview", "A newer retail game", "Zed"])
+        p = self.prog(self.page(assessment=a))
+        self.assertIn('<div class="score">70<small>%</small></div>', p)  # the hero is the furthest game
+        self.assertIn("<b>Minecraft Preview</b><span>Menus</span>", p)
+        self.assertEqual(re.findall(r'<li class="pg-game"><div class="pg-gh"><b>([^<]+)</b>', p), ["Minecraft Preview", "A newer retail game", "Zed"])
+        self.assertEqual(p.count('class="pg-mk '), 3)
+        self.assertNotIn("Fortnite", p)
 
     def test_partial_cells(self):
         a = json.loads(json.dumps(ps.load_progress()))
@@ -2412,11 +2432,11 @@ class ProgressPageTests(unittest.TestCase):
         self.assertIn("No PR activity in the last 24 h.", w)
         only_readme = self.prog(self.page(assessment=None, live={}))
         self.assertIn("No data yet", only_readme)
-        self.assertEqual(only_readme.count('class="pg-game"'), 3)  # README games are still listed, unassessed
+        self.assertEqual(only_readme.count('class="pg-game"'), 1)  # README rows not Playable are still listed, unassessed
 
     def test_hostile_markdown_is_escaped(self):
         hostile = "<img src=x onerror=alert(1)>"
-        readme = ("## Games\n\n| Game | Package | State | What works | Limits |\n|---|---|---|---|---|\n| **%s** | `<b>` | ✅ | [x](javascript:alert(1)) <script>a</script> | \"q\" |\n"
+        readme = ("## Games\n\n| Game | Package | State | What works | Limits |\n|---|---|---|---|---|\n| **%s** | `<b>` | 🚧 | [x](javascript:alert(1)) <script>a</script> | \"q\" |\n"
                   "\n## Highlights\n\n- <script>alert(1)</script> `<i>code</i>` **bold**\n\n## What works\n\n### <b>H</b>\n\n| Feature | State | What it does |\n|---|---|---|\n| <u>f</u> | <i>s</i> | <script>w</script> |\n" % hostile)
         handoff = "## Next steps (priority)\n1. <script>alert(2)</script> `<b>x</b>` [l](javascript:evil)\n## In progress (unfinished)\n### <h1>t</h1>\n<script>line</script>\n"
         pg = pg_fixture(games=ps.parse_games(readme), highlights=ps.parse_highlights(readme), features=ps.parse_features(readme),
