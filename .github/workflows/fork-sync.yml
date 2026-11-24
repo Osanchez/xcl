@@ -1,0 +1,93 @@
+name: Fork sync
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  sync:
+    if: github.repository == 'Osanchez/xcl'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require SYNC_TOKEN
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::SYNC_TOKEN is not set. Add a fine-grained PAT (contents and workflows write on this repository) as the repository secret SYNC_TOKEN."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync upstream into dev
+        id: sync
+        run: |
+          set +e
+          scripts/dev/sync-upstream.sh --branch dev --push-work 2>&1 | tee "$RUNNER_TEMP/sync.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" = 2 ]; then
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+            echo "Upstream merge conflict (exit 2)"
+          elif [ "$rc" != 0 ]; then
+            echo "::error::sync-upstream.sh failed with exit code $rc"
+            exit "$rc"
+          fi
+
+      - name: Report conflict
+        if: steps.sync.outputs.rc == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create sync-conflict --color B60205 --description "Upstream merge conflict" || true
+          {
+            echo "Merging upstream into dev hit conflicts in:"
+            echo
+            sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/conflicts.txt"
+            echo
+            echo "Run: $RUN_URL"
+            echo
+            echo "Resolve locally with scripts/dev/sync-upstream.sh --branch dev, then push dev. The next successful run closes this issue."
+          } > "$RUNNER_TEMP/body.md"
+          n=$(gh issue list --label sync-conflict --state open --json number --jq '.[0].number // empty')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh issue create --title "Upstream merge conflict" --label sync-conflict --body-file "$RUNNER_TEMP/body.md"
+          fi
+          git merge --abort
+          echo "::error::Upstream merge conflict; see the sync-conflict issue."
+          exit 1
+
+      - name: Close resolved conflict issue
+        if: steps.sync.outputs.rc == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          n=$(gh issue list --label sync-conflict --state open --json number --jq '.[0].number // empty')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body "Resolved by run $RUN_URL"
+            gh issue close "$n"
+          fi
