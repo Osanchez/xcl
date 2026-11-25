@@ -551,3 +551,71 @@ The user asked for a Progress tab like portwatch-vi.xyz: milestone steps with pe
 - The rule is "not Playable", not a hard-coded name, so a renamed or added in-progress row still shows. If every game is Playable, the page says "Every listed game is playable."
 - The hero is that game's own %, step and evidence. With several in-progress games, it shows the furthest one and lists the others below.
 - progress.json still holds all games (the routine rates every row); the filter applies at render time only.
+
+## 2026-11-25 Merge protection and telemetry spec correction (user approved both)
+
+### Merge protection
+Goal: outside code (pull requests, upstream syncs) enters only after a full-diff AI security review bound to the exact commit, plus the user's approval. Building locally afterwards is fine. Not a sandbox; a guard cannot catch every trick. Out of scope: crates/, upstream files, GitHub workflows, pushing.
+Files: scripts/dev/pr-gate.py, merge-pr.py, merge-guard.py, .githooks/pre-merge-commit, new scripts/dev/test_merge_protection.py. Python standard library only, Python 3.12+, LF. State in <git-common-dir>/pr-gate/.
+
+#### Gate (pr-gate.py)
+- `scan N [--repo OWNER/NAME]` (default repo ivall/xcl) and `scan --sync` (upstream main): read the head id (gh for a PR), `git fetch --no-tags <https url> <ref>:refs/pr-gate/<id>`, require the fetched id equals the head. Never check out, build or run it.
+- Full diff locally: `git diff --no-ext-diff --no-textconv --no-renames --binary <merge-base(HEAD,id)> <id>`, saved as <id>.diff. No GitHub patch text is used, so nothing is truncated. Any git error, empty diff or missing object: exit 3.
+- Keep path buckets and added-line patterns as review hints. Generated files: union of the marker scan (marker alone, no "do not edit" needed) and the built-in list. Scan writes <id>.scan.json: id, base, diff_sha256, line count, repo, number, hints. Scan always ends exit 2 (review needed); --ack is removed.
+- `record-review <id> --report FILE`: JSON {id, base, diff_sha256, reviewer, verdict: clean|findings|malicious, ranges: [[a,b],...], findings: [...]}. Refuse (exit 2) unless id/base/hash match the scan and the saved diff, ranges cover 1..line count with no gap, and the verdict is not malicious. Writes <id>.review.json.
+- `status <id>`: exit 0 only when scan and review match and the saved diff re-hashes.
+
+#### Merge (merge-pr.py)
+- `merge-pr.py N | --sync` with `--approve <full id>` required; `--dry-run` stops before merging. Requires a clean tree, status 0, current PR/upstream head == id == approve, and merge-base(HEAD,id) == reviewed base (otherwise scan again). Merges `--no-ff` with a message naming the id, review hash and reviewer. No cherry-pick or no-commit modes. Writes <id>.approved.json just before merging; removes it if the merge fails without conflicts.
+
+#### Guard (merge-guard.py, PreToolUse)
+- Outcomes: allow (exit 0), ask (exit 0 with hookSpecificOutput permissionDecision "ask" and a reason), deny (exit 2). Internal error: deny.
+- `merge-pr.py` without --dry-run: ask, so the user approves in Claude Code's own prompt. Recognised only as the program actually run, never as text or a comment.
+- Deny: merge/pull/rebase/cherry-pick/reset/checkout/switch/restore/worktree add/am/apply of FETCH_HEAD, MERGE_HEAD, a URL or refs/pr-gate/*; `gh pr merge`, `gh pr checkout`, `gh repo sync`; sync-upstream.sh without --dry-run; git with -c core.hooksPath, --no-verify on merge, or `git config core.hooksPath`; enabling the fork-sync workflow.
+- Ask: any other merge, pull (also --ff-only), rebase, cherry-pick, am, apply, or reset/checkout/switch whose target is not an ancestor of HEAD and not a local branch. `git checkout -- path` and creating a branch from HEAD are allowed.
+- Allow: --abort/--continue/--quit/--skip, read-only git, everything else. The origin/dev exemption is removed.
+- Parsing: newlines, ; && || | & ( ) { } $( ) and backticks separate commands with or without spaces; env prefixes; git global options; .exe; recurse into bash/sh -c, eval, cmd /c, powershell -Command. Heredoc bodies are data unless fed to a shell. Text it cannot parse that contains a blocked form: ask. Quoted text in echo, grep and commit messages stays allowed.
+
+#### Hook (pre-merge-commit)
+Allow when MERGE_HEAD is an ancestor of HEAD, or <id>.approved.json exists for it and HEAD matches; otherwise refuse. No remote-branch exemption. Must work in worktrees (git rev-parse --git-path).
+
+#### Acceptance
+test_merge_protection.py (unittest, no network, throwaway repositories, a local path standing in for the remote): every previous bypass (`git merge FETCH_HEAD; echo merge-pr.py`, `# merge-pr.py`, `(git merge FETCH_HEAD)`, rebase, reset --hard, checkout && build, gh pr checkout, bash -c, `;ls` without spaces) is ask or deny; data-only text is allowed; malformed input does not allow; gap in ranges, stale base, changed diff, moved head, malicious verdict, missing review and missing approval each refuse; a full happy path merges in a throwaway repository; hook cases. Run: python -I -m unittest style invocation documented in the file. Existing scripts/dev/test_pr_scan.py still passes.
+
+### Telemetry spec correction
+Files: docs/guide/telemetry.md, and in docs/guide/fork-workflow-for-agents.md only the statements that sync is hourly/automatic or done with sync-upstream.sh or git pull (now: manual, through scripts/dev/merge-pr.py --sync after review; fork-sync is disabled). Documentation; no code. Rewrite as one consistent document, under 400 lines, with the user's decisions D1, D2, D3, D4, D5, D6, D8 kept and D7 replaced.
+
+#### Corrections that must appear
+- No baseline has been measured on this machine. The 1 fps figure is VIctory's on an RX 6700 XT. XCL's README (line 47 at a67c592) reports about 5 fps in the 3D world on an RTX 5090 with #2057; its 14 fps is a whole-run average including menus and loading. Gap in the world is about 6x on that card, unknown here. Target 30. All causes H1-H6 are open, plus split wave64 (H7) and refused pipelines (H8). No ranking before measurement.
+- Loop cap: `xcl_budget = 1u << 16` (65,536) at crates/xcl/src/gpu/recomp/emit.rs:6220; the direct DXIL path has its own guard. HANDOFF's 4 M is stale.
+- XCL_WAVE64_SPIN=0 changes only groups of one console wave (emit.rs x64_spin); the multi-wave case always spins.
+- None of the nine wave64 PRs has merged (#1193 #2343 #1596 #1597 #1111 #2377 #2097 #2210 #917); #2203 and #2305 are other PRs.
+- GPU timing uses its own query heaps, never list_x.rs TimestampPool (shared 4096 slots, round robin). Pass intervals can overlap: report start and end ticks, do not sum them.
+- Part order: 1 event log, manifest, refused shaders and pipelines (with HRESULT, e.g. 0x8007000E on Blackwell groupshared subtract); 2 frame CPU/GPU/wait timing; 3 pass timing; 4 shader shape report; 5 no-window mode, error events, loop probe and counters; 6 smoke.ps1 reader last. Part 5 headless must be re-estimated against the compositor.
+- D7: measure overhead off versus on from part 2, on the test title; report it; sample if it exceeds 5 %.
+- D6: code appended in log.rs and report.rs, one-line call sites; remove every telemetry/ module reference. D8: remove smoke-block requirements. Switch name XCL_WINDOW_SIZE. Manifest example must match D5 (no XCL_FRAME_INTERVAL_US).
+- phase events carry confidence; pass events carry queue, start_tick, end_tick; nested manifest objects are allowed, events stay flat.
+- Split-wave report stays clean for possible sharing on a branch from main.
+- Testing uses tests/testtitle and synthetic shaders. No game run is part of this plan; choosing a title is an open question for the user.
+- Known test state at a67c592 (RTX 5080, driver 621.01): 1285 passed, 5 failed, 46 ignored, 26 skip messages; one stale barrier expectation (#2074 with #2203), four driver refusals of fuzz shaders. Security review of 052fddf^1..052fddf^2 found no malicious code.
+- Sync is manual now; remove hourly-sync claims.
+- Status line: awaiting the user's final review; nothing built.
+
+#### Review refinements (orchestrator, inside the approved design)
+1. "Do these before building anything" becomes "Once a title is chosen": these runs need a title, so they follow part 2 and none is part of this plan.
+2. Part 2 owns the query heaps and takes list-level start/end timestamps, so frame.gpu_ms is real: the union of calibrated list intervals; null when unavailable. Part 3 adds pass boundaries. Test 2 and 3 and the part table follow.
+3. Ticks are per queue. Each queue's GetClockCalibration is recorded (event `clock`: queue, gpu_tick, cpu_qpc, frequency) at start and every 60 frames; intervals on different queues are compared only after calibration. Direct and compute first; copy queues only when the device supports copy-queue timestamps, else null.
+4. Query slots belong to a submission, not a recording. A list submitted again before its results were read is emitted with null ticks and `resubmitted: true`. Bundles get no timestamps.
+5. XCL_LOOP_GUARD and XCL_LOOP_COUNTERS change generated code, so they join the list that bypasses the shader caches (gpu/recomp/pso.rs:805) on both paths; test 5 checks a changed value is never served from cache.
+6. Run directories hold title paths and names: they stay on the machine and are never committed.
+7. fork-workflow guide: `merge-pr.py --sync` merges into the checked-out work branch (dev); `main` is no longer updated automatically.
+8. "The exchange baseline moved with them" refers to #2203 only.
+
+#### Protection review refinements (orchestrator, security tightening inside the approved design)
+1. Hooks from incoming code must not run during the merge: core.hooksPath is the in-tree .githooks. merge-pr.py runs its merge, commit and abort with `-c core.hooksPath=<empty directory made in the state directory, verified empty>`. Test: an incoming commit that adds .githooks/pre-commit, prepare-commit-msg, commit-msg, post-commit, post-merge and post-checkout, each writing a marker, leaves no marker.
+2. Gate buckets add `agent-config` (.githooks/*, .claude/*, .mcp.json, CLAUDE.md, AGENTS.md, .gitattributes, .gitmodules, reverse-toolkit/*) and printed hints for them. merge-pr.py refuses (exit 2) when the diff touches .githooks/, .claude/, scripts/dev/, CLAUDE.md or .gitattributes, unless `--allow-protected` is also given; the guard's ask reason then says so.
+3. pre-merge-commit: take the incoming ids from the GITHEAD_<40 hex> environment variables git sets for this hook (measured with git 2.53: present, MERGE_HEAD absent), plus MERGE_HEAD when present; same ancestor / approval rule; none found: refuse. Test through a real `git merge` in a throwaway repository: unapproved refused, approved for this HEAD allowed.
+4. Guard asks for: anything whose words or redirect targets name the pr-gate state directory (pr-gate/....json, .diff) unless the program run is pr-gate.py or a read-only viewer (cat, ls, head, tail, wc, grep, sed -n, sha256sum) with no redirect into it; writes to the protection files (redirect target, or rm/mv/cp/sed -i/tee/truncate/chmod/dd, and PowerShell Set-Content/Out-File/Remove-Item/Copy-Item/Move-Item) naming merge-guard.py, merge-pr.py, pr-gate.py, pre-merge-commit or .claude/settings*.json; `patch`; git read-tree, checkout-index, archive, and `git show|cat-file <non-ancestor>:path` with an output redirect; gh workflow run of fork-sync (deny). `gh pr diff` piped to patch is covered by patch.
+5. Wrappers add timeout (with its duration word), watch, busybox, winpty, script -c, chroot, unshare, parallel. PowerShell iex / Invoke-Expression recurse into their text; Start-Process / saps / Invoke-Command / & with a git or gh program and danger words ask. A command anywhere whose any later word is git/gh followed by a FAMILY word, with an unknown program in front, asks (echo, printf, grep, rg, git, gh, cat excluded).
+6. Scan diff adds `--no-color --src-prefix=a/ --dst-prefix=b/ --no-relative --submodule=short -U3`; a diff containing a binary file needs each such path named in the review's findings (record-review refuses otherwise).
+7. Every row of the orchestrator's corpus is a test; remaining allowed by design: `git reset --hard origin/main` when it is an ancestor, `git clone` elsewhere, editing files through non-shell tools. The docstring says so.
