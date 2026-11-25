@@ -1,3 +1,14 @@
-# core.autocrlf is on in this clone. A shell script checked out with CRLF fails
-# on the carriage return, so git hooks have to keep LF whatever the platform.
-.githooks/* text eol=lf
+# core.autocrlf is on in this clone, which makes git announce a CRLF rewrite for
+# every file it touches and hands shell scripts a carriage return that `sh` chokes
+# on. These paths are the fork's own (see docs/guide/fork-workflow-for-agents.md)
+# and are all stored with LF already, so pinning them changes no content - it only
+# keeps the working copy correct and the output quiet.
+#
+# Deliberately NOT a blanket `* text=auto`: that would renormalise upstream's files
+# and turn the hourly sync into a tree-wide conflict.
+.gitattributes      text eol=lf
+.githooks/**        text eol=lf
+.claude/**          text eol=lf
+scripts/dev/**      text eol=lf
+docs/guide/**       text eol=lf
+reverse-toolkit/**  text eol=lf
