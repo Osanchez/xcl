@@ -121,11 +121,6 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
     console_list::hold_until_reset(old, blocks);
 }
 
-/// A submit is about to wait for the pipeline `this` has bound.
-pub(super) fn want_bound(this: *mut c_void) {
-    super::pso_async::want(with(this, |s| s.pso));
-}
-
 /// A put-off dispatch that could not be recorded.
 pub(super) fn dispatch_dropped() {
     count(DISPATCHES_SKIPPED);
