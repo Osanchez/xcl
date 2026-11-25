@@ -2164,13 +2164,11 @@ class LadderTests(unittest.TestCase):
 
 
 class ProgressFileTests(unittest.TestCase):
-    def test_file_is_valid_and_has_the_initial_values(self):
+    def test_file_is_valid_and_has_the_assessed_values(self):
         with open(ps.PROGRESS_FILE, encoding="utf-8") as f:
             d = json.load(f)
+        # assessedAt, assessedBy and the blob shas change on every re-assessment; validate_progress checks their format.
         self.assertEqual(ps.validate_progress(d), [])
-        self.assertEqual((d["assessedAt"], d["assessedBy"]), ("2026-11-24", "manual"))
-        self.assertEqual(d["readmeBlob"], "4d1932d2a423821dfd5f36fa44068f5689af817a")
-        self.assertEqual(d["handoffBlob"], "984a45360ab0cdb3750654199552df033f7fee87")
         self.assertEqual([(s["key"], s["pct"]) for s in d["ladder"]],
                          [("groundwork", 15), ("loads", 30), ("boots", 45), ("menus", 60), ("ingame", 80), ("playable", 100)])
         g = {x["name"]: x for x in d["games"]}
@@ -2337,7 +2335,8 @@ class ProgressPageTests(unittest.TestCase):
         p = self.prog(self.page())
         self.assertIn('<div class="score">60<small>%</small></div>', p)
         self.assertIn("<b>A newer retail game</b><span>Menus</span><span>&ldquo;starts in ~4 s", p)
-        self.assertIn("Assessed 2026-11-24 (manual)", p)
+        a = ps.load_progress()
+        self.assertIn("Assessed %s (%s)" % (a["assessedAt"], a["assessedBy"]), p)
         self.assertNotIn("games playable", p)
         self.assertEqual(p.count('class="pg-mk '), 1)
         self.assertIn('class="pg-mk wip" style="left:60%;bottom:0px"', p)
@@ -2410,7 +2409,7 @@ class ProgressPageTests(unittest.TestCase):
         a = ps.load_progress()
         live = {"README": "f" * 40, "HANDOFF": a["handoffBlob"]}
         out = self.prog(self.page(live=live))
-        self.assertIn("README changed since this assessment (2026-11-24).", out)
+        self.assertIn("README changed since this assessment (%s)." % a["assessedAt"], out)
         self.assertIn('href="https://github.com/o/r/commits/main/README.md"', out)
         self.assertNotIn("HANDOFF history", out)
         both = ps.banner_html(a, {"README": "1" * 40, "HANDOFF": "2" * 40}, "o/r")
