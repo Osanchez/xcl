@@ -25,11 +25,18 @@ merge_head="$root/.git/MERGE_HEAD"
 incoming=$(tr -d ' \t\r\n' < "$merge_head" | cut -c1-40)
 [ -n "$incoming" ] || exit 0
 
-# A merge of your own branches is normal work; only commits that are not already in this
-# repository's own history need the gate. An ancestor of HEAD cannot be foreign code.
+# A merge of your own branches is normal work; only commits from outside this fork need the
+# gate. An ancestor of HEAD cannot be foreign code, and a commit already reachable from this
+# fork's own remote branches arrived through the hourly sync workflow rather than from a
+# stranger's branch - 154 synced upstream commits cannot be reviewed one pull request at a time.
 if git merge-base --is-ancestor "$incoming" HEAD 2>/dev/null; then
     exit 0
 fi
+for own in origin/dev origin/main; do
+    if git merge-base --is-ancestor "$incoming" "$own" 2>/dev/null; then
+        exit 0
+    fi
+done
 
 receipt="$root/.git/pr-gate/$incoming.json"
 if [ -f "$receipt" ] && grep -q '"verdict": *"CLEAR"' "$receipt"; then
