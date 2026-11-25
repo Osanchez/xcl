@@ -1,66 +1,65 @@
 #!/bin/sh
-# Backstop for a merge made by hand in a terminal: refuse to create a merge commit for a
-# commit the security gate has not cleared.
+# Refuse to create a merge commit for a commit that merge-pr.py did not approve.
 #
-# Install once (not automatic - git hooks are per clone):
+# Install once (git hooks are per clone):
 #     git config core.hooksPath .githooks
 #
-# At this point git has staged the merge and MERGE_HEAD names what is coming in, so the only
-# question left is whether scripts/dev/pr-gate.py produced a receipt for that exact commit.
+# MERGE_HEAD names what is coming in. The merge is allowed when
+#   * every MERGE_HEAD commit is already an ancestor of HEAD (nothing new comes in), or
+#   * <git-common-dir>/pr-gate/<id>.approved.json exists for it, naming this HEAD. merge-pr.py
+#     writes that file just before it merges, after the review and --approve checks.
+# Otherwise the merge is refused. There is no exemption for remote branches: upstream code
+# arrives only through merge-pr.py.
 #
-# Known limits, by design of git rather than choice:
-#   * it does not run for a fast-forward merge, because no commit is created. That is why
-#     scripts/dev/merge-pr.py always passes --no-ff.
-#   * `git merge --no-verify` skips it.
-#   * `git cherry-pick` never reaches this hook at all.
-# So this is a seatbelt, not the mechanism. The mechanism is merge-pr.py plus the
-# PreToolUse hook in .claude/settings.json.
+# Measured with git 2.53: during a plain `git merge` git runs this hook BEFORE it writes
+# MERGE_HEAD, so there the hook cannot see what comes in and refuses (fail closed): a hand
+# merge that makes a commit is stopped here, whatever it merges. `git commit` that concludes a
+# merge runs only pre-commit, never this hook. So merge-pr.py merges with --no-commit and then
+# commits, and does not depend on this hook; the approval file is what this hook would honour
+# if git ever shows it MERGE_HEAD.
+#
+# A seatbelt, not the mechanism: it does not run for a fast-forward (merge-pr.py always passes
+# --no-ff), `git merge --no-verify` skips it (merge-guard.py denies that), and `git cherry-pick`
+# never reaches it. Works in linked worktrees: both paths come from `git rev-parse`.
 
-set -e
+refuse() {
+    cat >&2 <<EOF
 
-root=$(git rev-parse --show-toplevel)
-merge_head="$root/.git/MERGE_HEAD"
-[ -f "$merge_head" ] || exit 0          # not a merge we can inspect
+pre-merge-commit: refusing this merge: $1
 
-incoming=$(tr -d ' \t\r\n' < "$merge_head" | cut -c1-40)
-[ -n "$incoming" ] || exit 0
-
-# A merge of your own branches is normal work; only commits from outside this fork need the
-# gate. An ancestor of HEAD cannot be foreign code, and a commit already reachable from this
-# fork's own remote branches arrived through the hourly sync workflow rather than from a
-# stranger's branch - 154 synced upstream commits cannot be reviewed one pull request at a time.
-if git merge-base --is-ancestor "$incoming" HEAD 2>/dev/null; then
-    exit 0
-fi
-for own in origin/dev origin/main; do
-    if git merge-base --is-ancestor "$incoming" "$own" 2>/dev/null; then
-        exit 0
-    fi
-done
-
-receipt="$root/.git/pr-gate/$incoming.json"
-if [ -f "$receipt" ] && grep -q '"verdict": *"CLEAR"' "$receipt"; then
-    exit 0
-fi
-
-cat >&2 <<EOF
-
-pre-merge-commit: refusing to merge $incoming - no security-gate receipt.
-
-Expected: .git/pr-gate/$incoming.json
-
-Merging is followed by a build, and a build runs the incoming build.rs, its procedural macros
-and anything under scripts/ as you. Scan it first:
-
-    python scripts/dev/pr-gate.py <PR NUMBER> --repo ivall/xcl
-
-or do the whole thing the sanctioned way, which gates, verifies and merges in one step:
-
-    git merge --abort
-    python scripts/dev/merge-pr.py <PR NUMBER> --repo ivall/xcl
-
-If this is your own work rather than someone else's pull request, say so explicitly with
-    git merge --no-verify ...
+Outside code (a pull request, upstream main) is merged only with
+    python scripts/dev/merge-pr.py <N | --sync> --approve <full id>
+after pr-gate.py scan and record-review. Undo this merge with: git merge --abort
 
 EOF
-exit 1
+    exit 1
+}
+
+merge_head=$(git rev-parse --git-path MERGE_HEAD) || refuse "cannot locate MERGE_HEAD"
+[ -f "$merge_head" ] || refuse "git did not say what comes in (no MERGE_HEAD), so it cannot be checked"
+common=$(git rev-parse --path-format=absolute --git-common-dir) || refuse "cannot locate the git dir"
+here=$(git rev-parse HEAD) || refuse "cannot read HEAD"
+
+seen=0
+while IFS= read -r line || [ -n "$line" ]; do
+    incoming=$(printf '%s' "$line" | tr -d ' \t\r')
+    [ -n "$incoming" ] || continue
+    seen=1
+    case "$incoming" in
+        *[!0-9a-f]*) refuse "MERGE_HEAD holds something that is not a commit id" ;;
+    esac
+    [ "${#incoming}" -eq 40 ] || refuse "MERGE_HEAD holds something that is not a commit id"
+    if git merge-base --is-ancestor "$incoming" HEAD 2>/dev/null; then
+        continue
+    fi
+    approved="$common/pr-gate/$incoming.approved.json"
+    if [ -f "$approved" ] \
+        && grep -q "\"id\": \"$incoming\"" "$approved" \
+        && grep -q "\"head\": \"$here\"" "$approved"; then
+        continue
+    fi
+    refuse "$incoming has no approval for HEAD $here"
+done < "$merge_head"
+
+[ "$seen" -eq 1 ] || refuse "MERGE_HEAD is empty"
+exit 0

@@ -1,85 +1,53 @@
 #!/usr/bin/env python3
-"""Security gate for a pull request, to run *before* anything of it is checked out or built.
+"""Review gate for code that comes from outside (a pull request, an upstream sync).
 
-    scripts/dev/pr-gate.py 2343                       # scan upstream PR 2343
-    scripts/dev/pr-gate.py 2343 --repo Osanchez/xcl   # another repository
-    scripts/dev/pr-gate.py --diff origin/main..HEAD   # a local branch instead of a PR
-    scripts/dev/pr-gate.py 2343 --ack crates/xcl/build.rs   # after reviewing that file by hand
-    scripts/dev/pr-gate.py 2343 --json                # machine-readable
+    pr-gate.py scan 2343 [--repo OWNER/NAME]      fetch PR 2343's head, save the full diff
+    pr-gate.py scan --sync                        the same for upstream main
+    pr-gate.py record-review <id> --report FILE   record the AI review of that diff
+    pr-gate.py status <id>                        exit 0 only when scan and review match
 
-Why this exists: reading a diff is safe, but `cargo build` runs the pull request's `build.rs`
-and any procedural macro as you, `cargo test` runs its test code, and anything under
-`scripts/` runs as you. So the dangerous files have to be found before the first build, not
-after it.
+The flow, which merge-pr.py then enforces:
 
-What this does NOT do, by design:
+  1. `scan` reads the head commit id, fetches exactly that commit into refs/pr-gate/<id>
+     (never checked out, built or run), and saves `git diff <merge-base> <id>` in full as
+     <id>.diff. No GitHub patch text is used, so nothing is truncated. It always ends with
+     exit 2: a person or an AI reviewer still has to read the diff.
+  2. The reviewer reads the WHOLE saved diff and writes a report: id, base, diff_sha256,
+     reviewer, verdict (clean | findings | malicious), the line ranges it read (they must
+     cover 1..line count with no gap) and its findings.
+  3. `record-review` refuses a report that does not match the scan and the diff on disk, that
+     leaves a gap, or whose verdict is malicious.
+  4. merge-pr.py merges only when `status` passes, the head is still that id and the user
+     passed --approve <id>.
 
-* it never checks out, fetches, compiles or executes any code from the pull request;
-* for a pull request it only reads the GitHub API's file list and text patches (`gh api`),
-  and for `--diff` only `git diff` output of refs already in the local repository.
+State lives in <git-common-dir>/pr-gate/ (local, never committed, shared by worktrees):
+<id>.diff, <id>.scan.json, <id>.review.json, <id>.approved.json.
 
-Exit codes (the gate is fail-closed: anything it cannot determine blocks the merge):
+The path buckets and added-line patterns below are hints to point a reviewer at the risky
+files (build.rs and procedural macros run at build time; scripts/ run as you). They are not a
+verdict: the review covers every line.
 
-    0   clear - no blocking finding, or every blocking path was acknowledged with --ack
-    2   BLOCKED - a high-risk path or a suspicious added line needs manual review
-    3   could not scan (no `gh`, API error, unreadable diff) - treat exactly like BLOCKED
-
-Intended flow for a manual merge:
-
-    1. run this; if it exits 0, merge.
-    2. if it exits 2, read every file it names, in the browser or with `gh pr diff`.
-    3. re-run with one --ack per blocking path you have read and accepted. The acks are
-       echoed into the report so the decision is auditable.
-    4. only then merge.
+Exit codes: 0 ok, 2 refused / review needed, 3 could not scan (any git or gh error, empty diff,
+missing object). The gate fails closed: nothing it cannot determine counts as a pass.
 """
 from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Where a CLEAR verdict is recorded, one file per reviewed head commit. In .git/ on purpose:
-# it is local state, must never be committed, and must not survive a fresh clone.
-# merge-pr.py refuses to merge a commit with no receipt, so a force-pushed pull request (new
-# head commit) has to pass the gate again - a receipt keyed by pull request *number* would
-# silently bless whatever was pushed after the review.
-RECEIPTS = os.path.join(ROOT, ".git", "pr-gate")
-
-
-def write_receipt(head: str, repo: str, number: "int | None", acks: set) -> str:
-    """Record that `head` passed. Returns the receipt path, or "" if it could not be written
-    (which never turns a BLOCKED verdict into a pass - it only means merge-pr.py will ask for
-    the gate again)."""
-    if not head:
-        return ""
-    import time
-    try:
-        os.makedirs(RECEIPTS, exist_ok=True)
-        path = os.path.join(RECEIPTS, f"{head}.json")
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"head": head, "repo": repo, "number": number, "verdict": "CLEAR",
-                       "acknowledged": sorted(acks), "when": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                       "gate": os.path.basename(__file__)}, f, indent=1)
-            f.write("\n")
-        return path
-    except OSError:
-        return ""
-
-
-def pr_head(repo: str, number: int) -> str:
-    """The pull request's current head commit."""
-    doc = gh_json(f"repos/{repo}/pulls/{number}")
-    head = doc.get("head", {}).get("sha", "") if isinstance(doc, dict) else ""
-    if not head:
-        fail(f"could not read the head commit of {repo}#{number}.")
-    return head
+DEFAULT_REPO = "ivall/xcl"
+SYNC_REF = "refs/heads/main"
+ID_RE = re.compile(r"^[0-9a-f]{40}$")
+VERDICTS = ("clean", "findings", "malicious")
 
 # ---------------------------------------------------------------- risk buckets (by path)
 # Each bucket: (key, title, why it is dangerous, what to check by hand). Order is report order.
@@ -206,46 +174,114 @@ NOTICES = [
 LONG_BLOB = re.compile(r"[A-Za-z0-9+/=]{200,}")
 
 
+# ---------------------------------------------------------------- errors and git
 def fail(msg: str) -> "None":
-    """Exit 3: the scan could not be completed. Never exit 0 on an error - that would read as
-    a pass and is exactly the case where a merge must not happen."""
+    """Exit 3: the scan could not be completed. Never exit 0 on an error."""
     print(f"\nERROR: {msg}", file=sys.stderr)
-    print("pr-gate could not complete its scan, so nothing is cleared. Treat this as BLOCKED.",
+    print("pr-gate could not complete, so nothing is cleared. Treat this as BLOCKED.",
           file=sys.stderr)
     sys.exit(3)
 
 
-def gh_json(path: str, paginate: bool = False) -> object:
-    if not shutil.which("gh"):
-        fail("the GitHub CLI `gh` is not on PATH; install it or use --diff for a local branch.")
-    cmd = ["gh", "api", path]
-    if paginate:
-        cmd.append("--paginate")
-        cmd += ["--slurp"]
+def refuse(msg: str) -> "None":
+    print(f"\nREFUSED: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    """git in the repository this script lives in; output as bytes (a diff is not text)."""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=180)
+        r = subprocess.run(["git", "-C", ROOT, *args], capture_output=True, timeout=600)
     except (OSError, subprocess.SubprocessError) as e:
-        fail(f"`gh api {path}` could not run: {e}")
-    if r.returncode != 0:
-        detail = (r.stderr or r.stdout or "").strip().splitlines()
-        fail(f"`gh api {path}` failed: {detail[0] if detail else f'exit {r.returncode}'}")
+        fail(f"`git {' '.join(args[:2])}` could not run: {e}")
+    if check and r.returncode != 0:
+        detail = r.stderr.decode("utf-8", "replace").strip().splitlines()
+        fail(f"`git {' '.join(args[:2])}` failed: {detail[-1] if detail else r.returncode}")
+    return r
+
+
+def git_text(*args: str, check: bool = True) -> str:
+    return git(*args, check=check).stdout.decode("utf-8", "replace").strip()
+
+
+def state_dir() -> str:
+    """<git-common-dir>/pr-gate: one place for the main checkout and every worktree."""
+    common = git_text("rev-parse", "--path-format=absolute", "--git-common-dir")
+    return os.path.join(common, "pr-gate")
+
+
+def state_path(commit: str, kind: str) -> str:
+    if not ID_RE.match(commit):
+        fail(f"`{commit}` is not a full 40-hex commit id.")
+    return os.path.join(state_dir(), f"{commit}.{kind}")
+
+
+def remote_url(repo: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        fail(f"`{repo}` is not OWNER/NAME.")
+    return f"https://github.com/{repo}.git"
+
+
+def pr_head(repo: str, number: int) -> str:
+    """The pull request's current head commit, from the GitHub API."""
+    if not shutil.which("gh"):
+        fail("the GitHub CLI `gh` is not on PATH.")
     try:
-        doc = json.loads(r.stdout)
-    except ValueError as e:
-        fail(f"`gh api {path}` did not return JSON: {e}")
-    # --paginate --slurp gives a list of pages; flatten it.
-    if paginate and isinstance(doc, list) and doc and isinstance(doc[0], list):
-        return [item for page in doc for item in page]
-    return doc
+        r = subprocess.run(["gh", "api", f"repos/{repo}/pulls/{number}", "--jq", ".head.sha"],
+                           capture_output=True, text=True, errors="replace", timeout=180)
+    except (OSError, subprocess.SubprocessError) as e:
+        fail(f"`gh api` could not run: {e}")
+    head = r.stdout.strip()
+    if r.returncode != 0 or not ID_RE.match(head):
+        fail(f"could not read the head commit of {repo}#{number}: "
+             f"{(r.stderr or head).strip()[:200]}")
+    return head
 
 
-def generated_files() -> dict:
-    """{path: generator} for every file in the local checkout that names its generator in its
-    first lines. Falls back to GENERATED_FALLBACK when the checkout cannot be read (the gate
-    may be run from outside the repository)."""
-    found = {}
-    src = os.path.join(ROOT, "crates")
-    for folder, _, names in os.walk(src):
+def sync_head(repo: str) -> str:
+    out = git_text("ls-remote", remote_url(repo), SYNC_REF)
+    head = out.split()[0] if out else ""
+    if not ID_RE.match(head):
+        fail(f"could not read {SYNC_REF} of {repo}.")
+    return head
+
+
+def current_head(repo: str, number: "int | None", sync: bool) -> str:
+    return sync_head(repo) if sync else pr_head(repo, number)
+
+
+def sha256_file(path: str) -> str:
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def count_lines(data: bytes) -> int:
+    return data.count(b"\n") + (0 if data.endswith(b"\n") else 1)
+
+
+def write_json(path: str, doc: dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(doc, f, indent=1, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def read_json(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+# ---------------------------------------------------------------- hints
+def generated_files(extra: dict) -> dict:
+    """{path: generator}: files in the local checkout whose first lines name a generator (the
+    marker alone is enough), the built-in list, and `extra` (new files in the diff)."""
+    found = dict(GENERATED_FALLBACK)
+    for folder, _, names in os.walk(os.path.join(ROOT, "crates")):
         for name in names:
             if not name.endswith((".rs", ".toml")):
                 continue
@@ -256,30 +292,23 @@ def generated_files() -> dict:
             except OSError:
                 continue
             m = GENERATED_MARKER.search(head)
-            # Only count a file whose marker says "do not edit": several files mention a
-            # generator in prose while being hand-written logic (gpu/tiling.rs).
-            if m and re.search(r"do not edit", head, re.I):
-                rel = os.path.relpath(path, ROOT).replace("\\", "/")
-                found[rel] = m.group(1)
-    return found or dict(GENERATED_FALLBACK)
+            if m:
+                found[os.path.relpath(path, ROOT).replace("\\", "/")] = m.group(1)
+    found.update(extra)
+    return found
 
 
 def classify(path: str, generated: dict) -> list:
-    """Every bucket key the path falls into (a file can be in more than one)."""
-    hits = []
-    for key, patterns in BUCKET_PATTERNS.items():
-        if any(fnmatch.fnmatch(path, p) for p in patterns):
-            hits.append(key)
+    hits = [key for key, patterns in BUCKET_PATTERNS.items()
+            if any(fnmatch.fnmatch(path, p) for p in patterns)]
     if path in generated:
         hits.append("generated")
     return hits
 
 
 def scan_patch(patch: str) -> tuple:
-    """(suspicious, notices) found on the patch's added lines only. Removed and context lines
-    are not scanned: what matters is what the pull request introduces."""
-    added = [ln[1:] for ln in patch.splitlines()
-             if ln.startswith("+") and not ln.startswith("+++")]
+    """(suspicious, notices) on the added lines only."""
+    added = [ln[1:] for ln in patch.splitlines() if ln.startswith("+") and not ln.startswith("+++")]
     body = "\n".join(added)
     suspicious = [(k, why) for k, pat, why in SUSPICIOUS if pat.search(body)]
     notices = [(k, why) for k, pat, why in NOTICES if pat.search(body)]
@@ -289,7 +318,6 @@ def scan_patch(patch: str) -> tuple:
 
 
 def lock_findings(patch: str) -> list:
-    """Added dependency names and any git source in a Cargo.lock patch."""
     out = []
     for ln in patch.splitlines():
         if not ln.startswith("+") or ln.startswith("+++"):
@@ -297,189 +325,243 @@ def lock_findings(patch: str) -> list:
         text = ln[1:].strip()
         m = re.match(r'name\s*=\s*"([^"]+)"', text)
         if m:
-            out.append(("package", m.group(1)))
+            out.append(["package", m.group(1)])
         m = re.match(r'source\s*=\s*"(git\+[^"]+)"', text)
         if m:
-            out.append(("git-source", m.group(1)))
+            out.append(["git-source", m.group(1)])
     return out
 
 
-def pr_files(repo: str, number: int) -> list:
-    """[{path, status, binary, patch}] for a pull request, from the API only. No checkout."""
-    rows = gh_json(f"repos/{repo}/pulls/{number}/files?per_page=100", paginate=True)
-    if not isinstance(rows, list):
-        fail("the pull request file list was not a JSON array.")
-    files = []
-    for row in rows:
-        if not isinstance(row, dict) or "filename" not in row:
-            continue
-        patch = row.get("patch")
-        files.append({
-            "path": row["filename"],
-            "status": row.get("status", "?"),
-            # GitHub omits the patch for a binary file; changes == 0 with no patch is the
-            # same signal scripts/pr_check.py uses.
-            "binary": patch is None and row.get("changes", 0) == 0,
-            "patch": patch or "",
-        })
+def split_diff(text: str) -> list:
+    """[{path, binary, lines}] per file of a `git diff --no-renames --binary` text."""
+    files, cur = [], None
+    for ln in text.split("\n"):
+        if ln.startswith("diff --git "):
+            rest = ln[len("diff --git "):]
+            n = (len(rest) - 5) // 2          # "a/P b/P" with no renames
+            path = rest[2:2 + n] if rest.startswith("a/") and n > 0 else rest
+            cur = {"path": path.strip('"'), "binary": False, "lines": []}
+            files.append(cur)
+        elif cur is not None:
+            cur["lines"].append(ln)
+            if ln.startswith("GIT binary patch") or ln.startswith("Binary files"):
+                cur["binary"] = True
     return files
 
 
-def diff_files(rev: str) -> list:
-    """The same shape as pr_files, from `git diff` of refs already in the local repository."""
-    try:
-        names = subprocess.run(["git", "-C", ROOT, "diff", "--numstat", rev],
-                               capture_output=True, text=True, errors="replace", timeout=120)
-    except (OSError, subprocess.SubprocessError) as e:
-        fail(f"`git diff --numstat {rev}` could not run: {e}")
-    if names.returncode != 0:
-        fail(f"`git diff --numstat {rev}` failed: {(names.stderr or '').strip()}")
-    files = []
-    for line in names.stdout.splitlines():
-        parts = line.split("\t")
-        if len(parts) != 3:
-            continue
-        adds, dels, path = parts
-        binary = adds == "-" and dels == "-"   # git marks a binary file this way
-        patch = ""
-        if not binary:
-            one = subprocess.run(["git", "-C", ROOT, "diff", rev, "--", path],
-                                 capture_output=True, text=True, errors="replace", timeout=120)
-            patch = one.stdout if one.returncode == 0 else ""
-        files.append({"path": path, "status": "modified", "binary": binary, "patch": patch})
-    return files
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser(
-        description="Security gate for a pull request; run it before checking out or building.")
-    ap.add_argument("number", nargs="?", type=int, help="pull request number")
-    ap.add_argument("--repo", default="ivall/xcl", help="OWNER/NAME (default ivall/xcl)")
-    ap.add_argument("--diff", metavar="REV", help="scan a local range instead, e.g. origin/main..HEAD")
-    ap.add_argument("--ack", action="append", default=[], metavar="PATH",
-                    help="a blocking path you have read and accepted (repeatable)")
-    ap.add_argument("--json", action="store_true", help="machine-readable output")
-    a = ap.parse_args()
-    if (a.number is None) == (a.diff is None):
-        ap.error("give either a pull request number or --diff REV")
-
-    generated = generated_files()
-    # Read the head commit first: the receipt is bound to it, and merge-pr.py re-checks that
-    # the commit it fetches is the same one, so a push between the scan and the merge is caught.
-    head = pr_head(a.repo, a.number) if a.number is not None else ""
-    files = pr_files(a.repo, a.number) if a.number is not None else diff_files(a.diff)
-    if not files:
-        fail("the scan found no changed files, which is never true for a real pull request.")
-
-    acked = {p.replace("\\", "/") for p in a.ack}
-    findings, notices, deps, clean = {}, [], [], []
+def build_hints(diff_text: str) -> dict:
+    files = split_diff(diff_text)
+    extra = {}
     for f in files:
-        path = f["path"]
-        keys = classify(path, generated)
+        added = [ln[1:] for ln in f["lines"] if ln.startswith("+") and not ln.startswith("+++")]
+        m = GENERATED_MARKER.search("\n".join(added[:8]))
+        if m:
+            extra[f["path"]] = m.group(1)
+    generated = generated_files(extra)
+    flagged, notices, deps = {}, [], []
+    for f in files:
+        keys = classify(f["path"], generated)
         if f["binary"]:
             keys.append("binary")
-        suspicious, notes = scan_patch(f["patch"]) if f["patch"] else ([], [])
-        if "dependencies" in keys and path.endswith("Cargo.lock"):
-            deps += lock_findings(f["patch"])
-        for key, why in notes:
-            notices.append((path, key, why))
+        patch = "\n".join(f["lines"])
+        suspicious, notes = scan_patch(patch) if not f["binary"] else ([], [])
+        if f["path"].endswith("Cargo.lock"):
+            deps += lock_findings(patch)
+        notices += [[f["path"], k, why] for k, why in notes]
         if suspicious:
             keys.append("suspicious")
         if keys:
-            findings[path] = {"buckets": sorted(set(keys)), "status": f["status"],
-                              "suspicious": suspicious,
-                              "generator": generated.get(path)}
-        else:
-            clean.append(path)
+            flagged[f["path"]] = {"buckets": sorted(set(keys)),
+                                  "suspicious": [list(x) for x in suspicious],
+                                  "generator": generated.get(f["path"])}
+    return {"files": len(files), "flagged": flagged, "notices": notices, "dependencies": deps}
 
-    blocking = sorted(p for p in findings if p not in acked)
-    verdict = "CLEAR" if not blocking else "BLOCKED"
 
-    receipt = write_receipt(head, a.repo, a.number, acked) if verdict == "CLEAR" else ""
-
-    if a.json:
-        print(json.dumps({"verdict": verdict, "repo": a.repo, "number": a.number,
-                          "diff": a.diff, "head": head, "receipt": receipt,
-                          "files": len(files), "findings": findings,
-                          "blocking": blocking, "acknowledged": sorted(acked),
-                          "notices": notices, "dependencies": deps}, indent=1))
-        return 0 if verdict == "CLEAR" else 2
-
-    target = f"{a.repo}#{a.number}" if a.number is not None else a.diff
-    print(f"pr-gate: {target} - {len(files)} changed file(s), {len(clean)} with no risk flag\n")
-
-    by_bucket = {}
-    for path, info in findings.items():
-        for key in info["buckets"]:
-            by_bucket.setdefault(key, []).append(path)
-
-    for key, title, why, check in BUCKETS:
-        paths = sorted(by_bucket.get(key, []))
-        if not paths:
-            continue
-        print(f"[{key}] {title}")
-        print(f"  why:   {why}")
-        print(f"  check: {check}")
-        for p in paths:
-            mark = "  (acknowledged)" if p in acked else ""
-            gen = findings[p].get("generator")
-            print(f"    - {p} ({findings[p]['status']}){mark}")
-            if key == "generated" and gen:
-                print(f"        regenerate with: python {gen}   then diff; it must match exactly")
-        print()
-
-    if "suspicious" in by_bucket:
-        print("[suspicious] Added lines that look like a dropper")
-        print("  why:   these idioms are rare in this codebase and are how code fetches, decodes")
-        print("         or launches something at run time.")
-        print("  check: read every added line in these files before you build anything.")
-        for p in sorted(by_bucket["suspicious"]):
-            mark = "  (acknowledged)" if p in acked else ""
-            print(f"    - {p}{mark}")
-            for key, meaning in findings[p]["suspicious"]:
-                print(f"        {key}: {meaning}")
-        print()
-
-    if deps:
-        print("[dependencies] Changes in Cargo.lock")
-        for kind, value in deps:
-            flag = "  <-- never acceptable" if kind == "git-source" else ""
-            print(f"    {kind}: {value}{flag}")
-        print("  check: every added package name, character by character, against crates.io.\n")
-
-    if notices:
-        print("Notices (not blocking, but worth a look):")
-        for path, key, why in notices:
-            print(f"    {path}: {key} - {why}")
-        print()
-
-    if verdict == "CLEAR":
-        if acked:
-            print("Acknowledged by hand this run:")
-            for p in sorted(acked):
-                print(f"    - {p}")
-        print("VERDICT: CLEAR - no unreviewed high-risk path. Safe to check out, build and merge.")
-        if head:
-            print(f"         head commit: {head}")
-            if receipt:
-                print(f"         receipt:     {receipt}")
-                print("         merge it with: python scripts/dev/merge-pr.py "
-                      f"{a.number} --repo {a.repo}")
-            else:
-                print("         NOTE: the receipt could not be written, so merge-pr.py will "
-                      "ask for the gate again.")
-        return 0
-
-    print(f"VERDICT: BLOCKED - {len(blocking)} path(s) need a manual read first:")
-    for p in blocking:
-        print(f"    - {p}")
-    print("\nRead them without building anything:")
-    if a.number is not None:
-        print(f"    gh pr diff {a.number} --repo {a.repo} -- {' '.join(blocking[:6])}")
-    print("Then re-run with one --ack per path you accept, e.g.:")
-    print("    " + " ".join([f"--ack {p}" for p in blocking[:3]]))
-    print("\nDo not build or merge until this exits 0.")
+# ---------------------------------------------------------------- scan
+def do_scan(repo: str, number: "int | None", sync: bool) -> int:
+    head = current_head(repo, number, sync)
+    url = remote_url(repo)
+    ref = SYNC_REF if sync else f"pull/{number}/head"
+    dest = f"refs/pr-gate/{head}"
+    print(f"pr-gate: fetching {repo} {ref} (head {head}); nothing is checked out or run.")
+    git("fetch", "--no-tags", "--", url, f"{ref}:{dest}")
+    fetched = git_text("rev-parse", "--verify", "--quiet", f"{dest}^{{commit}}", check=False)
+    if fetched != head:
+        git("update-ref", "-d", dest, check=False)
+        fail(f"fetched {fetched or 'nothing'}, but the head is {head}: it moved during the scan. "
+             "Run the scan again.")
+    base = git_text("merge-base", "HEAD", head, check=False)
+    if not ID_RE.match(base):
+        fail("no merge base between HEAD and the head: unrelated history.")
+    diff = git("diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--binary",
+               base, head).stdout
+    if not diff.strip():
+        fail("the diff against the merge base is empty (already merged?).")
+    os.makedirs(state_dir(), exist_ok=True)
+    with open(state_path(head, "diff"), "wb") as f:
+        f.write(diff)
+    lines = count_lines(diff)
+    hints = build_hints(diff.decode("utf-8", errors="replace"))
+    write_json(state_path(head, "scan.json"), {
+        "id": head, "base": base, "diff_sha256": hashlib.sha256(diff).hexdigest(),
+        "lines": lines, "repo": repo, "number": number, "sync": sync, "hints": hints,
+        "scanned_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+    print(f"\nbase {base}\ndiff {state_path(head, 'diff')}  ({lines} lines, "
+          f"{hints['files']} file(s), {len(hints['flagged'])} flagged)\n")
+    titles = {k: t for k, t, _, _ in BUCKETS}
+    for path, info in sorted(hints["flagged"].items()):
+        tags = [titles.get(b, b) for b in info["buckets"]]
+        print(f"  hint: {path}: {', '.join(tags)}")
+        for key, why in info["suspicious"]:
+            print(f"        {key}: {why}")
+    for kind, value in hints["dependencies"]:
+        print(f"  hint: Cargo.lock {kind}: {value}")
+    print("\nREVIEW NEEDED: read the whole diff, then write a report and run\n"
+          f"  python scripts/dev/pr-gate.py record-review {head} --report <file>\n"
+          "Hints above are not a verdict; every line must be covered by the reported ranges.")
     return 2
+
+
+# ---------------------------------------------------------------- review
+def check_ranges(ranges: object, lines: int) -> str:
+    """"" when the ranges cover 1..lines with no gap, else the reason."""
+    spans = []
+    if not isinstance(ranges, list) or not ranges:
+        return "ranges must be a non-empty list of [first, last] line numbers"
+    for r in ranges:
+        if (not isinstance(r, list) or len(r) != 2
+                or any(not isinstance(x, int) or isinstance(x, bool) for x in r)):
+            return "every range must be [first, last] with two integers"
+        if r[0] < 1 or r[1] < r[0] or r[1] > lines:
+            return f"range {r} is outside 1..{lines}"
+        spans.append((r[0], r[1]))
+    spans.sort()
+    reach = 0
+    for a, b in spans:
+        if a > reach + 1:
+            return f"lines {reach + 1}..{a - 1} were not reviewed (gap)"
+        reach = max(reach, b)
+    if reach < lines:
+        return f"lines {reach + 1}..{lines} were not reviewed"
+    return ""
+
+
+def verify(commit: str) -> tuple:
+    """(problems, scan, review): no problems means the scan and the review match each other and
+    the diff on disk. Re-hashes the diff every time, so an edited diff is caught."""
+    problems = []
+    scan = read_json(state_path(commit, "scan.json"))
+    review = read_json(state_path(commit, "review.json"))
+    if not scan:
+        return ["there is no scan for this commit (run scan)"], scan, review
+    diff_path = state_path(commit, "diff")
+    try:
+        with open(diff_path, "rb") as f:
+            diff = f.read()
+    except OSError:
+        return ["the saved diff is missing"], scan, review
+    if scan.get("id") != commit:
+        problems.append("the scan is for another commit")
+    if hashlib.sha256(diff).hexdigest() != scan.get("diff_sha256"):
+        problems.append("the saved diff no longer matches the scan (it was changed)")
+    if count_lines(diff) != scan.get("lines"):
+        problems.append("the saved diff has a different line count than the scan")
+    if not review:
+        problems.append("there is no recorded review (run record-review)")
+        return problems, scan, review
+    for key in ("id", "base", "diff_sha256", "lines"):
+        if review.get(key) != scan.get(key):
+            problems.append(f"the review's {key} does not match the scan")
+    if review.get("verdict") not in ("clean", "findings"):
+        problems.append("the review verdict is not clean or findings")
+    why = check_ranges(review.get("ranges"), scan.get("lines", 0))
+    if why:
+        problems.append(why)
+    return problems, scan, review
+
+
+def review_hash(commit: str) -> str:
+    return sha256_file(state_path(commit, "review.json"))
+
+
+def do_record(commit: str, report_path: str) -> int:
+    scan = read_json(state_path(commit, "scan.json"))
+    if not scan:
+        refuse("there is no scan for this commit; run scan first.")
+    try:
+        with open(report_path, encoding="utf-8") as f:
+            report = json.load(f)
+    except (OSError, ValueError) as e:
+        refuse(f"the report cannot be read: {e}")
+    if not isinstance(report, dict):
+        refuse("the report must be a JSON object.")
+    for key in ("id", "base", "diff_sha256"):
+        if report.get(key) != scan.get(key) or report.get(key) is None:
+            refuse(f"the report's {key} does not match the scan (is it for another commit, "
+                   "another base, or another diff?).")
+    try:
+        with open(state_path(commit, "diff"), "rb") as f:
+            actual = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        refuse("the saved diff is missing; scan again.")
+    if actual != scan.get("diff_sha256"):
+        refuse("the saved diff was changed after the scan; scan again.")
+    reviewer = report.get("reviewer")
+    if not isinstance(reviewer, str) or not reviewer.strip():
+        refuse("the report names no reviewer.")
+    verdict = report.get("verdict")
+    if verdict not in VERDICTS:
+        refuse(f"verdict must be one of {', '.join(VERDICTS)}.")
+    if verdict == "malicious":
+        refuse("the reviewer's verdict is MALICIOUS. Do not merge this commit.")
+    findings = report.get("findings", [])
+    if not isinstance(findings, list):
+        refuse("findings must be a list.")
+    why = check_ranges(report.get("ranges"), scan["lines"])
+    if why:
+        refuse(f"the review does not cover the whole diff: {why}.")
+    write_json(state_path(commit, "review.json"), {
+        "id": commit, "base": scan["base"], "diff_sha256": scan["diff_sha256"],
+        "lines": scan["lines"], "reviewer": reviewer.strip(), "verdict": verdict,
+        "ranges": report["ranges"], "findings": findings,
+        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+    print(f"review recorded for {commit}: {verdict}, {len(findings)} finding(s), "
+          f"by {reviewer.strip()}.")
+    return 0
+
+
+def do_status(commit: str) -> int:
+    problems, scan, review = verify(commit)
+    if problems:
+        print(f"status {commit}: NOT READY", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        return 2
+    print(f"status {commit}: ready (base {scan['base']}, review {review['verdict']} by "
+          f"{review['reviewer']}, sha256 {review_hash(commit)})")
+    return 0
+
+
+def main(argv: "list | None" = None) -> int:
+    ap = argparse.ArgumentParser(description="Review gate for pull requests and upstream syncs.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sp = sub.add_parser("scan", help="fetch a head, save its full diff")
+    sp.add_argument("number", nargs="?", type=int, help="pull request number")
+    sp.add_argument("--sync", action="store_true", help="scan upstream main instead of a PR")
+    sp.add_argument("--repo", default=DEFAULT_REPO, help=f"OWNER/NAME (default {DEFAULT_REPO})")
+    rp = sub.add_parser("record-review", help="record a review report for a scanned commit")
+    rp.add_argument("id")
+    rp.add_argument("--report", required=True, metavar="FILE")
+    st = sub.add_parser("status", help="exit 0 only when scan and review match")
+    st.add_argument("id")
+    a = ap.parse_args(argv)
+    if a.cmd == "scan":
+        if (a.number is None) == (not a.sync):
+            ap.error("give a pull request number or --sync, not both")
+        return do_scan(a.repo, a.number, a.sync)
+    if not ID_RE.match(a.id):
+        ap.error("give the full 40-hex commit id")
+    return do_record(a.id, a.report) if a.cmd == "record-review" else do_status(a.id)
 
 
 if __name__ == "__main__":
