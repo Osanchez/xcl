@@ -1,7 +1,7 @@
 {
   "assessedAt": "2026-11-25",
   "assessedBy": "claude-routine",
-  "readmeBlob": "d9d151320a3731d4bd60471458c0b6b8e6b0d8a0",
+  "readmeBlob": "0af03d753ce01b9484fee9759f774053bf485c18",
   "handoffBlob": "984a45360ab0cdb3750654199552df033f7fee87",
   "ladder": [
     {"key": "groundwork", "label": "Groundwork", "pct": 15, "description": "The runtime, loader and GPU recompiler exist and are tested against real data."},
