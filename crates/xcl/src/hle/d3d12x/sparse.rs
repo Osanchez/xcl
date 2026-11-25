@@ -1462,6 +1462,15 @@ pub fn note_watch(t: std::time::Duration, pages: usize, watched: usize) {
 /// CPU writes, the textures uploaded again), `t` long.
 pub fn note_look(t: std::time::Duration) {
     WATCH[4].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
+    LONGEST_LOOK.fetch_max(t.as_micros() as u64, Ordering::Relaxed);
+}
+
+/// The longest look since the last `take_longest_look`, in µs.
+static LONGEST_LOOK: AtomicU64 = AtomicU64::new(0);
+
+/// The longest look since the last call (µs; the line's one reader resets it).
+pub fn take_longest_look() -> u64 {
+    LONGEST_LOOK.swap(0, Ordering::Relaxed)
 }
 
 /// What the looks before the title's submits cost so far: [whole looks µs, write-watch µs,
@@ -1473,18 +1482,33 @@ pub fn look_counters() -> [u64; 6] {
 }
 
 /// The `XCL_ACTIVITY` line for `d`, two `look_counters()` subtracted, `secs` apart: how much
-/// of the title's submitting threads' time XCL's looks took, and where it went.
-pub fn look_line(d: [u64; 6], secs: u64) -> String {
+/// of the title's submitting threads' time XCL's looks took, and where it went. `rest`: the
+/// same for `title_textures::look_parts()` (what the rest was spent on), `longest`: the
+/// longest look in the period (µs).
+pub fn look_line(d: [u64; 6], rest: [u64; 8], longest: u64, secs: u64) -> String {
     let [all, watch, pages, looks, watched, copies] = d;
+    let [recheck, vram, streamed, select, hash, detile, submit, bytes] = rest;
     let ms = |us: u64| us / 1000;
+    let the_rest = all.saturating_sub(watch + copies);
+    let named = recheck + vram + streamed + select + hash + detile + submit;
     format!(
-        "looks before submits ({secs} s): {looks} looks took {} ms ({:.1} % of the time): write-watch {} ms ({:.1} MB watched a look, {pages} pages written), copies into sparse video memory {} ms, the rest {} ms",
+        "looks before submits ({secs} s): {looks} looks took {} ms ({:.1} % of the time, longest {} ms): write-watch {} ms ({:.1} MB watched a look, {pages} pages written), copies into sparse video memory {} ms, the rest {} ms (view-source recheck {}, VRAM pages {}, streamed-texture recheck {}, choosing uploads {}, uploads {} MB: hash {}, detile {}, submit {}; other {})",
         ms(all),
         all as f64 / (secs.max(1) * 10_000) as f64,
+        ms(longest),
         ms(watch),
         watched as f64 / looks.max(1) as f64 / (1 << 20) as f64,
         ms(copies),
-        ms(all.saturating_sub(watch + copies))
+        ms(the_rest),
+        ms(recheck),
+        ms(vram),
+        ms(streamed),
+        ms(select),
+        bytes >> 20,
+        ms(hash),
+        ms(detile),
+        ms(submit),
+        ms(the_rest.saturating_sub(named))
     )
 }
 
@@ -1674,12 +1698,18 @@ mod tests {
     /// zero for a period without a look.
     #[test]
     fn the_look_line_splits_the_time() {
-        let line = look_line([830_000, 610_000, 4_800, 240, 240 * 1_641 << 20, 120_000], 2);
-        assert!(line.contains("240 looks took 830 ms (41.5 % of the time)"), "{line}");
+        let rest = [10_000, 5_000, 2_000, 8_000, 20_000, 30_000, 15_000, 48 << 20];
+        let line = look_line([830_000, 610_000, 4_800, 240, 240 * 1_641 << 20, 120_000], rest, 41_000, 2);
+        assert!(line.contains("240 looks took 830 ms (41.5 % of the time, longest 41 ms)"), "{line}");
         assert!(line.contains("write-watch 610 ms (1641.0 MB watched a look, 4800 pages written)"), "{line}");
         assert!(line.contains("copies into sparse video memory 120 ms, the rest 100 ms"), "{line}");
-        let idle = look_line([0; 6], 2);
-        assert!(idle.contains("0 looks took 0 ms (0.0 % of the time)") && idle.contains("0.0 MB watched a look"), "{idle}");
+        assert!(
+            line.contains("(view-source recheck 10, VRAM pages 5, streamed-texture recheck 2, choosing uploads 8, uploads 48 MB: hash 20, detile 30, submit 15; other 10)"),
+            "{line}"
+        );
+        let idle = look_line([0; 6], [0; 8], 0, 2);
+        assert!(idle.contains("0 looks took 0 ms (0.0 % of the time, longest 0 ms)") && idle.contains("0.0 MB watched a look"), "{idle}");
+        assert!(idle.contains("; other 0)"), "{idle}");
     }
 
     /// `queue()` answers while the state's lock is held: a resource's last `Release` asks for

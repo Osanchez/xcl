@@ -51,6 +51,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             };
             let mut last = snap();
             let mut last_looks = crate::hle::d3d12x::sparse::look_counters();
+            let mut last_parts = crate::hle::d3d12x::title_textures::look_parts();
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -61,8 +62,14 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 );
                 // XCL's own CPU time before the title's submits (on the title's threads)
                 let looks = crate::hle::d3d12x::sparse::look_counters();
-                crate::xlog_info!("{}", crate::hle::d3d12x::sparse::look_line(std::array::from_fn(|i| looks[i] - last_looks[i]), 2));
+                let parts = crate::hle::d3d12x::title_textures::look_parts();
+                let longest = crate::hle::d3d12x::sparse::take_longest_look();
+                crate::xlog_info!(
+                    "{}",
+                    crate::hle::d3d12x::sparse::look_line(std::array::from_fn(|i| looks[i] - last_looks[i]), std::array::from_fn(|i| parts[i] - last_parts[i]), longest, 2)
+                );
                 last_looks = looks;
+                last_parts = parts;
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let private = unsafe {
                     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
