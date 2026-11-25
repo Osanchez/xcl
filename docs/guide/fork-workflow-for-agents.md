@@ -15,8 +15,8 @@ The SessionStart hook runs `scripts/dev/preflight.sh` (read-only, never fails th
 
 1. Read the preflight output: branch, dirty flag, commits behind upstream, newest upstream commits,
    last `fork-sync` run, open `sync-conflict` issue.
-2. If `main` or `dev` is behind, run `scripts/dev/sync-upstream.sh` (the tree must be clean;
-   `--dry-run` shows what it would do). It adds the `upstream` remote on first use.
+2. If `main` or `dev` is behind, tell the user. Sync is manual: it goes through
+   `scripts/dev/merge-pr.py --sync` after a reviewed scan, never automatically.
 3. Check whether the work is already covered:
    - `scripts/dev/pr-scan.py covers <keywords...>`
    - `scripts/dev/pr-scan.py covers --files-from-branch [BASE]` (files the current branch touches)
@@ -26,10 +26,10 @@ The SessionStart hook runs `scripts/dev/preflight.sh` (read-only, never fails th
 
 ## Automation
 
-- An hourly GitHub Action (`fork-sync.yml`) mirrors upstream into `main` and merges it into `dev`.
-  If origin/dev is ahead of local `dev`, pull it with `git pull --ff-only`.
-- On a merge conflict the Action opens an issue labelled `sync-conflict`. Tell the user; do not
-  resolve it silently.
+- The `fork-sync` workflow is disabled. Nothing syncs on its own: upstream changes enter only through
+  `scripts/dev/merge-pr.py --sync`, after the review the gate requires. It merges into the
+  checked-out work branch (`dev`); `main` is no longer updated automatically.
+- On a merge conflict, tell the user; do not resolve it silently.
 
 ## Docs and tools
 
