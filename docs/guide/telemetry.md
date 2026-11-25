@@ -12,6 +12,12 @@ could be contributed.
 
 **All eight decisions are made.** This is ready to implement.
 
+**Checked against the upstream sync of 2026-11-25** (154 commits merged into `dev`; see
+"Upstream sync check" at the end). Nothing in this document collides, but four things moved and
+are folded in below: `XCL_WAVE64_SPIN` already exists upstream, split-dispatch scratch is being
+actively bounded, two of the nine wave64 pull requests landed, and `present.rs` gained a
+compositor that makes the headless work larger than estimated.
+
 Because of D8 this is fork tooling, so it lives in `docs/guide/` (with `scripts/dev/`,
 `reverse-toolkit/` and `.claude/`) rather than `docs/specs/`, which is upstream's area, and it
 belongs on `dev` — never on a branch cut from `main`.
@@ -430,6 +436,47 @@ Two things stay separable there: the **tool** contains no title data and is safe
 the **numbers it produces for this title** are derived from the game's shaders. Upstream already
 publishes aggregate counts of this kind, but what to publish is a separate decision from whether
 to contribute the tool.
+
+## Upstream sync check (2026-11-25, 154 commits)
+
+Run before this document was committed, because an instrumentation plan written against a stale
+tree measures the wrong thing. `git diff` of the merge's two parents:
+
+| Spec dependency | State after the sync |
+|---|---|
+| `log.rs`, `report.rs` | **unchanged** — the two files D6 extends are untouched, so D6 stands |
+| `frame.rs`, `uma.rs` | unchanged |
+| `host.rs` | +4 lines, cosmetic |
+| `runner.rs` | +47/−7; the test-only GPU timing path still exists |
+| `present.rs` | **+712/−45** — see below |
+| Upstream telemetry of its own | **none**, so no duplicated subsystem |
+| Our own files (`CLAUDE.md`, `.gitattributes`, `.claude/`, `scripts/dev/`, this document) | untouched by upstream — no conflict materialised |
+| The seven switch names this document proposes | all **free** |
+| fps-every-300-frames sampler | still present, so §"What exists today" holds |
+
+Four things that change the plan:
+
+1. **`XCL_WAVE64_SPIN` already exists** (`gpu/recomp/emit.rs`). It selects the spin/counter
+   rendezvous or a group barrier, and **defaults to spin** — the expensive variant. §5.8's
+   "regroup, or finish the direct backend" is therefore not the only route to the ~4× case: with
+   `XCL_WAVE64_SPIN=0` it is already a one-run A/B experiment, and it should be the *first*
+   measurement taken, alongside the loop-cap probe. Both are nearly free.
+2. **Split-dispatch scratch is being actively bounded upstream** — `XCL_SPLIT_SCRATCH_MB`
+   (default 256 MB), `hle/d3d12x/real/dispatch_chain.rs`, and three commits: scratch bounded
+   over all recordings, dispatches run in slabs sharing a bounded scratch, and consecutive lanes
+   packed into each scratch slot. H1 is therefore not an unexamined hypothesis — scratch
+   pressure is known upstream. §5.6's `register_arrays` and `scratch_hint` fields should be read
+   against `XCL_SPLIT_SCRATCH_MB`, and H1 restated as "is scratch still the dominant cost *after*
+   this bounding", not "does anyone know about scratch".
+3. **Two of the nine wave64 pull requests landed**: #2305 (`v_readfirstlane` in a pixel shader
+   reads a live lane first) and #2203 (whole-wave branches and dead-SCC elision in split wave64).
+   The exchange baseline has moved, so §5.6's counts must be taken on this tree, not against the
+   figures in `docs/wave64-on-wave32.md`.
+4. **`present.rs` gained a compositor and a present ring** (`Compositor`, `PresentRing`,
+   `compositor_shaders`, `present_slot_count`, `XCL_PRESENT_SYNC`). Part 5 (headless) is larger
+   than its ~250-line estimate: "no window and no swapchain" now also means bypassing a
+   compositor with its own shaders. Re-estimate part 5 before starting it, and expect
+   `XCL_PRESENT_SKIP` to interact with `XCL_PRESENT_SYNC`.
 
 ## What this produces, concretely
 
