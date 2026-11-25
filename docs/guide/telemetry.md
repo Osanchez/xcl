@@ -478,6 +478,39 @@ Four things that change the plan:
    compositor with its own shaders. Re-estimate part 5 before starting it, and expect
    `XCL_PRESENT_SKIP` to interact with `XCL_PRESENT_SYNC`.
 
+## Do these before building anything
+
+Three measurements are already possible on this tree with switches that exist today. Each is one
+run, no code. Taking them first may remove whole parts of the plan, and at minimum tells us which
+hypothesis to instrument for.
+
+| Run | Switch | Answers |
+|---|---|---|
+| spin vs barrier rendezvous | `XCL_WAVE64_SPIN=0` against the default (spin) | the ~4x counter-paired case in `docs/wave64-on-wave32.md`. The expensive variant is the *default*, so this is the single cheapest experiment available |
+| all masks exchanged vs the liveness pass | `XCL_X64_ALL_MASKS=1` against the default | what the landed mask-liveness pass is actually worth on real shaders, which has never been measured |
+| scratch pressure | `XCL_SPLIT_SCRATCH_MB` at 256 (default) and lower/higher | whether split-dispatch scratch is near its bound, the live half of H1 |
+
+The loop-cap probe (part 7) needs a small change first, because `LOOP_GUARD` is a constant
+(`xcl_budget` in `gpu/recomp/emit.rs`) rather than a switch.
+
+## Audit against the tree, 2026-11-25 — what not to rebuild
+
+Each part re-checked against the merged tree, so none of it duplicates work already done.
+
+| # | Part | Already there | Revised |
+|---|---|---|---|
+| 1 | Telemetry core | nothing — no run directory, manifest, JSONL or `run_id` anywhere | **stands**, ~350 |
+| 2 | Frame + memory series | the fps-every-300 sampler (`present.rs`) and the memory line (`host.rs`) exist as prose and carry the right numbers | **stands**, ~150: convert, don't invent |
+| 3 | GPU timing | **most of the plumbing exists in the live path.** `list_x.rs` already builds a per-device `TimestampPool` — a 4096-slot `D3D12_QUERY_HEAP_TYPE_TIMESTAMP`, a READBACK buffer via `ensure_timestamp_readback`, a `NEXT_TIMESTAMP` slot allocator and `ResolveQueryData` wiring — to service the *title's own* timestamp writes. `GetTimestampFrequency` is implemented too | **reduced to ~200.** Reuse that pool and allocator; do **not** create a second query heap. Only the pass/list boundaries, the deferred read and the events are new |
+| 4 | Static shape report | nothing counts exchanges or records a translation shape. `XCL_X64_ALL_MASKS` and `XCL_WAVE64_SPIN` give A/B levers but no per-shader numbers | **stands**, ~300 |
+| 5 | Headless | window configuration already lives in `config.rs` with `XCL_WINDOW_POS`; but `present.rs` now has a `Compositor`, a `PresentRing`, `present_slot_count` and `XCL_PRESENT_SYNC` | **re-estimate upward.** Name the size switch `XCL_WINDOW_SIZE` for consistency with `XCL_WINDOW_POS`, and extend `config.rs` rather than adding parallel plumbing |
+| 6 | Error channel | `hle/d3d12x/dred.rs` is new upstream: device-removal diagnostics with PSO labelling, list markers, `reset`/`forget_list`/`forget_pso` | **reduced to ~150.** Consume `dred::` for `device_removed`; do not reimplement it |
+| 7 | Loop probe | `LOOP_GUARD` is a constant, not a switch | **stands**, ~120 + ~250 |
+| 8 | `smoke.ps1` reads events | `smoke.ps1` changed (+43) and `scripts/test-smoke-artifacts.tests.ps1` is new | **re-read both before touching.** Still last, still alone |
+
+Net effect: parts 3 and 6 shrink by roughly 400 lines between them, part 5 grows, and nothing is
+duplicated. Parts 1, 2, 4 and 7 are untouched by anything upstream has done.
+
 ## What this produces, concretely
 
 After parts 1–4, one five-minute headless run yields: a manifest naming the commit, adapter,
