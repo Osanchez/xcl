@@ -1,0 +1,59 @@
+#!/bin/sh
+# Backstop for a merge made by hand in a terminal: refuse to create a merge commit for a
+# commit the security gate has not cleared.
+#
+# Install once (not automatic - git hooks are per clone):
+#     git config core.hooksPath .githooks
+#
+# At this point git has staged the merge and MERGE_HEAD names what is coming in, so the only
+# question left is whether scripts/dev/pr-gate.py produced a receipt for that exact commit.
+#
+# Known limits, by design of git rather than choice:
+#   * it does not run for a fast-forward merge, because no commit is created. That is why
+#     scripts/dev/merge-pr.py always passes --no-ff.
+#   * `git merge --no-verify` skips it.
+#   * `git cherry-pick` never reaches this hook at all.
+# So this is a seatbelt, not the mechanism. The mechanism is merge-pr.py plus the
+# PreToolUse hook in .claude/settings.json.
+
+set -e
+
+root=$(git rev-parse --show-toplevel)
+merge_head="$root/.git/MERGE_HEAD"
+[ -f "$merge_head" ] || exit 0          # not a merge we can inspect
+
+incoming=$(tr -d ' \t\r\n' < "$merge_head" | cut -c1-40)
+[ -n "$incoming" ] || exit 0
+
+# A merge of your own branches is normal work; only commits that are not already in this
+# repository's own history need the gate. An ancestor of HEAD cannot be foreign code.
+if git merge-base --is-ancestor "$incoming" HEAD 2>/dev/null; then
+    exit 0
+fi
+
+receipt="$root/.git/pr-gate/$incoming.json"
+if [ -f "$receipt" ] && grep -q '"verdict": *"CLEAR"' "$receipt"; then
+    exit 0
+fi
+
+cat >&2 <<EOF
+
+pre-merge-commit: refusing to merge $incoming - no security-gate receipt.
+
+Expected: .git/pr-gate/$incoming.json
+
+Merging is followed by a build, and a build runs the incoming build.rs, its procedural macros
+and anything under scripts/ as you. Scan it first:
+
+    python scripts/dev/pr-gate.py <PR NUMBER> --repo ivall/xcl
+
+or do the whole thing the sanctioned way, which gates, verifies and merges in one step:
+
+    git merge --abort
+    python scripts/dev/merge-pr.py <PR NUMBER> --repo ivall/xcl
+
+If this is your own work rather than someone else's pull request, say so explicitly with
+    git merge --no-verify ...
+
+EOF
+exit 1
