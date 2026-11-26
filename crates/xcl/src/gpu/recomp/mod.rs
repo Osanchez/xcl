@@ -204,6 +204,8 @@ pub const GS_PRIMS_PER_GROUP: u32 = 21;
 pub const IO_GS_PRIMS: usize = 110;
 pub const IO_GS_VERTICES: usize = 111;
 pub const IO_UMA_BASE_HI: usize = 112;
+/// io slot (ttmp12, unused by titles as 110..112) holding the loop-counter word (`XCL_LOOP_COUNTERS`)
+pub const IO_LOOP_COUNTER: usize = 120;
 
 impl GsInterface {
     /// bytes of one ES vertex in LDS (ESGS item: 16 per ES output register)
@@ -646,6 +648,8 @@ impl Conts {
 /// even be terminated). Once the budget is spent every loop
 /// leaves at its next iteration and the program runs to its end.
 const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
+/// `LOOP_GUARD` in counters mode: the lane is counted (once) before it leaves
+const LOOP_GUARD_COUNTED: &str = "if (xcl_budget == 0u) { xcl_lc_trip(); break; } xcl_budget--;";
 
 /// Structured code longer than this many bytes per byte of program falls back to the `pc` form.
 /// Each guard of the structured form lists every pending skip flag, so it grows with the
@@ -667,6 +671,20 @@ pub(crate) fn loop_budget() -> u32 {
         return n;
     }
     loop_budget_from(std::env::var("XCL_LOOP_BUDGET").ok().as_deref())
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LOOP_COUNTERS_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether translations count loop-guard exits (`report::loop_counters_on`; tests: the seam).
+pub(crate) fn loop_counters() -> bool {
+    #[cfg(test)]
+    if let Some(b) = LOOP_COUNTERS_TEST.with(|c| c.get()) {
+        return b;
+    }
+    crate::report::loop_counters_on()
 }
 
 fn loop_budget_from(v: Option<&str>) -> u32 {

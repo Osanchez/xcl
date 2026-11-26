@@ -8279,6 +8279,54 @@ let mut st = KernelState::default();
     assert!((4096..=4097).contains(&runs[0]), "iterations run: {runs:?}");
 }
 
+/// Sets the loop counters seam (`recomp::LOOP_COUNTERS_TEST`) for this thread; restores "unset" on
+/// drop, so a failing assert cannot leak it to another test on the thread.
+pub(super) struct LoopCountersSeam;
+
+impl LoopCountersSeam {
+    pub(super) fn set(on: Option<bool>) -> Self {
+        super::LOOP_COUNTERS_TEST.with(|c| c.set(on));
+        LoopCountersSeam
+    }
+}
+
+impl Drop for LoopCountersSeam {
+    fn drop(&mut self) {
+        super::LOOP_COUNTERS_TEST.with(|c| c.set(None));
+    }
+}
+
+/// `XCL_LOOP_COUNTERS` off leaves the HLSL as it was; on, every loop guard counts the lane before
+/// it leaves, and the prelude and the io load are there (no GPU needed).
+#[test]
+fn loop_counters_leave_hlsl_unchanged_when_off() {
+    let p = prog(&[
+        ("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)], None),
+        ("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", 1)], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 0), ("SRC0", 10)], None),
+    ]);
+    let opt = Options { wave64: false, hw_wave: 32, ..Options::default() };
+    let unset = translate(&p, &opt).unwrap().hlsl;
+    let off = {
+        let _seam = LoopCountersSeam::set(Some(false));
+        translate(&p, &opt).unwrap().hlsl
+    };
+    assert_eq!(off, unset, "counters off must not change the HLSL");
+    assert!(!off.contains("xcl_lc"), "{off}");
+    let guards = off.matches(super::LOOP_GUARD).count();
+    assert!(guards >= 1, "the program has a loop guard: {off}");
+    let on = {
+        let _seam = LoopCountersSeam::set(Some(true));
+        translate(&p, &opt).unwrap().hlsl
+    };
+    assert_eq!(on.matches("xcl_lc_trip(); break;").count(), guards, "{on}");
+    assert!(!on.contains(super::LOOP_GUARD), "{on}");
+    assert!(on.contains("xcl_lc = io.Load(480u);"), "{on}");
+    assert!(on.contains("xcl_lc_done"), "{on}");
+}
+
 #[test]
 fn gpu_mad_nf_f16_rounds_intermediate_in_binary16() {
     if !gpu_ready() {

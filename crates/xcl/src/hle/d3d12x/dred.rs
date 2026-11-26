@@ -39,6 +39,7 @@ pub fn on() -> bool {
 
 /// Name a translated pipeline by its console shaders (`("ms", bytes)`, …).
 pub fn label(pso: usize, shaders: &[(&str, Option<&[u8]>)]) {
+    crate::report::loop_counters_label(pso, shaders);
     if !on() || pso == 0 {
         return;
     }

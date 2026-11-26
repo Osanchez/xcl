@@ -271,12 +271,18 @@ mod translated {
                 identity_for(&id.to_string(), &format!("dispatch-split-{}", crate::gpu::dxil::kernel::dispatch_piece_limit()))
             } else { id };
             // `XCL_PER_LANE=1` (direct compute only): its entries under their own identity
-            if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
+            let id = if Backend::current() != Backend::Hlsl && crate::gpu::recomp::lower_dxil::enabled() {
                 identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
             } else {
                 id
-            }
+            };
+            with_loop_counters(id, crate::gpu::recomp::loop_counters())
         })
+    }
+
+    /// `XCL_LOOP_COUNTERS`: entries translated with the loop-guard counters are another output.
+    pub(super) fn with_loop_counters(id: u64, on: bool) -> u64 {
+        if on { identity_for(&id.to_string(), "xcl-loop-counters-1") } else { id }
     }
 
     /// a second hash of the bytes, independent of `fnv64`'s
@@ -512,11 +518,12 @@ mod translated {
             None => id,
         };
         let id = identity_for(&id.to_string(), &format!("dispatch-split-{split_limit}"));
-        if crate::gpu::recomp::lower_dxil::enabled() {
+        let id = if crate::gpu::recomp::lower_dxil::enabled() {
             identity_for(&id.to_string(), concat!("xcl-per-lane-", env!("XCL_PER_LANE_SOURCE_ID")))
         } else {
             id
-        }
+        };
+        with_loop_counters(id, crate::gpu::recomp::loop_counters())
     }
 
     /// The identity of `ident`'s entries the direct translator (`direct`: `direct_output`) made
@@ -1555,6 +1562,15 @@ mod shader_cache_tests {
         ];
         assert!(ids.iter().all(|&i| i != 0));
         assert_eq!(ids.iter().collect::<std::collections::HashSet<_>>().len(), ids.len());
+    }
+
+    /// The loop-guard counters tag both identities; off leaves them as they were.
+    #[test]
+    fn loop_counters_tag_the_cache_identity() {
+        use translated::with_loop_counters;
+        assert_eq!(with_loop_counters(42, false), 42);
+        assert_ne!(with_loop_counters(42, true), 42);
+        assert_ne!(with_loop_counters(42, true), with_loop_counters(43, true));
     }
 
     /// An edit of the direct translator's sources changes the direct entries' identity (no

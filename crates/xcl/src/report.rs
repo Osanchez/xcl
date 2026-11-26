@@ -355,6 +355,7 @@ pub fn telemetry_start(boot: &crate::config::Boot) {
     crate::xlog_info!("telemetry: {} -> {}", tier.name(), dir.display());
     gpu_tel::telemetry_gpu_start();
     run_tel::telemetry_poll_start(boot.logs_dir());
+    let _ = run_tel::lc_region();
 }
 
 /// The manifest of a run at its start (device and DXC fields still null).
@@ -387,7 +388,7 @@ fn new_manifest(boot: &crate::config::Boot, run_id: &str, tier: Tier, started: &
         present_mode: present_mode_name().to_string(),
         window_size: format!("{ww}x{wh}"),
         loop_budget: crate::gpu::recomp::loop_budget(),
-        loop_counters: false,
+        loop_counters: run_tel::loop_counters_on(),
         diagnostic,
         compare_key,
         ..Default::default()
@@ -467,6 +468,7 @@ fn telemetry_final(report_json: &str) {
         return;
     }
     gpu_tel::telemetry_gpu_final();
+    run_tel::loop_counters_tick(true);
     let Some(dir) = xlog::run_dir() else { return };
     let tmp = dir.join("report.json.tmp");
     if std::fs::write(&tmp, report_json).is_ok() && std::fs::rename(&tmp, dir.join("report.json")).is_err() {

@@ -298,6 +298,69 @@ fn gpu_heap_windows_divergent_lanes_match_switch_form() {
     }
 }
 
+/// Loop guard counters (`XCL_LOOP_COUNTERS`, HLSL path): a loop that never exits makes every lane
+/// of the wave leave through the guard once, counted in word 0 of the slot the io word names,
+/// here in window 1 (the word carries the window); a loop that exits counts nothing, and io
+/// word 0 means "do not count". 64 lanes on a native wave64 and as two 32-lane halves alike.
+#[test]
+fn gpu_loop_counters_count_guard_exits() {
+    if !gpu_kernel_ready() {
+        return;
+    }
+    let e = |n: &str, enc: &str, f: &[(&str, u64)]| crate::gpu::rdna2::encode(n, enc, f, None).unwrap();
+    // s10 = 0; do { s10 += 1 } while (s10 != limit): the limit 0 never comes, 10 comes after 10 iterations
+    let looping = |limit_src: u64| {
+        let mut code = Vec::new();
+        code.extend(e("S_MOV_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 128)]));
+        code.extend(e("S_ADD_U32", "ENC_SOP2", &[("SDST", 10), ("SSRC0", 10), ("SSRC1", 129)]));
+        code.extend(e("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 10), ("SSRC1", limit_src)]));
+        code.extend(e("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)]));
+        code.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+        code
+    };
+    let never = looping(128);
+    let exits = looping(128 + 10);
+
+    let arena = crate::gpu::uma::Uma::with_windows(2, 1 << 20).unwrap();
+    let (w0, w1) = (arena.window(0).0 as u64, arena.window(1).0 as u64);
+    let word = |a: u64| unsafe { &mut *(a as *mut u32) };
+    let slot: u64 = 0x4000;
+
+    // a small budget keeps the never-ending loop short; reset on drop, so a failing assert cannot leak it
+    struct Budget;
+    impl Drop for Budget {
+        fn drop(&mut self) {
+            super::LOOP_BUDGET_TEST.with(|c| c.set(None));
+        }
+    }
+    super::LOOP_BUDGET_TEST.with(|c| c.set(Some(64)));
+    let _reset = Budget;
+    let _seam = super::tests::LoopCountersSeam::set(Some(true));
+
+    for (direct, heap) in [(false, false), (false, true)] {
+        // (program, io word, words 0..4 of window 1's slot)
+        let runs: [(&Vec<u8>, u32, [u32; 4]); 3] = [
+            (&never, (1 << 28) | (slot >> 4) as u32, [64, 0, 0, 0]),
+            (&exits, (1 << 28) | (slot >> 4) as u32, [0; 4]),
+            (&never, 0, [0; 4]),
+        ];
+        for (i, (code, io_word, want)) in runs.iter().enumerate() {
+            for k in 0..4u64 {
+                *word(w0 + slot + 4 * k) = 0;
+                *word(w1 + slot + 4 * k) = 0;
+            }
+            let mut st = super::runner::KernelState::default();
+            st.sgpr[super::IO_LOOP_COUNTER] = *io_word;
+            let dxil = compile_variant(code, direct, heap, 2);
+            super::runner::run_in_arena(&dxil, &st, &arena).unwrap_or_else(|err| panic!("run {i} direct={direct} heap={heap}: {err}"));
+            for k in 0..4u64 {
+                assert_eq!(*word(w1 + slot + 4 * k), want[k as usize], "run {i} direct={direct} heap={heap}: window 1 slot word {k}");
+                assert_eq!(*word(w0 + slot + 4 * k), 0, "run {i} direct={direct} heap={heap}: window 0 word {k} must stay 0");
+            }
+        }
+    }
+}
+
 /// 64-bit atomics (`GLOBAL_ATOMIC_ADD_X2`, `GLOBAL_ATOMIC_CMPSWAP_X2`) on heap windows:
 /// in-bounds window-1 operations carry across the 32-bit boundary and swap cleanly, while
 /// out-of-UMA 64-bit atomics return 0 and leave live window canaries untouched.

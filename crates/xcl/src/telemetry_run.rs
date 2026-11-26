@@ -281,6 +281,7 @@ fn write_end(reason: &str, code: Option<i64>, fatal_kind: Option<&str>) {
     if END.swap(true, Ordering::AcqRel) {
         return;
     }
+    loop_counters_end();
     let (shown, presented) = crate::hle::d3d12x::present::counters();
     let mut f: Vec<(&'static str, serde_json::Value)> = vec![("reason", reason.into())];
     if let Some(c) = code {
@@ -717,7 +718,7 @@ fn telemetry_poll_thread(logs_dir: std::path::PathBuf) {
             write_phase(&schedule[next_entry].1, &mut from_schedule, 1.0, "schedule", frames_now);
             next_entry += 1;
         }
-        // (5e: loop counter readback goes here)
+        loop_counters_tick(false);
         let dt = window_start.elapsed();
         if dt < std::time::Duration::from_millis(PHASE_WINDOW_MS) {
             continue;
@@ -892,5 +893,390 @@ mod telemetry_p5c_tests {
         std::fs::write(&path, "menu").unwrap();
         assert_eq!(f.poll(), Some("menu".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ---- part 5e: loop guard counters ----
+//
+// `XCL_LOOP_COUNTERS` (with `XCL_TELEMETRY=all`): translated code counts the lanes that leave a loop
+// through its guard into a 16-byte slot per distinct shader set, in a region of the first committed
+// UMA window (the only window the CPU sees GPU stores in). The poll thread reads the slots.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+/// Whether translated code counts loop-guard exits (`XCL_LOOP_COUNTERS` with tier `all`): decided
+/// once per process from the environment, before the first translation.
+pub fn loop_counters_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let counters = std::env::var("XCL_LOOP_COUNTERS").ok();
+        let tier = std::env::var("XCL_TELEMETRY").ok();
+        let (on, warning) = loop_counters_wanted(counters.as_deref(), tier.as_deref());
+        if let Some(w) = warning {
+            crate::xlog_warn!("{w}");
+        }
+        on
+    })
+}
+
+/// pure: the decision from the two variables, and the warning when the counters were asked for
+/// at a tier below `all`
+fn loop_counters_wanted(counters: Option<&str>, tier: Option<&str>) -> (bool, Option<&'static str>) {
+    if !counters.is_some_and(|v| !v.is_empty() && v != "0") {
+        return (false, None);
+    }
+    if crate::log::parse_tier(tier) == Ok(crate::log::Tier::All) {
+        (true, None)
+    } else {
+        (false, Some("telemetry: XCL_LOOP_COUNTERS needs XCL_TELEMETRY=all - loop counters off"))
+    }
+}
+
+/// pure: the io word of byte offset `off` in window `k` (0 is reserved for "do not count")
+pub(crate) fn loop_counter_word_of(k: usize, off: usize) -> u32 {
+    debug_assert!(k < 16 && off % 16 == 0 && off >> 4 < 1 << 28, "loop counter slot {k}:{off:#x}");
+    ((k as u32) << 28) | ((off >> 4) as u32 & 0x0FFF_FFFF)
+}
+
+/// bytes of the counter region: 65 536 slots of 16 bytes, slot 0 unused
+const LC_REGION_BYTES: usize = 1 << 20;
+
+/// Slot table: one 16-byte slot per distinct shader set, slot 0 never used. `labels[slot]` is the
+/// label text and the (kind, fnv64) of each shader of the set.
+struct LcSlots {
+    by_label: HashMap<String, u32>,
+    by_pso: HashMap<usize, u32>,
+    labels: Vec<(String, Vec<(&'static str, u64)>)>,
+    full_warned: bool,
+}
+
+impl LcSlots {
+    fn new() -> Self {
+        LcSlots { by_label: HashMap::new(), by_pso: HashMap::new(), labels: vec![(String::new(), Vec::new())], full_warned: false }
+    }
+
+    /// The slot of `pso`, a new one for a shader set not seen before; 0 when the table holds
+    /// `capacity` slots (slot 0 included), with one warning.
+    fn assign(&mut self, pso: usize, text: String, shaders: Vec<(&'static str, u64)>, capacity: u32) -> u32 {
+        if let Some(&slot) = self.by_label.get(&text) {
+            self.by_pso.insert(pso, slot);
+            return slot;
+        }
+        if self.labels.len() as u32 >= capacity {
+            self.by_pso.remove(&pso);
+            if !self.full_warned {
+                self.full_warned = true;
+                crate::xlog_warn!("telemetry: more than {} distinct shader sets - the loop counters of later pipelines are not counted", capacity.saturating_sub(1));
+            }
+            return 0;
+        }
+        let slot = self.labels.len() as u32;
+        self.labels.push((text.clone(), shaders));
+        self.by_label.insert(text, slot);
+        self.by_pso.insert(pso, slot);
+        slot
+    }
+}
+
+static LC_SLOTS: Mutex<Option<LcSlots>> = Mutex::new(None);
+
+/// (window k, address of the region, its offset in window k); None: no region
+static LC_REGION: OnceLock<Option<(usize, usize, usize)>> = OnceLock::new();
+
+/// The region in the first committed window (`Uma::committed_window`), allocated once; None (with
+/// one warning) when there is none, or when the counters are off.
+pub(super) fn lc_region() -> Option<(usize, usize, usize)> {
+    if !loop_counters_on() {
+        return None;
+    }
+    *LC_REGION.get_or_init(|| {
+        let Some(u) = crate::gpu::uma::get() else {
+            crate::xlog_warn!("telemetry: loop counters: no UMA - not counted");
+            return None;
+        };
+        let Some(k) = u.committed_window() else {
+            crate::xlog_warn!("telemetry: loop counters: no committed UMA window - not counted");
+            return None;
+        };
+        let Some(p) = u.alloc_in(k, LC_REGION_BYTES, 1 << 16) else {
+            crate::xlog_warn!("telemetry: loop counters: no room for the counter region in window {k} - not counted");
+            return None;
+        };
+        let addr = p as usize;
+        // SAFETY: the allocation is LC_REGION_BYTES long, committed and writable
+        unsafe { std::ptr::write_bytes(p, 0, LC_REGION_BYTES) };
+        crate::xlog_info!("telemetry: loop counters on: {} slots in UMA window {k} at offset {:#x}", LC_REGION_BYTES / 16 - 1, addr - u.window(k).0);
+        Some((k, addr, addr - u.window(k).0))
+    })
+}
+
+/// The stage kinds of a label as the `&'static str` the table keeps.
+fn lc_kind(k: &str) -> &'static str {
+    match k {
+        "cs" => "cs",
+        "ms" => "ms",
+        "vs" => "vs",
+        "ps" => "ps",
+        "gs" => "gs",
+        _ => "?",
+    }
+}
+
+/// From `dred::label`: give the pipeline its slot (a new one for a new shader set).
+pub fn loop_counters_label(pso: usize, shaders: &[(&str, Option<&[u8]>)]) {
+    if !loop_counters_on() || pso == 0 {
+        return;
+    }
+    let mut text = String::new();
+    let mut list: Vec<(&'static str, u64)> = Vec::new();
+    for (k, b) in shaders {
+        let Some(b) = *b else { continue };
+        let h = crate::gpu::shader::fnv64(b);
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&format!("{k} {h:016x}"));
+        list.push((lc_kind(k), h));
+    }
+    if list.is_empty() || lc_region().is_none() {
+        return;
+    }
+    let capacity = (LC_REGION_BYTES / 16) as u32;
+    let mut g = LC_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(LcSlots::new).assign(pso, text, list, capacity);
+}
+
+/// From the two bind sites: the io word of `pso` (0 when off, unknown or no region).
+pub fn loop_counter_word(pso: usize) -> u32 {
+    if !loop_counters_on() {
+        return 0;
+    }
+    let Some((k, _, off)) = LC_REGION.get().copied().flatten() else { return 0 };
+    let slot = {
+        let g = LC_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_ref().and_then(|s| s.by_pso.get(&pso)) {
+            Some(&slot) => slot,
+            None => return 0,
+        }
+    };
+    loop_counter_word_of(k, off + 16 * slot as usize)
+}
+
+/// pure: per slot, the change since the last read: (slot, word, delta, total, first_trip).
+/// `first_trip` marks the first changed word of a slot whose words were all 0 before.
+fn lc_deltas(prev: &mut Vec<[u32; 4]>, now: &[[u32; 4]]) -> Vec<(u32, usize, u32, u32, bool)> {
+    if prev.len() < now.len() {
+        prev.resize(now.len(), [0; 4]);
+    }
+    let mut out = Vec::new();
+    for (slot, words) in now.iter().enumerate() {
+        let mut first = prev[slot] == [0; 4];
+        for (w, &total) in words.iter().enumerate() {
+            if total != prev[slot][w] {
+                out.push((slot as u32, w, total.wrapping_sub(prev[slot][w]), total, first));
+                first = false;
+            }
+        }
+        prev[slot] = *words;
+    }
+    out
+}
+
+/// pure: the fields of one `loop_guard` event
+fn loop_guard_fields(record: u64, stage: &str, slot: u32, delta: u32, total: u32) -> Vec<(&'static str, serde_json::Value)> {
+    vec![("record", format!("{record:016x}").into()), ("stage", stage.into()), ("pipeline", slot.into()), ("trips", delta.into()), ("total", total.into())]
+}
+
+/// What the poll thread last read, and when.
+struct LcRead {
+    prev: Vec<[u32; 4]>,
+    last: Option<std::time::Instant>,
+}
+
+static LC_READ: Mutex<LcRead> = Mutex::new(LcRead { prev: Vec::new(), last: None });
+
+/// Poll thread (every call, reads at most once a second) and `telemetry_final` (`final_read`):
+/// reads every assigned slot's 4 words, writes `loop_guard` events (tier all) for each changed
+/// word, and a non-fatal `loop_guard_tripped` error on a slot's first trip.
+pub(super) fn loop_counters_tick(final_read: bool) {
+    if !loop_counters_on() {
+        return;
+    }
+    if let Some((_, addr, _)) = LC_REGION.get().copied().flatten() {
+        lc_read(final_read, addr);
+    }
+}
+
+/// From `write_end` (the once-latched end of the run): a last read, so the trips of the final
+/// second are written, then the `loop_counters` summary once, also when nothing tripped. The only
+/// other holder of `LC_READ` is the poll thread's short read; poisoned locks are recovered.
+fn loop_counters_end() {
+    if !loop_counters_on() {
+        return;
+    }
+    let region = LC_REGION.get().copied().flatten();
+    let tripped = region.and_then(|(_, addr, _)| lc_read(true, addr)).unwrap_or(0);
+    if !LC_SUMMARY.swap(true, Ordering::AcqRel) {
+        let slots = LC_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |s| s.labels.len().saturating_sub(1) as u32);
+        crate::log::event(crate::log::Tier::All, "loop_counters", &loop_counters_summary_fields(region.map(|r| r.0), slots, tripped));
+        crate::xlog_info!("telemetry: loop counters: {slots} shader sets labelled, {tripped} left a loop through its guard");
+    }
+}
+
+/// The `loop_counters` event of the end of the run is written once.
+static LC_SUMMARY: AtomicBool = AtomicBool::new(false);
+
+/// pure: the fields of the `loop_counters` event (`window` None: no region)
+fn loop_counters_summary_fields(window: Option<usize>, slots: u32, tripped: u32) -> Vec<(&'static str, serde_json::Value)> {
+    let w = match window {
+        Some(k) => serde_json::Value::from(k),
+        None => serde_json::Value::Null,
+    };
+    vec![("window", w), ("slots", slots.into()), ("tripped", tripped.into())]
+}
+
+/// One read of the slots at `addr` and its events; the number of slots with a non-zero word, or
+/// None when the read was skipped (not due, or another thread is reading).
+fn lc_read(final_read: bool, addr: usize) -> Option<u32> {
+    let mut rd = match LC_READ.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) if !final_read => return None,
+        Err(std::sync::TryLockError::WouldBlock) => LC_READ.lock().unwrap_or_else(|e| e.into_inner()),
+    };
+    if !final_read && rd.last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1)) {
+        return None;
+    }
+    rd.last = Some(std::time::Instant::now());
+    let count = LC_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |s| s.labels.len());
+    // the region is read outside the slot lock
+    let mut now: Vec<[u32; 4]> = vec![[0; 4]; count];
+    for (slot, words) in now.iter_mut().enumerate().skip(1) {
+        for (w, word) in words.iter_mut().enumerate() {
+            // SAFETY: slots 1..count lie inside the region (`LC_REGION_BYTES`), committed memory the GPU writes
+            *word = unsafe { std::ptr::read_volatile((addr + 16 * slot + 4 * w) as *const u32) };
+        }
+    }
+    let tripped = now.iter().filter(|w| **w != [0; 4]).count() as u32;
+    let deltas = lc_deltas(&mut rd.prev, &now);
+    drop(rd);
+    for (slot, word, delta, total, first) in deltas {
+        let (text, shaders) = {
+            let g = LC_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+            match g.as_ref().and_then(|s| s.labels.get(slot as usize)) {
+                Some(l) => l.clone(),
+                None => continue,
+            }
+        };
+        let kinds: &[&str] = match word {
+            0 => &["cs", "ms", "vs"],
+            1 => &["ps"],
+            2 => &["gs"],
+            _ => continue,
+        };
+        let entry = shaders.iter().find(|(k, _)| kinds.contains(k));
+        let (stage, record) = match entry {
+            Some((k, h)) => (*k, *h),
+            None => (kinds[0], 0),
+        };
+        let fields = loop_guard_fields(record, stage, slot, delta, total);
+        crate::log::event(crate::log::Tier::All, "loop_guard", &fields);
+        if first {
+            telemetry_error(ErrKind::LoopGuardTripped, "loop_counters", &format!("pipeline {slot} ({text}) left a loop through its guard"), None, false, &fields);
+        }
+    }
+    Some(tripped)
+}
+
+#[cfg(test)]
+mod telemetry_p5e_tests {
+    use super::*;
+
+    #[test]
+    fn counters_are_on_only_with_tier_all() {
+        assert_eq!(loop_counters_wanted(Some("1"), Some("all")), (true, None));
+        assert_eq!(loop_counters_wanted(Some("1"), Some("ALL")), (true, None));
+        assert_eq!(loop_counters_wanted(None, Some("all")), (false, None));
+        assert_eq!(loop_counters_wanted(Some("0"), Some("all")), (false, None));
+        assert_eq!(loop_counters_wanted(Some(""), Some("all")), (false, None));
+        assert_eq!(loop_counters_wanted(Some("0"), Some("frame")), (false, None));
+        let (on, warning) = loop_counters_wanted(Some("1"), Some("frame"));
+        assert!(!on && warning.is_some());
+        let (on, warning) = loop_counters_wanted(Some("1"), None);
+        assert!(!on && warning.is_some());
+        let (on, warning) = loop_counters_wanted(Some("1"), Some("pass"));
+        assert!(!on && warning.is_some());
+    }
+
+    #[test]
+    fn io_word_carries_window_and_slot_offset() {
+        assert_eq!(loop_counter_word_of(3, 0x1230), (3 << 28) | 0x123);
+        assert_eq!(loop_counter_word_of(0, 16), 1);
+        assert_eq!(loop_counter_word_of(1, 0x4000), (1 << 28) | 0x400);
+        for k in [0usize, 3, 15] {
+            for slot in 1..4usize {
+                assert_ne!(loop_counter_word_of(k, 16 * slot), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn slots_are_per_shader_set() {
+        let mut t = LcSlots::new();
+        assert_eq!(t.assign(0x10, "cs a".into(), vec![("cs", 1)], 3), 1);
+        // the same shader set from another pipeline object shares the slot
+        assert_eq!(t.assign(0x20, "cs a".into(), vec![("cs", 1)], 3), 1);
+        assert_eq!(t.by_pso.get(&0x20), Some(&1));
+        assert_eq!(t.assign(0x30, "cs b".into(), vec![("cs", 2)], 3), 2);
+        assert!(!t.full_warned);
+        // capacity 3: slot 0 + two slots; a third distinct text does not fit
+        assert_eq!(t.assign(0x40, "cs c".into(), vec![("cs", 3)], 3), 0);
+        assert!(t.full_warned);
+        assert!(!t.by_pso.contains_key(&0x40));
+        // known sets still resolve when the table is full
+        assert_eq!(t.assign(0x50, "cs b".into(), vec![("cs", 2)], 3), 2);
+    }
+
+    #[test]
+    fn deltas_since_the_last_read() {
+        let mut prev: Vec<[u32; 4]> = Vec::new();
+        assert!(lc_deltas(&mut prev, &[[0; 4], [0; 4]]).is_empty());
+        let d = lc_deltas(&mut prev, &[[0; 4], [64, 0, 0, 0]]);
+        assert_eq!(d, vec![(1, 0, 64, 64, true)]);
+        // unchanged: nothing
+        assert!(lc_deltas(&mut prev, &[[0; 4], [64, 0, 0, 0]]).is_empty());
+        // grows again: the delta, not a first trip
+        let d = lc_deltas(&mut prev, &[[0; 4], [96, 32, 0, 0], [0; 4]]);
+        assert_eq!(d, vec![(1, 0, 32, 96, false), (1, 1, 32, 32, false)]);
+        // a new slot with two words at once: only the first word is the first trip
+        let d = lc_deltas(&mut prev, &[[0; 4], [96, 32, 0, 0], [5, 0, 7, 0]]);
+        assert_eq!(d, vec![(2, 0, 5, 5, true), (2, 2, 7, 7, false)]);
+    }
+
+    #[test]
+    fn loop_counters_summary_event_fields() {
+        let f = loop_counters_summary_fields(Some(3), 12, 0);
+        let keys: Vec<&str> = f.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, ["window", "slots", "tripped"]);
+        assert_eq!(f[0].1, 3);
+        assert_eq!(f[1].1, 12);
+        assert_eq!(f[2].1, 0);
+        let f = loop_counters_summary_fields(None, 0, 0);
+        assert_eq!(f[0].1, serde_json::Value::Null);
+        assert_eq!(f[1].1, 0);
+        assert_eq!(f[2].1, 0);
+    }
+
+    #[test]
+    fn loop_guard_event_fields() {
+        let f = loop_guard_fields(0xABCDEF, "ps", 7, 64, 128);
+        let keys: Vec<&str> = f.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, ["record", "stage", "pipeline", "trips", "total"]);
+        assert_eq!(f[0].1, "0000000000abcdef");
+        assert_eq!(f[1].1, "ps");
+        assert_eq!(f[2].1, 7);
+        assert_eq!(f[3].1, 64);
+        assert_eq!(f[4].1, 128);
     }
 }
