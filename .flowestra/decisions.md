@@ -8667,3 +8667,408 @@ If R4 fails, `auto` stays off, and the trips plus the verify lines say which of 
 4. A loop-work bound per dispatch is added. The document has no runtime-work control.
 5. The default for the ray-tracing chain is off until proven. The document has no ray-tracing
    policy.
+
+## 2026-11-26 Ray tracing toggle, refinement of U2, U3 and U8: builder lookup, roles, the left-out path, counter slots, list keys (orchestrator approved; inside the approved design)
+
+### 0. Orchestrator review and the split of U2
+
+- **Approved by the orchestrator** as internal structure inside the design the user approved.
+  What a user can see is unchanged in kind: three per-frame counters
+  (`dispatch_skip_left_out`, `dispatch_skip_rt_off`, `dispatch_skip_rt_incomplete`), a `left_out`
+  event, one summary log line, and `raytracing=off` / `XCL_LEAVE_OUT` working with
+  `XCL_ASYNC_PSO=0` too.
+- **Citations spot-checked at 19ccb8af:** `hle/d3d12x/real.rs:1718-1729` and `:1833`
+  (`standin_released`, `pso_release`, `forget_pso`), `hle/d3d12x/pso_async.rs:2560-2570`
+  (`resolve` enqueues only when `sent` was false) and `:2596-2602` (`spared` returns through
+  `resolve_spared`), `telemetry_gpu.rs:2300-2330` (`Call`, `is_dispatch`, `skip_index`),
+  `shaders.rs:1045` (`fnv64` of the inflated blob), the three callers of `go_background`
+  (`real.rs:6306`, `:6359`, `:7436`). All hold.
+- **U2 is split by files so that three writers can work at once:**
+  - **U2a** (`telemetry_gpu.rs`, `telemetry_run.rs`): section 5 below, plus
+    `pub fn telemetry_left_out(record: u64, rule: &str, stage: &str)` (a `left_out` event at tier
+    frame with `record` as 16 hex digits, `rule`, `stage`), plus one line in `write_end`
+    (`telemetry_run.rs`) that logs `rt_chain::summary()` when it is Some.
+  - **U2** (`hle/d3d12x/rt_chain.rs` new, `real.rs`, `pso_async.rs`, the `mod` line): sections
+    1-4 below.
+  - **U4** (`gpu/xbox.rs`, `shaders.rs`, `README.md`): `debug_name` and `--list-records` with
+    the key of section 6. Wiring the name into `classify` is a later small unit (U4b): in U2
+    `classify` passes no name, so only record keys match. R1 needs keys only.
+- **Decisions the orchestrator pinned for U2:**
+  - `pub enum LeftOut { Rule, RtOff }` lives in `pso_async.rs` (stored as 1 and 2).
+  - `rt_chain::classify(cs: &[u8]) -> (Role, Option<LeftOut>)`. It logs one line per left-out
+    pipeline (the first 64, then at powers of two) and calls
+    `crate::report::telemetry_left_out(record, rule, "cs")`, where `rule` is the matching
+    token's text, or `rt_off`.
+  - The pure core is
+    `decide(record, fx, builder, rules, chain, mode) -> (Role, Option<(LeftOut, String)>, Option<usize>)`
+    (the last value is the index of the chain entry that matched). Role: Build when `builder`,
+    else Trace when `fx.traces`, else the role of the first chain entry whose `Record` key
+    equals `record`, else None. Left out: `rules.matches(record, None, fx, role)` gives
+    `(Rule, text)`; else `(RtOff, "rt_off")` when the role is not None and the mode is Off.
+  - The rules text is the config's `leave_out`, then a newline, then the env `XCL_LEAVE_OUT`;
+    the chain text is the config's `raytracing_chain`, then a newline, then the env
+    `XCL_RT_CHAIN`. `@file` paths are relative to `crate::state::data_dir()`. Parse warnings are
+    logged once each. Loaded once, at the first `classify`.
+  - `rt_chain::summary() -> Option<String>`: None when nothing was configured and no pipeline
+    had a role; else
+    `rt chain: <on|off>; list N entries, M matched a pipeline; left out P pipelines (R by rule, O by raytracing off)`.
+  - `create_compute_pso` becomes a thin wrapper: the existing body moves unchanged into
+    `create_compute_pso_normal`; the wrapper classifies, takes the left-out path of section 4
+    or calls the normal one, then `note_role(*ppv, role, built)` for `hr >= 0` and a role that
+    is not None, with `built = !pso_async::is_pending(*ppv as usize)`.
+  - The `mod` line is `pub mod rt_chain;`.
+- **Not built or run on macOS;** every unit is built and tested on the Windows PC by the
+  orchestrator.
+
+This replaces the named parts of U2, U3 and U8 in `gpu-hang-design.md`.
+- Code citations are at dev tip 717ab78d, under `crates/xcl/src/`. The code is the same as at
+  2265e889.
+- Nothing was built or run.
+- No title data appears here. Tests use made-up keys and names.
+
+---
+
+### 1. Finding the builder module (replaces "`modules::find_export` style lookups" in U2)
+
+**There is no up-front lookup and no cached negative.** The builder is recognised from the
+frames of the creating call, every time.
+
+New in `hle/d3d12x/rt_chain.rs`:
+
+```rust
+/// The console BVH builder's constructor (an SDK library export, already named in
+/// tests/console_dlls_e2e.rs:629): the module that exports it is the builder.
+const BUILDER_CTOR: &str = "??0XboxBvhBuilder@@QEAA@PEAUID3D12Device11@@_N@Z";
+/// Base of the module found to export BUILDER_CTOR (0: not found yet). Positive-only cache.
+static BUILDER_BASE: AtomicUsize = AtomicUsize::new(0);
+
+/// pure seam: whether the module at `base` with these exports is the builder
+fn exports_builder(by_name: &HashMap<String, ExportTarget>) -> bool { by_name.contains_key(BUILDER_CTOR) }
+
+/// Whether `addr` lies in the builder module.
+fn in_builder(addr: usize) -> bool {
+    let b = BUILDER_BASE.load(Ordering::Acquire);
+    if b != 0 {
+        return crate::modules::image_base_for_addr(addr) == Some(b);   // modules.rs:67-77, lock-free
+    }
+    match crate::modules::find_mapped_by_addr(addr) {                   // modules.rs:91-93
+        Some(m) if exports_builder(&m.exports.by_name) => { BUILDER_BASE.store(m.base, Ordering::Release); true }
+        _ => false,
+    }
+}
+```
+
+- **The exact calls:**
+  - `modules::image_base_for_addr` (`modules.rs:67`) once the base is known.
+  - Otherwise `modules::find_mapped_by_addr` (`modules.rs:91`) and a `HashMap::contains_key` on
+    `MappedModule::exports.by_name` (`modules.rs:23`, `pe.rs:599-602`).
+  - `resolver::resolve_export_of_mapped` (`resolver.rs:163`) is not needed: we only ask whether
+    the module exports the name, not where the export points.
+- **When the lookup runs:** at each compute pipeline creation, on the first title-image frame
+  (§2). Only a positive result is cached.
+  - The builder DLL may be mapped after the first pipeline is made. Every lookup before then
+    still checks the frame's own module, so a late load is found at its first pipeline.
+  - A module leaves the table only when its load fails (`unregister_mapped`, `modules.rs:56-64`).
+    The builder had already loaded when it was cached, so the positive cache stays valid.
+- **Cost per pipeline creation:**
+  - before the builder is found: one `RwLock` read, plus a linear scan over the mapped images
+    (tens), plus one hash lookup;
+  - after it is found: a lock-free scan of `RANGE_BASE` (`modules.rs:67-77`).
+  - Both are microseconds; the stack capture (§2) costs more.
+- **Test seam:** `exports_builder` is pure. `classify_frames(frames: &[usize], module_of: &dyn Fn(usize) -> Option<(usize /*base*/, bool /*is builder*/)>) -> bool`
+  holds the rule. `in_builder` is its production `module_of`.
+- **Tests:**
+  - `exports_builder_finds_the_constructor` (made-up export map);
+  - `classify_frames_first_title_frame_in_builder`;
+  - `classify_frames_skips_non_image_frames`;
+  - `classify_frames_none_without_title_frame`;
+  - `builder_found_after_late_load` (`module_of` returns no builder for the first call and the
+    builder for the second: the second is Build, the first stays None).
+
+### 2. `caller_in_image()`: frame count and rule (replaces U2's `fn caller_in_image`)
+
+```rust
+/// Return addresses of this call, skipping this function's own frame.
+#[inline(never)]
+fn frames() -> ([usize; 16], usize) {
+    use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
+    let mut f = [std::ptr::null_mut::<c_void>(); 16];
+    let n = unsafe { RtlCaptureStackBackTrace(1, 16, f.as_mut_ptr(), std::ptr::null_mut()) } as usize;
+    (std::array::from_fn(|i| f[i] as usize), n)
+}
+```
+
+- **Skip 1 and capture 16:**
+  - `hle/waits.rs:86-92` captures 6. Here the XCL frames before the title are
+    `rt_chain::classify` -> `create_compute_pso` (`real.rs:6354`) -> `dev_create_compute_pso`
+    (`real.rs:6346`) -> `dev_create_compute_pso_x` (`real.rs:2851`, console slot #62 only).
+  - The guard thunks in front of a console slot do not add a frame: `make_split` uses
+    `Tail::JumpToResult` (`guard.rs:42-45`), a tail jump, so the title's return address is the
+    next frame.
+  - That is at most 4 XCL frames, fewer if inlined. 16 leaves room for a debug build and for
+    DLL-internal frames inside the builder.
+- **The rule: the first frame that lies in a mapped image (`find_mapped_by_addr` is Some)
+  decides. If it is in the builder module, the role is Build.**
+  - If no frame among the 16 is in an image, the role is None and a line is logged once
+    (`rt chain: no title frame for a compute pipeline`).
+- **When the builder calls through a game-exe wrapper:** the first image frame is the exe, so
+  the role is not Build. This is deliberate. The builder holds the device itself and creates its
+  pipelines in its own code (the constructor path probed in HANDOFF.md:330-345). A pipeline whose
+  first image frame is the exe was made by the title.
+- **"Any of the first N image frames" was rejected:**
+  - it marks title pipelines made while a builder frame is merely deeper on the stack (a title
+    callback run from builder code) as Build;
+  - under OFF those would be left out, a silent loss outside the chain.
+  - If a run shows builder dispatches under the exe, U9's per-module slot log
+    (`XCL_RT_VERIFY=1`) shows it. The rule can then widen to "first two image frames", in a
+    PR of its own.
+- **Risk:** `RtlCaptureStackBackTrace` needs unwind data for the mapped images. `hle/waits.rs:86`
+  relies on the same for title frames. If a run logs the "no title frame" line, that is the
+  cause.
+
+### 3. Where roles live (replaces `pso_async::set_role` / `role_of` in U2, U3 and U8)
+
+**Roles live in `rt_chain`, keyed by the pointer the title holds, for both warm and stand-in
+pipelines.** They are not kept on `Pending`.
+
+```rust
+/// title-visible pipeline pointer -> its chain role and whether its real pipeline exists
+static ROLES: Mutex<Option<HashMap<usize, (Role, bool /*built*/)>>> = Mutex::new(None);
+static ANY_ROLE: AtomicBool = AtomicBool::new(false);   // fast path: no map lookup while false
+pub fn note_role(pso: usize, role: Role, built: bool)    // skips Role::None
+pub fn role_of(pso: usize) -> Role                       // Role::None when !ANY_ROLE or absent
+pub fn forget(pso: usize)                                // removes; U8: fixes PRODUCERS_UNBUILT
+```
+
+- **Which pointer:** the `*ppv` that `create_compute_pso` returns (`real.rs:6354-6370`).
+  - For a warm pipeline it is the real PC pipeline: the success branch of `attempt` returns at
+    `real.rs:6372-6374`, and `note_translated_compute` registers that pointer (`real.rs:6326-6330`).
+  - For a stand-in it is the title's own object: a `standin::Shell` per pipeline
+    (`standin.rs:106`) or a driver stand-in. `PENDING` is keyed by the same pointer
+    (`pso_async.rs:975-990`).
+  - This is the pointer **before** `console_list::wrap_pso` (`real.rs:2857-2859`), which runs
+    only with `XCL_CONSOLE_LISTS=1`.
+- **The dispatch paths see that pointer as `raw`:**
+  - `bind::set_pipeline_state` stores the title's object: `s.pso = pso` (`bind.rs:891-894`).
+    The list's initial pipeline comes through `bind::reset` (`device_x.rs:119`).
+  - `bind::dispatch` reads `let pso = with(this, |s| s.pso)` and keeps it as `raw`
+    (`bind.rs:905-911`).
+  - `execute_indirect` reads `raw_pso` (`bind.rs:281`).
+  - Console lists use `(*p).pc` (`console_list.rs:887`), the pre-wrap pointer.
+  - So all three call `role_of(raw)`. None of them uses the resolved real pipeline, which differs
+    for stand-ins.
+- **Insertion:** at the end of `create_compute_pso`, for every result with `hr >= 0`:
+  `note_role(*ppv, role, built)`. `built` is:
+  - true for the warm path;
+  - false for the stand-in (background) path, including the left-out path (§4).
+- **Removal:** `rt_chain::forget(pso)` goes into `real::forget_pso` (`real.rs:1833-1858`). That
+  covers both kinds of release:
+  - real PC pipelines: `pso_release` (`real.rs:1724-1729`), installed as the Release override on
+    every adopted pipeline (`real.rs:2921`), calls `forget_pso` when the count reaches 0;
+  - shell stand-ins: `standin::release` (`standin.rs:157-162`) -> `real::standin_released`
+    (`real.rs:1718-1721`) -> `forget_pso`;
+  - driver-object stand-ins go through `pso_release`.
+
+  `pso_async::released` (`pso_async.rs:3092`) and `release` (`pso_async.rs:948`) are called
+  after `forget_pso` on those same paths. `release` frees XCL's own real pipeline, which the
+  title never holds, so it needs no hook. A reused address therefore never inherits a role.
+- **U8:**
+  - `Pending` gains `standin: usize`, set in `submit_as` (`pso_async.rs:975`).
+  - `complete(p, real)` (`pso_async.rs:176`) calls `rt_chain::note_built(p.standin)` when
+    `real != 0`.
+  - `PRODUCERS_UNBUILT` is incremented in `note_role` for an unbuilt Build, Trace or Producer
+    entry, and decremented in `note_built` and in `forget` (unbuilt entry).
+  - A left-out entry never counts, because it is not gated.
+- **U3:** at the three run sites, a role-tagged count goes next to the existing
+  `telemetry_dispatch(this, pso)` (`bind.rs:1046`, `console_list.rs:910`) and the
+  ExecuteIndirect Ok branch (`bind.rs:363-370`):
+  `crate::report::telemetry_rt_dispatch(rt_chain::role_of(raw))`.
+- **Hot path:** one atomic load while no role exists. Otherwise one mutex lookup per dispatch,
+  the same order as the existing `is_translated_compute` set lookup (`real.rs:1780-1784`).
+- **Tests:**
+  - `roles_keyed_by_title_pointer_warm_and_standin`;
+  - `forget_drops_role_so_a_reused_pointer_has_none`;
+  - `role_of_is_none_without_any_role`;
+  - U8: `producer_count_follows_build_and_release`.
+
+### 4. The left-out path (replaces the U2 bullet for `real.rs` / `pso_async.rs`)
+
+**Confirmed: with the change below, a left-out pipeline gets a stand-in, is never built, and
+never touches the translation, DXIL or driver-blob caches.**
+
+- **`create_compute_pso` (`real.rs:6354`):**
+  - First: `if let Some(cs) = shader_bytes(&(*desc).CS)` (`real.rs:3971`), then
+    `let (role, left) = rt_chain::classify(cs);`.
+  - If `left.is_some()`: go to the background branch directly, without `attempt`
+    (`real.rs:6357`), so nothing is translated:
+    `own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, compute_key, build_compute, left))`.
+  - Then set `LAST_COMPUTE_TRANSLATED` to true and `LAST_COMPUTE_RS` to 0, and call
+    `note_console_compute(hr, ppv)`, as the existing missed branch does (`real.rs:6359-6366`).
+    The console-list wrapper then marks it translated, so `console_list.rs:883-891` takes the
+    skip path. ExecuteIndirect's `is_console_compute` check (`bind.rs:283`, `:325`) stays true.
+- **`go_background` (`real.rs:6216`)** gets a last parameter `left_out: Option<LeftOut>`. The
+  graphics and stream callers pass `None`. With `Some(r)`:
+  - the stand-in is made as today (`real.rs:6228-6253`): a `standin::shell` by `compute_key`, or
+    `standin_compute`, a driver pipeline with the dummy CS (`real.rs:6153-6158`). Neither reads
+    any cache of ours;
+  - it skips `shaders_key`, the image-only test (`real.rs:6256-6258`), the job, and
+    `submit`/`submit_lazy` (`real.rs:6266-6270`);
+  - it calls `pso_async::submit_left_out(*ppv, r)`, then `pso_async::shared(*ppv, driver)` when
+    `driver != 0` (`real.rs:6271-6273`).
+
+  `go_background` needs three things to be true:
+  - `own_compute` returns Some. It always does (`real.rs:6054-6060`).
+  - The stand-in is made (`hr >= 0`). If not, it returns None (`real.rs:6248-6253`). Then
+    `create_compute_pso` logs once
+    `rt chain: no stand-in for a left-out pipeline: built and run normally` and falls through to
+    today's path.
+  - `ppv` is not null.
+- **`pso_async::submit_left_out(standin: usize, why: LeftOut)`**, new. It inserts a `Pending`
+  with:
+  - `job: Mutex::new(None)`;
+  - `sent: true` (`resolve` and `resolve_spared` never enqueue: `pso_async.rs:2564-2568`,
+    `:2931-2933`);
+  - `spared: true` (`resolve_wait_inner` returns through `resolve_spared` with no wait:
+    `pso_async.rs:2600-2602`; `put_off_to_submit` is false: `bind.rs:899-901`);
+  - `key: 0` (`note_use` records nothing in `used-pipelines.txt`, `pso_async.rs:158-168`, so a
+    later run does not preload it);
+  - `done: false`;
+  - the new `left_out: AtomicU8` (1 left_out, 2 rt_off).
+
+  `why_of` (`pso_async.rs:249`) tests `left_out` first and returns `Unbuilt::LeftOut` or
+  `Unbuilt::RtOff`. `resolve_spared` does not log its "writes only images" line when `left_out`
+  is not 0. When the title releases it, `released` (`pso_async.rs:3092-3105`) finds
+  `done == false` and the job is None, so it only marks the entry orphaned.
+- **A shared stand-in is harmless:**
+  - Each title object is its own `Shell` (`standin.rs:106`). Only the driver dummy pipeline
+    (`Shared`, `standin.rs:40-55`) is shared, by `standin::Key` (device, root signature, flags:
+    `real.rs:6190-6194`).
+  - The left-out state lives on the `Pending` of the shell pointer, and roles live under that
+    pointer too.
+  - A non-left-out pipeline with the same key has its own shell, its own `Pending` and its own
+    real pipeline. Resolving either one returns the dummy until that one's own real pipeline
+    exists.
+  - The dummy fails `is_translated_compute`, so every dispatch of the left-out one is skipped.
+- **With `pso_async::enabled()` false (`XCL_ASYNC_PSO=0`, `pso_async.rs:589-591`):** the
+  left-out path is taken anyway.
+  - It needs no worker: `submit_left_out` and `resolve*` do not consult `enabled()`.
+  - So `raytracing=off` and `XCL_LEAVE_OUT` behave the same in both modes.
+  - "Warn and run normally" was rejected because it would silently break `raytracing=off`.
+- **Tests:**
+  - `left_out_pipeline_is_never_enqueued` (`submit_left_out`, then `resolve` and
+    `resolve_wait`: they return the stand-in and nothing is queued);
+  - `left_out_records_no_used_key`;
+  - `why_unbuilt_names_left_out_and_rt_off`;
+  - `left_out_and_normal_share_a_driver_standin_independently` (two shells over one key: one
+    left out, one built; the built one resolves to its real pipeline, the left-out one to the
+    dummy);
+  - `released_left_out_pipeline_is_forgotten`;
+  - `go_background_left_out_submits_no_job` (a seam: a `left_out` argument with a job counter
+    that must stay 0).
+
+### 5. ExecuteIndirect, console lists, counter slots (replaces the `COUNT_NAMES` bullet in U2)
+
+**Every skip site reaches the same reason path:**
+- Direct dispatch, `bind.rs:905-920`:
+  - `resolve_wait(raw)` gives the dummy (§4) and `is_translated_compute` is false, so the site
+    calls `telemetry_skip(this, Call::Dispatch, raw)`;
+  - `telemetry_skip` -> `pso_async::skipped(raw).why` -> `skip_index`
+    (`telemetry_gpu.rs:2381-2386`, `2317`).
+  - `list_x::dispatch_x` (`list_x.rs:3124-3126`) and deferred replays (`list_x.rs:2763`) call
+    `bind::dispatch`, so they take the same path.
+- ExecuteIndirect:
+  - `resolve_draw(raw_pso)` -> for compute, `resolve_wait` plus `is_pending`, which is true
+    because `done == false` (`pso_async.rs:2826-2829`);
+  - `!gfx && !compute && unbuilt` -> `telemetry_skip(this, Call::Indirect(sig_dispatches), raw_pso)`
+    (`bind.rs:297-299`).
+  - `bind.rs:330` is the "no translation" branch. It is not reached for a left-out pipeline,
+    because the `unbuilt` branch returns first.
+- Console lists, `console_list.rs:887-891`:
+  - `resolve_wait((*p).pc)` gives the dummy, so the site calls
+    `telemetry_skip(list, Call::Dispatch, (*p).pc)`.
+- **`Call::Indirect(true)` and `Call::Dispatch` share the dispatch counters** (`is_dispatch`,
+  `telemetry_gpu.rs:2306-2308`). An indirect dispatch that is left out counts in
+  `dispatch_skip_<reason>`, as image-only skips do today.
+  - Left-out rules are compute-only, so neither `ei_draw_skip_left_out` nor
+    `ei_dispatch_skip_left_out` is needed.
+  - `reserved_0` stays.
+
+**The final list.** It grows from 33 to 36 entries. Add `pub const COUNTS_LEN: usize = 36;`.
+
+| Slot | Name |
+|---|---|
+| 32 | `reserved_0` (unchanged; its test `telemetry_gpu.rs:3631` stays) |
+| 33 | `dispatch_skip_left_out` |
+| 34 | `dispatch_skip_rt_off` |
+| 35 | `dispatch_skip_rt_incomplete` (U8 sets it; U2 adds the slot) |
+
+**`skip_index`, in the dispatch arm (`telemetry_gpu.rs:2311-2321`):**
+- `Some("left_out") => 33`
+- `Some("rt_off") => 34`
+- `Some("rt_incomplete") => 35`
+
+Draw kinds never receive these reasons. If one did, it would map to slot 4 of its base
+("failed", as today).
+
+**Other edits that follow from the new length:**
+- `COUNTS`, `counts_now`, and the `counts` fields of the frame and activity sums: change `33` to
+  `COUNTS_LEN` (`telemetry_gpu.rs:2254`, `2266`, `2292-2293`, `2967`, `3014`; `telemetry_run.rs:351`,
+  `356`, `1359-1360`).
+- `frame_count_fields` (`telemetry_gpu.rs:2466-2467`): iterate
+  `(0..COUNTS_LEN).filter(|&i| i != 32 && i != MUSTDRAW_WAIT_US && (i < 4 || d[i] != 0))`.
+- `activity_count_fields` (`telemetry_run.rs:356-364`): `dispatch_skipped` becomes
+  `sum(17..26) + sum(33..36)`.
+- `writer_note` (`telemetry_gpu.rs:2325-2327`) also runs for the new reasons, so
+  `ei_after_skipped_dispatch` keeps counting the hazard after a left-out trace pass. This is
+  intended.
+
+**Tests:**
+- `skip_index_maps_new_reasons` (direct and indirect);
+- `frame_fields_include_new_slots_not_reserved`;
+- `activity_dispatch_skipped_sums_new_slots`;
+- `execute_indirect_with_a_left_out_pipeline_is_skipped` (built on `bind.rs:1154`'s test).
+
+### 6. The record key `--list-records` prints (replaces the U4 key text; needed for R1)
+
+- **Runtime:** `pipeline_bind.records` = `format!("{:016x}", fnv64(b))` (`telemetry_gpu.rs:2612`).
+  `b` is the title's CS bytes: `dred::label(*ppv, &[("cs", Some(cs))])` (`real.rs:4976`,
+  `:5013`), with `cs = shader_bytes(&d.CS)` (`real.rs:4942`, `:3971-3974`). Exactly the bytes in
+  `D3D12_COMPUTE_PIPELINE_STATE_DESC.CS`.
+- **Pack tool:** `let hash = shader::fnv64(&blob)` (`shaders.rs:1045`), with `blob` from
+  `pack::inflate(data, &records[i])` (`shaders.rs:721`).
+- **They are equal exactly when the title passes the inflated pack record unchanged.** The run
+  data shows this for the one program checked: the record key telemetry gave was found by
+  `--record-hash`. The code cannot prove it for every program, because the title could patch the
+  bytes.
+  - So U2 logs at run end: `rt chain list: N entries, M matched a pipeline`.
+  - R1's acceptance adds: M > 0, and every listed key that the run's `pipeline_bind` events show
+    has a `left_out` event.
+- **FSPX driver containers** (`gpu/recomp/pso.rs:45-50`, read by `effects::compute_code`,
+  `effects.rs:83-85`) come from the console upscaler DLL's pipelines, not from the title's shader
+  pack. `--list-records` cannot list them, and they are not ray-tracing programs.
+  - Their runtime record is still `fnv64` of the whole container, as passed.
+  - To leave one out, use the 16 hex digits from its `pipeline_bind` event in `XCL_LEAVE_OUT`.
+    This is the same format, so U4 needs no other key.
+- **What U4 prints:**
+  - one line per matching record: `<fnv64 of the inflated blob, 16 hex> <role>  # <records[i].name>`;
+  - records that do not inflate are skipped, with a stderr line;
+  - duplicates are printed once, by the same `exported` set logic as `shaders.rs:1034`, `:1049-1051`.
+  - Matching is a glob on `records[i].name`, without the ` @offset` suffix.
+
+---
+
+### Changes to the U2/U3/U8 work items
+
+- **U2:**
+  - `rt_chain.rs` holds §1-§3;
+  - `real.rs` gets §4: `create_compute_pso`, `go_background` with the new parameter (3 callers),
+    and `forget_pso` with one line;
+  - `pso_async.rs` gets `submit_left_out`, `LeftOut`, the `why_of` and `resolve_spared` lines,
+    and `Unbuilt::LeftOut` and `Unbuilt::RtOff`;
+  - `telemetry_gpu.rs` and `telemetry_run.rs` get §5.
+
+  Estimate about 380 lines with tests. If it goes over 400, split the telemetry slots (§5) into
+  U2a, before U2.
+- **U3:** role-tagged counts at the three run sites (§3).
+- **U8:** roles and producer counts come from `rt_chain`, not `Pending`. The only change to
+  `Pending` is the `standin` field (§3).
