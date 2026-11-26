@@ -217,11 +217,25 @@ fn commit_backing(s: &mut State, list: usize, backing: usize, prev: Option<usize
             }
         }
     }
-    detach_from_orphans(s, list);
-    s.of_list.insert(list, backing);
-    let b = s.backings.entry(backing).or_default();
-    b.users.insert(list);
-    b.already_reset = false;
+    let mut orphaned_backing = false;
+    for o in &mut s.orphaned {
+        if o.backing == backing && o.state.users.contains(&list) {
+            o.state.already_reset = false;
+            orphaned_backing = true;
+        } else {
+            o.state.users.remove(&list);
+        }
+    }
+    if orphaned_backing {
+        // `backing` was moved to `s.orphaned` by a concurrent `forget(alloc)` mid-`reset_list`:
+        // keep `list` pinned on its orphan and do not recreate a zombie `s.backings` entry.
+        s.of_list.remove(&list);
+    } else {
+        s.of_list.insert(list, backing);
+        let b = s.backings.entry(backing).or_default();
+        b.users.insert(list);
+        b.already_reset = false;
+    }
     *s.recordings.entry(list).or_default() += 1;
 }
 
@@ -230,6 +244,11 @@ fn rollback_backing(s: &mut State, list: usize, backing: usize, prev: Option<usi
     if prev != Some(backing) {
         if let Some(b) = s.backings.get_mut(&backing) {
             b.users.remove(&list);
+        }
+        for o in &mut s.orphaned {
+            if o.backing == backing {
+                o.state.users.remove(&list);
+            }
         }
     }
 }
@@ -465,6 +484,7 @@ unsafe fn restore_aside(s: &mut State, a: usize, f: usize, ok: bool) -> bool {
         s.aside.entry(a).or_default().push(f);
         true
     } else {
+        s.backings.remove(&f);
         false
     }
 }
@@ -530,7 +550,7 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
             results.push((f, hr >= 0));
         }
         let mut orphans = Vec::new();
-        {
+        let (o_made, o_free) = {
             let mut g = STATE.lock().unwrap();
             if let Some(s) = g.as_mut() {
                 for (f, ok) in results {
@@ -538,8 +558,12 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
                         orphans.push(f);
                     }
                 }
+                take_free_orphaned(s)
+            } else {
+                (Vec::new(), Vec::new())
             }
-        }
+        };
+        finish_reclaimed(o_made, o_free);
         for f in orphans {
             drop(ID3D12CommandAllocator::from_raw(f as *mut c_void));
         }
@@ -610,6 +634,7 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
                                 );
                             }
                         } else if spare != a && !s.orphaned.iter().any(|o| o.backing == spare) {
+                            s.backings.remove(&spare);
                             orphan = Some(spare);
                         }
                     }
@@ -1331,5 +1356,58 @@ mod tests {
         }
         forget_list(list_a);
         forget_list(list_b);
+    }
+
+    #[test]
+    fn forget_racing_mid_reset_list_cleans_up_on_rollback_and_commit() {
+        let mut ids = Box::new([0u8; 4]);
+        let base = ids.as_mut_ptr() as usize;
+        let (prev_alloc, alloc, list) = (base, base + 1, base + 2);
+        created_on(list, prev_alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+
+        // Rollback path: `forget(alloc)` runs mid-`reset_list`, then native Reset fails.
+        let hr = reset_list(list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0, |b| {
+            assert_eq!(b, alloc);
+            unsafe { forget(alloc) };
+            crate::util::E_FAIL
+        });
+        assert_eq!(hr, crate::util::E_FAIL);
+        {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            assert!(!s.backings.contains_key(&alloc), "rolled-back forgotten backing must not remain in backings");
+            assert!(!s.orphaned.iter().any(|o| o.backing == alloc), "rolled-back forgotten backing must be reclaimed");
+            assert_eq!(s.of_list.get(&list), Some(&prev_alloc));
+            assert!(s.backings.get(&prev_alloc).is_some_and(|b| b.users.contains(&list)));
+        }
+
+        // Commit path: `forget(alloc)` runs mid-`reset_list`, then native Reset succeeds.
+        let hr = reset_list(list, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0, |b| {
+            assert_eq!(b, alloc);
+            unsafe { forget(alloc) };
+            0
+        });
+        assert_eq!(hr, 0);
+        {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            assert!(!s.backings.contains_key(&alloc), "committed forgotten backing must not recreate a zombie backing");
+            assert!(!s.of_list.contains_key(&list), "committed forgotten backing must not leave a stale of_list entry");
+            assert!(s.backings.get(&prev_alloc).is_none_or(|b| !b.users.contains(&list)));
+            assert!(
+                s.orphaned.iter().any(|o| o.backing == alloc && o.state.users.contains(&list) && !o.state.already_reset),
+                "committed list must stay pinned on the orphaned backing"
+            );
+        }
+
+        // Retiring the list reclaims the orphaned backing cleanly.
+        retire_recording(list);
+        {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            assert!(!s.orphaned.iter().any(|o| o.backing == alloc));
+        }
+        forget_list(list);
+        unsafe { forget(prev_alloc) };
     }
 }
