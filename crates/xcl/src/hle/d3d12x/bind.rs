@@ -355,7 +355,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         Ok(()) => {
             if compute {
                 match super::real::dispatch_chain::whole(pso) {
-                    Ok(Some(whole)) => list.SetPipelineState(&whole),
+                    Ok(Some(whole)) => {
+                        list.SetPipelineState(&whole);
+                        super::code_use::bound(whole.as_raw() as usize);
+                    }
                     Ok(None) => {}
                     Err(e) => {
                         crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
@@ -1107,6 +1110,7 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let real = real as *mut c_void;
     let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
     list.SetPipelineState(pc);
+    super::code_use::bound(real as usize);
     Ok(())
 }
 

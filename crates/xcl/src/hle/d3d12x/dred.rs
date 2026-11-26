@@ -41,6 +41,7 @@ pub fn on() -> bool {
 pub fn label(pso: usize, shaders: &[(&str, Option<&[u8]>)]) {
     crate::report::loop_counters_label(pso, shaders);
     crate::report::telemetry_pipeline_label(pso, shaders);
+    super::code_use::note_label(pso, shaders);
     if !on() || pso == 0 {
         return;
     }
@@ -55,6 +56,7 @@ fn label_of(pso: usize) -> Option<String> {
 /// After `SetPipelineState(pso)` on `list`: a marker, and the label of what is bound now.
 /// `pso` is the title's object, `bound` what reached the PC list (a stand-in while it builds).
 pub unsafe fn mark_pipeline(list: *mut c_void, pso: usize, bound: usize) {
+    super::code_use::bound(bound);
     if !on() || list.is_null() {
         return;
     }
@@ -113,6 +115,7 @@ pub fn forget_list(list: *mut c_void) {
 
 /// A pipeline was released: its address may be another pipeline's next.
 pub fn forget_pso(pso: usize) {
+    super::code_use::released(pso);
     if on() {
         if let Some(m) = LABELS.lock().unwrap().as_mut() {
             m.remove(&pso);

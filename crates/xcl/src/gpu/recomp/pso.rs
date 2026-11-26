@@ -1368,6 +1368,7 @@ pub(crate) unsafe fn record_dispatch_chain<'a>(
         let constants = [x, y, z, i as u32, ox, oy, oz, 0];
         list.SetComputeRoot32BitConstants(7, 8, constants.as_ptr().cast(), 0);
         list.SetPipelineState(piece);
+        crate::hle::d3d12x::code_use::bound(windows::core::Interface::as_raw(piece) as usize);
         list.Dispatch(x, y, z);
     }
     }

@@ -2906,6 +2906,7 @@ pub fn telemetry_present_begin() -> PresentSpan {
 
 /// `present_now` showed frame `n` (the running count of shown frames, 1-based).
 pub fn telemetry_frame_shown(n: u64) {
+    crate::hle::d3d12x::code_use::frame(n);
     if xlog::telemetry_on(Tier::Frame) {
         set_shown(n);
     }

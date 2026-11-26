@@ -220,7 +220,9 @@ pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, 
     let most = scratch.as_ref().map_or(1, |(s, _)| (s.bytes / group).max(1));
     let slabs = pso::dispatch_slabs(grid, most);
     let Some((scratch, used)) = scratch else {
-        list.SetPipelineState(&chain.whole()?);
+        let w = chain.whole()?;
+        list.SetPipelineState(&w);
+        super::super::code_use::bound(w.as_raw() as usize);
         list.Dispatch(x, y, z);
         return Ok(());
     };

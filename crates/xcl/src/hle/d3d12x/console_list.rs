@@ -917,6 +917,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let raw = real as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
+                        super::code_use::bound(real as usize);
                         crate::report::telemetry_dispatch(list.as_raw(), real as usize);
                         let mark = super::culprit::before_dispatch(&list, (*p).pc, real, [x, y, z]);
                         super::real::dispatch_chain::dispatch(&list, real, st.allocator, [x, y, z])?;
