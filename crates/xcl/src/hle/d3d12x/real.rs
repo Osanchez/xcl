@@ -2807,7 +2807,10 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
         .then(|| super::device_x::pc_resource_desc_for_device(this, &(console_desc as *const [u8; 0x38]).read_unaligned()));
     let desc = pc_full.as_ref().map_or(desc, |d| d.as_ptr() as usize);
     let mut clear_buf = [0u8; 24];
-    let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf) as usize;
+    let clear = match pc_full.as_ref() {
+        Some(d) => super::device_x::pc_clear_for_desc(clear as *const c_void, u32::from_le_bytes(d[0x20..0x24].try_into().unwrap()), &mut clear_buf),
+        None => super::device_x::pc_clear(clear as *const c_void, &mut clear_buf),
+    } as usize;
     // console-only state bits (e.g. 0x100000 on a display target) are not the PC's; a resource
     // the PC description took ALLOW_UNORDERED_ACCESS from does not start as a UAV
     let st = pc_full.as_ref().map_or(state as u32 & PC_RESOURCE_STATES, |d| {
@@ -3232,7 +3235,9 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = super::device_x::pc_resource_desc(&x);
     let st = super::device_x::pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state as u32);
-    let hr2 = dev_create_placed_resource(this, heap, offset, d.as_ptr() as usize, st as usize, clear, riid, ppv);
+    let mut clear_buf2 = [0u8; 24];
+    let clear_d = super::device_x::pc_clear_for_desc(clear as *const c_void, u32::from_le_bytes(d[0x20..0x24].try_into().unwrap()), &mut clear_buf2) as usize;
+    let hr2 = dev_create_placed_resource(this, heap, offset, d.as_ptr() as usize, st as usize, clear_d, riid, ppv);
     let heap_desc = pc_heap_desc(heap);
     let pc_size = pc_allocation_size(this, &d);
     // A texture the title placed by the console's size (`get_resource_allocation_info_x`
@@ -3241,7 +3246,7 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
     // heap's kind; the console's aliasing of that one placement is lost.
     let is_texture = u32::from_le_bytes(x[0..4].try_into().unwrap()) != D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32;
     let hr3 = match heap_desc {
-        Some(h) if hr2 < 0 && is_texture => Some(dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear, riid, ppv)),
+        Some(h) if hr2 < 0 && is_texture => Some(dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear_d, riid, ppv)),
         _ => None,
     };
     static N: AtomicU64 = AtomicU64::new(0);
@@ -3286,6 +3291,8 @@ unsafe fn own_memory_if_larger_on_the_pc(this: *mut c_void, heap: usize, offset:
     }
     let h = pc_heap_desc(heap)?;
     let st = super::device_x::pc_initial_state(u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()), state as u32);
+    let mut clear_buf = [0u8; 24];
+    let clear = super::device_x::pc_clear_for_desc(clear as *const c_void, u32::from_le_bytes(d[0x20..0x24].try_into().unwrap()), &mut clear_buf) as usize;
     let mut hr = dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear, riid, ppv);
     if hr < 0 && st != 0 {
         // as in the past-the-end fallback: a state the PC refuses for this desc (e.g. UAV
@@ -4335,7 +4342,12 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         return Some(Err(()));
     }
     let record = crate::gpu::shader::fnv64(cs);
-    if let Some(plan) = compiled.dispatch_chain {
+    let warm = compiled.dispatch_chain.as_ref().and_then(|_| {
+        let rs = abi_rs_for(this, &compiled.samplers)?;
+        let result = compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::CachedWhole);
+        (result.0 >= 0).then_some((rs, result))
+    });
+    if let Some(plan) = compiled.dispatch_chain.filter(|_| warm.is_none()) {
         if let Some(rs) = dispatch_chain::build(this, f, d, riid, ppv, record, &dxil, &compiled.samplers, plan) {
             LAST_COMPUTE_RS.with(|c| c.set(rs));
             note_pso_rs(*ppv, rs as *mut c_void);
@@ -4348,9 +4360,14 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             return Some(Ok(0));
         }
     }
-    let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
+    let (rs, (hr, in_driver, reused)) = match warm {
+        Some(hit) => hit,
+        None => {
+            let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
+            (rs, compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::Whole))
+        }
+    };
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
-    let (hr, in_driver, reused) = compute_container(this, f, d, rs, &dxil, record, riid, ppv, false);
     if hr < 0 {
         // A huge program's verdict in the log itself: `note_translation_error` goes to the
         // report, or to the notes of a cached-only attempt – a retail title's 13.8 MB program
@@ -4388,10 +4405,18 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
 pub(super) mod dispatch_chain;
 pub(crate) use dispatch_chain::log_counts as log_dispatch_chain_counts;
 
-/// `chained`: built with the dispatch chain's root signature (`dispatch_chain`), whose driver blobs
-/// are kept apart on disk from the same DXIL's under the title's.
+#[derive(Clone, Copy, PartialEq)]
+enum ComputeBuild {
+    Whole,
+    // Try the existing whole program before building a chain. A miss or rejected blob falls
+    // through to building the pieces, whose cold build is cheaper.
+    CachedWhole,
+    // The chain root signature has a separate on-disk namespace.
+    Chain,
+}
+
 unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void,
-    dxil: &[u8], record: u64, riid: *const GUID, ppv: *mut *mut c_void, chained: bool) -> (HRESULT, std::time::Duration, bool) {
+    dxil: &[u8], record: u64, riid: *const GUID, ppv: *mut *mut c_void, mode: ComputeBuild) -> (HRESULT, std::time::Duration, bool) {
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(dxil);
@@ -4401,13 +4426,15 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path(dxil, copy.Flags.0).map(|p| if chained { p.with_extension("chain.pso") } else { p });
+    let disk = driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
     let from_disk = cached.is_none();
     if from_disk {
         cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
     }
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+    } else if mode == ComputeBuild::CachedWhole {
+        return (E_INVALIDARG, std::time::Duration::ZERO, false);
     }
     // in the background, a few at a time and within the commit headroom the program asks for
     let (mut hr, mut in_driver) = driver_compile_identified(
@@ -4422,6 +4449,9 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         forget_compute_blob(key);
         if from_disk {
             driver_cache::note(false, disk.as_deref());
+        }
+        if mode == ComputeBuild::CachedWhole {
+            return (hr, in_driver, false);
         }
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
         let (retried, took) = driver_compile_identified(
@@ -4468,7 +4498,14 @@ pub(crate) mod driver_cache {
 
     /// The file of the pipeline made from `dxil` with `flags`.
     pub fn name(dxil: &[u8], flags: i32) -> String {
-        format!("{:016x}-{:x}-{:x}.pso", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+        name_for(dxil, flags, false)
+    }
+
+    /// Like [`name`], using `.chain.pso` for pipelines built with the dispatch chain's root
+    /// signature (`dispatch_chain`).
+    pub fn name_for(dxil: &[u8], flags: i32, chained: bool) -> String {
+        let ext = if chained { "chain.pso" } else { "pso" };
+        format!("{:016x}-{:x}-{:x}.{ext}", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
     }
 
     /// The file of a translated graphics pipeline keyed by its full state + shader digest.
@@ -4482,7 +4519,11 @@ pub(crate) mod driver_cache {
     }
 
     pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
-        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name(dxil, flags)))
+        path_for(dxil, flags, false)
+    }
+
+    pub fn path_for(dxil: &[u8], flags: i32, chained: bool) -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(name_for(dxil, flags, chained)))
     }
 
     pub fn graphics_path(hash: u64, bytes: usize) -> Option<PathBuf> {
@@ -4572,6 +4613,9 @@ pub(crate) mod driver_cache {
             assert_ne!(name(b"abc", 0), name(b"abc", 1));
             // (the length is in the name: two programs of one hash and different lengths differ)
             assert!(name(&[0u8; 0x1234], 2).ends_with("-1234-2.pso"));
+            assert_eq!(name_for(b"abc", 0, false), name(b"abc", 0));
+            assert_ne!(name_for(b"abc", 0, true), name_for(b"abc", 0, false));
+            assert!(name_for(&[0u8; 0x1234], 2, true).ends_with("-1234-2.chain.pso"));
         }
 
         #[test]
@@ -4662,6 +4706,54 @@ fn forget_compute_blob(key: (u64, usize, i32)) {
 
 #[cfg(test)]
 mod compute_blob_tests {
+    #[test]
+    fn recorded_split_selects_cached_whole_or_pieces() {
+        use super::*;
+        use crate::gpu::recomp::pso::{console_to_dxil_for, Stage};
+        let Some(input) = std::env::var_os("XCL_SAMPLE_RUNTIME_COMPUTE") else { return };
+        let cache = std::path::PathBuf::from(std::env::var_os("XCL_DXIL_CACHE").expect("private empty replay cache"));
+        let mode = std::env::var("XCL_SAMPLE_CACHE_CASE").unwrap();
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let raw = device_raw();
+        let code = std::fs::read(input).unwrap();
+        let c = console_to_dxil_for(&code, Stage::Compute, 0, wave32_only(raw)).unwrap();
+        assert!(c.dispatch_chain.is_some());
+        let path = driver_cache::path(&c.dxil, 0).unwrap();
+        assert!(path.starts_with(&cache));
+        assert_eq!(path.exists(), mode == "offline", "expected driver cache entry at {}", path.display());
+        unsafe {
+            let root = abi_rs_for(raw, &c.samplers).unwrap();
+            let create: PsoFn = std::mem::transmute(orig_fn(raw, slot_of(raw, "CreateComputePipelineState")));
+            let iid = pc_iid(Kind::PipelineState);
+            match mode.as_str() {
+                "hit" => {
+                    let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root), CS: bytecode(&c.dxil), ..Default::default()
+                    };
+                    let mut ptr = std::ptr::null_mut();
+                    assert!(create(raw, (&desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC).cast(), &iid, &mut ptr) >= 0);
+                    let blob = ID3D12PipelineState::from_raw(ptr).GetCachedBlob().unwrap();
+                    assert!(driver_cache::write(&path, std::slice::from_raw_parts(blob.GetBufferPointer().cast(), blob.GetBufferSize())));
+                }
+                "stale" => assert!(driver_cache::write(&path, b"invalid driver blob")),
+                "miss" | "offline" => (),
+                _ => panic!("unknown replay case"),
+            }
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { CS: bytecode(&code), ..Default::default() };
+            let mut out = std::ptr::null_mut();
+            let start = std::time::Instant::now();
+            let hr = translated_compute_pso_once(raw, create, (&desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC).cast(), &iid, &mut out)
+                .expect("recognized compute shader").expect("translated pipeline");
+            assert!(hr >= 0 && !out.is_null());
+            let whole = LAST_COMPUTE_RS.with(|s| s.get()) == root as usize;
+            println!("RUNTIME_CACHE case={mode} whole={whole} elapsed_ms={:.2}", start.elapsed().as_secs_f64()*1000.);
+            let expected_whole = matches!(mode.as_str(), "hit" | "offline");
+            assert_eq!(whole, expected_whole);
+            assert_eq!(path.exists(), expected_whole);
+            drop(ID3D12PipelineState::from_raw(out));
+        }
+    }
+
     #[test]
     fn a_blob_is_found_only_for_the_same_program_root_signature_and_flags_and_is_forgotten() {
         let dxil = vec![7u8; 1000];
@@ -6847,7 +6939,7 @@ unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rt
     }
 }
 
-/// A stand-in pipeline is bound as its real pipeline once that is built (compute: waited for).
+/// A stand-in pipeline is bound as its real pipeline once that is built (compute: waited for at its use).
 /// SetPipelineState on the PC list (a pipeline still building in the background: its stand-in)
 pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
     cl_set_pipeline_state(this, pso)
@@ -6856,7 +6948,7 @@ pub(super) unsafe fn bind_pipeline(this: *mut c_void, pso: *mut c_void) {
 unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
-    let bound = super::pso_async::resolve_for_bind(pso as usize);
+    let bound = super::pso_async::resolve(pso as usize);
     f(this, bound as *mut c_void);
     super::dred::mark_pipeline(this, pso as usize, bound);
     super::list_x::on_set_pipeline_state(this, pso as usize);
@@ -7177,8 +7269,11 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     for &l in std::slice::from_raw_parts(lists, n as usize) {
         if let Some(pc) = super::console_list::pc_list(l) {
             mapped.push(pc);
-        } else if !super::title_list::push_segments(l, &mut mapped) {
-            mapped.push(l);
+        } else {
+            super::list_x::record_deferred(l);
+            if !super::title_list::push_segments(l, &mut mapped) {
+                mapped.push(l);
+            }
         }
     }
     super::list_x::note_queue_for_lists(this as usize, &mapped);
@@ -7624,7 +7719,16 @@ mod readback_routing_tests {
                     drop(r_ok);
                     drop(heap);
                 }
-                assert_ne!(VirtualFree(mem, 0, MEM_RELEASE), 0);
+                // D3D12CreateDevice gives the process's one device: once another test adopted it,
+                // r_ok was adopted too, and its last Release is held (`late_release`) while a
+                // queue of another test still has work. The heap pins `mem` until then (#1487).
+                let start = std::time::Instant::now();
+                let mut freed = VirtualFree(mem, 0, MEM_RELEASE);
+                while freed == 0 && start.elapsed() < std::time::Duration::from_secs(10) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    freed = VirtualFree(mem, 0, MEM_RELEASE);
+                }
+                assert_ne!(freed, 0, "the heap's pages were not let go within 10 s");
             }
         }
     }
@@ -7759,6 +7863,8 @@ mod readback_routing_tests {
 #[cfg(test)]
 mod queue_tests {
     use super::*;
+    use std::mem::{offset_of, size_of};
+    use windows::Win32::Graphics::Direct3D12::ID3D12Fence_Vtbl;
 
     // a fake adopted queue: the extension vtable's word before slot 0 points at the PC table
     unsafe extern "system" fn get_desc(_: *mut c_void, out: usize) -> usize {
@@ -7769,11 +7875,36 @@ mod queue_tests {
     unsafe extern "system" fn signal(_: *mut c_void, _: usize, _: usize) -> i32 {
         0
     }
+    unsafe extern "system" fn fake_fence_completed(_: *mut c_void) -> u64 {
+        u64::MAX
+    }
+
+    #[repr(C)]
+    struct FakeFence {
+        vtable: *const usize,
+    }
+
+    /// Removes the synthetic fence and queue entries from every global table that
+    /// `queue_dispatch(14, ...)` touches before the stack objects go out of scope.
+    struct Cleanup {
+        fence: usize,
+        queue: usize,
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            FENCES.write().unwrap_or_else(|e| e.into_inner()).retain(|&f| f != self.fence);
+            super::super::fence_x::forget_fence_for_test(self.fence);
+            super::super::list_x::forget_title_fence_for_test(self.fence, self.queue);
+            QUEUE_OLDER.store(false, Ordering::Release);
+        }
+    }
 
     /// Queue #18 before the layout is known writes 8 bytes; after a Signal at #14 (the older
     /// layout) it is GetDesc with all 16.
     #[test]
     fn queue_slot_18_before_the_layout_is_known_writes_8_bytes() {
+        const SLOT: usize = size_of::<usize>();
         let mut pc = [0usize; 32];
         pc[14] = signal as usize;
         pc[18] = get_desc as usize;
@@ -7781,7 +7912,14 @@ mod queue_tests {
         let vtbl = ext.as_ptr() as usize + 8;
         let mut obj = [vtbl];
         let this = obj.as_mut_ptr() as *mut c_void;
-        let fence = 0x5EED_0000usize;
+        // A valid minimal ID3D12Fence COM object while registered: if a parallel test inspects
+        // `SYNC_GRAPH.title_fences` before `Cleanup::drop` runs, `GetCompletedValue` succeeds
+        // cleanly instead of dereferencing an unmapped sentinel address.
+        let mut fence_vtbl = [0usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        fence_vtbl[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = fake_fence_completed as usize;
+        let fake_fence = FakeFence { vtable: fence_vtbl.as_ptr() };
+        let fence = (&fake_fence as *const FakeFence) as usize;
+        let _cleanup = Cleanup { fence, queue: this as usize };
         QUEUE_SHIFTED.store(false, Ordering::Release);
         QUEUE_OLDER.store(false, Ordering::Release);
         unsafe {
@@ -7791,13 +7929,11 @@ mod queue_tests {
             assert_eq!(out, [1, 2, 0xAAAA_AAAA, 0xAAAA_AAAA], "only the first 8 bytes");
             FENCES.write().unwrap().push(fence);
             queue_dispatch(14, this, fence, 1, 0, 0);
-            FENCES.write().unwrap().retain(|&f| f != fence);
             assert!(QUEUE_OLDER.load(Ordering::Acquire) && !QUEUE_SHIFTED.load(Ordering::Acquire));
             let mut out = [0xAAAA_AAAAu32; 4];
             queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0);
             assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
         }
-        QUEUE_OLDER.store(false, Ordering::Release);
     }
 
     #[test]
