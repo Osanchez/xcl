@@ -164,6 +164,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 if !stalled(last, since.elapsed(), secs) {
                     continue;
                 }
+                arm_end_watchdog(END_GRACE, || unsafe { crate::eh::end_process_now(0) });
                 crate::xlog_warn!("XCL_STALL_DUMP: no frame presented for {secs} s after frame {last} – where every thread is, then the end");
                 crate::hle::d3d12x::list_x::log_sync_state("the stall");
                 crate::report::telemetry_stall(last, since.elapsed().as_secs_f64(), secs);
@@ -181,6 +182,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     if let Some(secs) = std::env::var("XCL_RUN_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()) {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(secs));
+            arm_end_watchdog(END_GRACE, || unsafe { crate::eh::end_process_now(0) });
             let (shown, presented) = crate::hle::d3d12x::present::counters();
             crate::xlog_info!("XCL_RUN_SECONDS: {secs} s – ending the title ({shown} frames shown, {presented} PresentX calls)");
             crate::report::telemetry_end("run_seconds", Some(0));
@@ -235,6 +237,15 @@ pub fn host_main(boot_path: &Path) -> i32 {
     code as i32
 }
 
+/// The process ends `after` from now whatever the rest of the ending does.
+fn arm_end_watchdog(after: std::time::Duration, fire: impl FnOnce() + Send + 'static) {
+    let _ = std::thread::Builder::new().name("xcl-run-end-watchdog".into()).spawn(move || {
+        std::thread::sleep(after);
+        fire();
+    });
+}
+const END_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// `XCL_STALL_DUMP`'s value: seconds without a frame, if it is a positive number.
 fn stall_seconds(value: Option<&str>) -> Option<f64> {
     value.and_then(|v| v.trim().parse::<f64>().ok()).filter(|s| s.is_finite() && *s > 0.0)
@@ -266,5 +277,23 @@ mod tests {
         assert!(!stalled(940, Duration::from_millis(5_999), 6.0));
         assert!(stalled(940, Duration::from_secs(6), 6.0));
         assert!(stalled(1, Duration::from_secs(60), 6.0));
+    }
+
+    #[test]
+    fn an_armed_end_watchdog_fires_while_the_ending_blocks() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        arm_end_watchdog(Duration::from_millis(50), move || {
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(2)).is_ok(), "the watchdog did not fire");
+    }
+
+    #[test]
+    fn an_armed_end_watchdog_waits_its_time() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        arm_end_watchdog(Duration::from_millis(300), move || {
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "the watchdog fired early");
     }
 }
