@@ -489,11 +489,19 @@ pub fn init() -> Result<String, String> {
             }
             crate::gpu::agility::State::NotFound => {}
         }
-        let debug = cfg.d3d12_debug || std::env::var_os("XCL_D3D12_DEBUG").is_some();
+        // `XCL_D3D12_GBV=1|nostate`: GPU-based validation (needs the debug layer, so it turns it on).
+        let gbv = std::env::var("XCL_D3D12_GBV").ok().filter(|v| v == "1" || v == "nostate");
+        let debug = cfg.d3d12_debug || std::env::var_os("XCL_D3D12_DEBUG").is_some() || gbv.is_some();
         if debug {
             match crate::gpu::agility::enable_debug_layer() {
                 Ok(()) => {
                     crate::xlog_info!("D3D12: debug layer enabled");
+                    if let Some(v) = &gbv {
+                        match crate::gpu::agility::enable_gpu_based_validation(v == "nostate") {
+                            Ok(()) => crate::xlog_info!("D3D12: GPU-based validation enabled ({v})"),
+                            Err(e) => crate::xlog_warn!("D3D12: GPU-based validation requested but unavailable: {e}"),
+                        }
+                    }
                 }
                 Err(e) => {
                     crate::xlog_warn!("D3D12: debug layer requested but unavailable: {e}");
@@ -562,16 +570,23 @@ pub fn init() -> Result<String, String> {
     }
 }
 
+/// Message ids of a device removal (DRED-related: 232, 233, 234): never held back by the caps.
+fn always_logged(id: i32) -> bool {
+    matches!(id, 232..=234)
+}
+
 /// A debug layer message: errors and warnings into the log – the first 8 of each message id
 /// (3 000 in all). One cap for all of them (200) was used up in seconds by two per-frame state
 /// errors of a retail game, long before the message that came with its device removal.
-unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
+unsafe extern "system" fn debug_message(category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static PER_ID: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
+    let t = if text.is_null() { String::new() } else { String::from_utf8_lossy(text.as_bytes()).into_owned() };
+    crate::report::telemetry_debug_message(id.0, severity.0, category.0, &t);
     if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
         return;
     }
-    {
+    if !always_logged(id.0) {
         let mut g = PER_ID.lock().unwrap();
         let n = g.get_or_insert_with(HashMap::new).entry(id.0).or_insert(0);
         *n += 1;
@@ -579,11 +594,21 @@ unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, sever
             return;
         }
     }
-    if N.fetch_add(1, Ordering::Relaxed) >= 3000 {
+    if !always_logged(id.0) && N.fetch_add(1, Ordering::Relaxed) >= 3000 {
         return;
     }
-    let t = if text.is_null() { String::new() } else { String::from_utf8_lossy(text.as_bytes()).into_owned() };
     crate::xlog_warn!("D3D12 debug layer ({}, id {}): {t}", if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 { "error" } else { "warning" }, id.0);
+}
+
+#[cfg(test)]
+mod debug_message_tests {
+    use super::always_logged;
+
+    #[test]
+    fn always_logged_covers_removal_ids() {
+        assert!(always_logged(232) && always_logged(233) && always_logged(234));
+        assert!(!always_logged(0) && !always_logged(231) && !always_logged(235));
+    }
 }
 
 type QiFn = unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT;

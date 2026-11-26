@@ -46,6 +46,7 @@ pub enum State {
 
 static STATE: OnceLock<State> = OnceLock::new();
 static DEBUG_LAYER: OnceLock<Result<(), String>> = OnceLock::new();
+static GPU_BASED_VALIDATION: OnceLock<Result<(), String>> = OnceLock::new();
 
 /// Candidate directories in search order.
 pub(crate) fn candidates(env_override: Option<PathBuf>, exe_dir: Option<PathBuf>, local_app_data: Option<PathBuf>) -> Vec<PathBuf> {
@@ -365,6 +366,22 @@ pub fn enable_debug_layer() -> &'static Result<(), String> {
         unsafe { debug.EnableDebugLayer() };
         Ok(())
     })
+}
+
+/// Turn on GPU-based validation (once per process; call it after `enable_debug_layer` and before
+/// the device exists). `no_state_tracking` adds `DISABLE_STATE_TRACKING` (cheaper, fewer checks).
+pub fn enable_gpu_based_validation(no_state_tracking: bool) -> Result<(), String> {
+    GPU_BASED_VALIDATION
+        .get_or_init(|| {
+            let debug = configuration_interface::<ID3D12Debug1>(&CLSID_D3D12Debug).map_err(|e| e.to_string())?;
+            unsafe { debug.SetEnableGPUBasedValidation(true) };
+            if no_state_tracking {
+                let debug2 = debug.cast::<ID3D12Debug2>().map_err(|e| e.to_string())?;
+                unsafe { debug2.SetGPUBasedValidationFlags(D3D12_GPU_BASED_VALIDATION_FLAGS_DISABLE_STATE_TRACKING) };
+            }
+            Ok(())
+        })
+        .clone()
 }
 
 #[cfg(test)]

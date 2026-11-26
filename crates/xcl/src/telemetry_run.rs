@@ -1481,3 +1481,73 @@ mod telemetry_p5e_tests {
         assert_eq!(f[4].1, 128);
     }
 }
+
+// ---- debug layer messages (XCL_D3D12_DEBUG, XCL_D3D12_GBV) ----
+
+/// Messages of an id written whole as `debug_layer` events (the rest only as counts).
+const DEBUG_EVENTS_PER_ID: u64 = 64;
+
+/// Messages that arrived while the count table was locked by another thread.
+static DEBUG_DROPPED: AtomicU64 = AtomicU64::new(0);
+static DEBUG_COUNTS: Mutex<Option<HashMap<i32, u64>>> = Mutex::new(None);
+
+/// pure: which event the `n`-th message (1-based) of `id` gets: `debug_layer` for the first 64
+/// and for the removal ids 232-234, `debug_layer_count` at n = 128, 256, 512, ..., else None.
+fn debug_event_due(n: u64, id: i32) -> Option<&'static str> {
+    if n <= DEBUG_EVENTS_PER_ID || (232..=234).contains(&id) {
+        Some("debug_layer")
+    } else if n >= 128 && n.is_power_of_two() {
+        Some("debug_layer_count")
+    } else {
+        None
+    }
+}
+
+/// Every debug layer message (any severity), from the layer's callback (tier frame).
+pub fn telemetry_debug_message(id: i32, severity: i32, category: i32, text: &str) {
+    if !crate::log::telemetry_on(crate::log::Tier::Frame) {
+        return;
+    }
+    let n = {
+        let Ok(mut g) = DEBUG_COUNTS.try_lock() else {
+            DEBUG_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let n = g.get_or_insert_with(HashMap::new).entry(id).or_insert(0);
+        *n += 1;
+        *n
+    };
+    match debug_event_due(n, id) {
+        Some("debug_layer") => {
+            let severity = match severity {
+                0 => "corruption",
+                1 => "error",
+                2 => "warning",
+                3 => "info",
+                _ => "message",
+            };
+            let text: String = text.chars().take(512).collect();
+            crate::log::event(
+                crate::log::Tier::Frame,
+                "debug_layer",
+                &[("id", id.into()), ("severity", severity.into()), ("category", category.into()), ("text", text.into()), ("n", n.into())],
+            );
+        }
+        Some(name) => crate::log::event(crate::log::Tier::Frame, name, &[("id", id.into()), ("n", n.into())]),
+        None => {}
+    }
+}
+
+#[cfg(test)]
+mod telemetry_debug_tests {
+    use super::debug_event_due;
+
+    #[test]
+    fn debug_event_due_caps_per_id() {
+        assert_eq!(debug_event_due(1, 10), Some("debug_layer"));
+        assert_eq!(debug_event_due(64, 10), Some("debug_layer"));
+        assert_eq!(debug_event_due(65, 10), None);
+        assert_eq!(debug_event_due(128, 10), Some("debug_layer_count"));
+        assert_eq!(debug_event_due(1000, 233), Some("debug_layer"));
+    }
+}

@@ -254,7 +254,8 @@ for completeness; what they affect is explained in `gpu-recompiler.md`, `d3d12x.
 | `XCL_RAYTRACING` | `crates/xcl/src/config.rs:244` | Raytracing tier reported to the title: `auto`, `tier1_1` (`1.1`, `11`), `tier1_0` (`1.0`, `10`), `off` (`none`, `0`). Overrides `raytracing`. | `raytracing` from `xcl.toml` (`auto`) |
 | `XCL_WINDOW_POS` | `crates/xcl/src/hle/d3d12x/present.rs:434` | XCL window position: `auto`, `center` or `x,y`. Overrides `window_pos`. | `window_pos` from `xcl.toml` (`auto`) |
 | `XCL_UMA_MB` | `crates/xcl/src/gpu/uma.rs:737` | Size of the title's unified (GPU-visible) memory in MiB. The host copies `uma_mb` from the config into it when it is unset (crates/xcl/src/host.rs:28). | `uma_mb` from `xcl.toml`; 4095 for "advanced" title memory, else 2048 (crates/xcl/src/config.rs:110) |
-| `XCL_D3D12_DEBUG` | `crates/xcl/src/hle/d3d12x/real.rs:471` | Turns on the D3D12 debug layer (needs Graphics Tools). Same as `d3d12_debug = true`. | unset (off) |
+| `XCL_D3D12_DEBUG` | `crates/xcl/src/hle/d3d12x/real.rs:471` | Turns on the D3D12 debug layer (needs Graphics Tools). Same as `d3d12_debug = true`. Errors and warnings go to the log (first 8 per message id, 3000 in all; ids 232-234 always); with telemetry on, every message also counts toward `debug_layer` / `debug_layer_count` events. | unset (off) |
+| `XCL_D3D12_GBV` | `crates/xcl/src/hle/d3d12x/real.rs` (`init`) | GPU-based validation: `1` or `nostate` (`nostate` adds `DISABLE_STATE_TRACKING`). Turns the debug layer on too; slow. | unset (off) |
 
 ### Where tools and caches are
 
