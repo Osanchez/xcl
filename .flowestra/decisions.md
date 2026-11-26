@@ -9965,3 +9965,1321 @@ Status code to add: `END_ENUMERATION: Status = -7` (`nvapi_lite_common.h` l.273)
   `ReadApi`, asserting none of `0x577DD202` (SetSetting), `0xFCBC7E14` (SaveSettings), `0xCC176068`, `0x4347A9DE`,
   `0x17093206` is in it.
 The DRS calls themselves are not mocked (as in PR #2590); the PC run is the integration test.
+
+## 2026-11-26 Statistics overlay (HUD) in the top-left corner of the window (user asked for it; orchestrator reviewed)
+
+### 0. Approval and orchestrator review
+
+- **User (2026-11-26):** "include runn stats on the top left of our window. I want it to show
+  all basic stats. RAM used, CPU percentage. Graphics card, FPS. Any useful information to me on
+  the top left of the window with nice live graphs. Sleek and modern looking, and ultra light
+  weight. Please have another agent work on this and send me a screenshot when done".
+- **Orchestrator decisions:** the design below is built as written. Default `hud = "full"` (the
+  user wants to see it), `XCL_HUD` overrides, F3 cycles full / compact / off. GPU utilisation
+  stays out of the first version (unit U8, deferred until its cost is measured). Upstream PR #450
+  (an on-screen panel drawn on the CPU and copied in: opaque, no graphs, 8-bit only, conflicting)
+  is not adopted because it does not meet the request; the user is told.
+- **U0 is narrowed** so that it can be written at the same time as wave 1: it creates
+  `hud/mod.rs`, the `mod` line in the d3d12x `mod.rs`, and one-line placeholder files only for
+  `hud/layout.rs`, `hud/sample.rs` and `hud/draw.rs`. The wave 1 units create `hud/font.rs`,
+  `hud/model.rs` and `hud/text.rs` themselves.
+- **Citations spot-checked at db3bc937:** `hle/d3d12x/present.rs:1007-1013` (the swap chain is
+  made with `DXGI_SCALING_STRETCH`), `present.rs:373-378` (`wndproc`), `hle/d3d12x/pso_async.rs:3182-3185`
+  (`counts` walks the pending map under its lock). All hold.
+- **The bitmap font** (95 glyphs, 5x9) was drawn for this project by the designer; nothing is
+  taken from a third-party font.
+- Nothing here was built or run on macOS; every unit is built and tested on the Windows PC.
+
+Status: draft for the orchestrator's review. Written on macOS from the source of branch `dev`
+(head `b3527fd4`); nothing was built or run. Every `path:line` is on that commit.
+
+### 1. Summary and recommendation
+
+Draw a small translucent panel in the top-left corner of XCL's own swap-chain back buffer, after
+the title's frame has been copied (or composited) into it and after any XCL frame-dump readback,
+just before the back buffer goes to `PRESENT`. The panel is one instanced draw of quads on XCL's
+present command list, from an upload buffer that is mapped once. Quads are of three kinds: a
+rectangle, a rounded rectangle (signed distance in the pixel shader) and a glyph of a 5x9 bitmap
+font written for this project (the bits sit in the pixel shader as a constant array, so there is no
+texture and no descriptor heap). A sampler thread (`xcl-hud`, 4 Hz) reads CPU, memory and video
+memory; the present path only pushes a time stamp per shown frame into a lock-free ring. Layout is
+rebuilt only when the sampler publishes (4 Hz) or the frame size changes; other frames copy about
+40 KB of cached quads and record about 12 D3D12 calls.
+
+Recommendation on prior art (decision A): do **not** adopt upstream PR #450; write our own (section
+3.1).
+
+Default: `hud = "full"` in `xcl.toml`, `XCL_HUD` overrides, F3 cycles full / compact / off.
+
+Decisions at a glance:
+- A, prior art: PR #450 exists (CPU-drawn opaque panel, copied); not adopted (3.1).
+- B, content: 13 rows in full mode, 4 figures and one graph in compact; GPU utilisation left out
+  of v1 (4, 4.3).
+- C, drawing: one instanced draw of quads, font bits in the pixel shader, recorded after the
+  title's frame and any frame dump (5, 7, U3 10.5, U5 10.7).
+- D, sampler: `xcl-hud` thread at 4 Hz (pipeline counts at 1 Hz), lock-free frame stamps, fixed
+  buffers (4.1, 4.2, U4 10.6).
+- E, switches: `hud` / `XCL_HUD` = full (default), compact, off; F3 cycles (8).
+- F, tests: 60 named tests, two of them GPU tests on WARP (9 and each unit).
+- G, docs: one README bullet, one Controls sentence, two rows in the fork's config guide (9).
+
+Full panel at a 1080-line frame (1 dot = 2 px; panel 180 x 193 dots = 360 x 386 px):
+
+```
+.------------------------------------------------.
+| XCL ScarlettGame                     00:12:34  |
+| -----------------------------------------------|
+| FPS  2.4           |      ||   |  |   ||  ||  ||   <- frame-time graph (cyan)
+|      412 ms        |  |||||||||||||||||||||||| |
+| CPU  38%           |  ....::::::::::::........ |   <- system (dim) + XCL (bright), violet
+| sys  61%           |  ::::::::::::::::::::::::||
+| RAM  9.8 GB        |  ======================== |   <- system used (dim) + XCL (bright), green
+| sys  27.1/63.9G    |  ======================== |
+| VRAM 15.1 GB       |  -------budget----------- |   <- amber; value red when over budget
+| of   14.6 GB       |  ######################## |
+| -----------------------------------------------|
+| GPU    NVIDIA GeForce RTX 50                   |
+| Commit 14.2 GB                                 |
+| PSO    55,223 queued                           |
+| Failed 12                                      |
+| DXC    2 run, 46 done                          |
+| Res    3840x2160 > 1280x720                    |
+| RT     off                                     |
+'------------------------------------------------'
+```
+
+(`GPU` is cut at 21 characters; the `Failed` row appears only when a pipeline failed, `Code ... MB`
+and `GPU ms ...` only when their sources are on, section 4. The panel above has 7 detail rows,
+193 dots tall; without `Failed`, 183.)
+
+Compact panel (168 x 42 dots = 336 x 84 px at 1080 lines):
+
+```
+.-------------------------------------------.
+| FPS 2.4   412 ms      |  |  ||  | ||  ||  |
+| CPU 38%  RAM 9.8G     | ||||||||||||||||| |
+| VRAM 15.1/14.6G       | ||||||||||||||||| |
+'-------------------------------------------'
+```
+
+### 2. Goal and scope
+
+Goal: while a title runs, the user sees at a glance how fast it presents, what XCL costs the
+machine (CPU, RAM, video memory against its budget), which GPU runs it and whether pipelines are
+still being built, with short live graphs, at a cost that does not show in the frame time.
+
+In scope:
+- the panel (full and compact), its sampler thread, its switches (`hud`, `XCL_HUD`, F3);
+- 8-bit, 10-bit and FP16 swap chains (all formats `swap_format` gives, `present.rs:283`);
+- unit tests of every pure part, two GPU tests on WARP;
+- README line and the fork's config table rows.
+
+Out of scope (section 13): GPU utilisation in v1 (a measured follow-up, unit U8), drawing when the
+title does not present, a mouse-driven UI, per-pass or per-queue timings, an always-on GPU timer.
+
+### 3. What exists today
+
+#### 3.1 Prior art upstream (decision A)
+
+`gh pr list -R xcl-dev/xcl --search overlay|HUD|on-screen|"fps counter"|stats|osd --state all` and the
+same for issues found:
+
+- **PR #450** (open, `CONFLICTING`, head `093f600`, 361 added lines: `hle/overlay.rs` 266,
+  `present.rs` +86, `host.rs` +3, `README.md` +5): `XCL_OVERLAY=1` renders a panel **on the CPU**
+  into BGRA/RGBA pixels with a 5x7 font and `CopyTextureRegion`s it to (8, 8) of the back buffer.
+  Off by default, refreshed once a second, text only, opaque, no graphs; 10-bit and FP16 back
+  buffers draw nothing. Written with "GPT-6.2 Astra"; reviewers found a back-buffer reference leak
+  and an unaligned pitch (fixed in `cd41749`). Last comment (2026-11-25): conflicts with `main`.
+- PR #516 (merged): the FPS in the window title (`present.rs:442`-`478`). PR #482 closed duplicate.
+- No issue asks for an overlay. Issue #933 (closed) is about CapFrameX's injected overlay.
+
+Adopt #450 or write our own? Write our own:
+- A copy cannot blend: the user asked for a translucent, "sleek" panel with live graphs; a copy
+  replaces pixels and would need the CPU to rasterise graphs too, every refresh.
+- It skips 10-bit and FP16 frames; ours draws on all of `swap_format`'s formats.
+- It does not apply to `dev`: it conflicts with upstream `main`, and `dev`'s `present.rs` has 163
+  more commits; bringing it through `scripts/dev/merge-pr.py` means resolving `present.rs` anyway.
+- What it teaches is kept: a child window does not work under flip-model presentation (the
+  description says the flip draws over it), copy locations must borrow with `transmute_copy`
+  rather than `ManuallyDrop::new(Some(x.clone()))`, and placed footprints need 256-byte pitches.
+  We use none of these paths (no child window, no texture copy), so none of its bugs can recur.
+- No code is taken from it.
+
+#### 3.2 The window and its title bar
+
+- The window is made on its own thread `xcl-window` (`present.rs:569`-`582`) by `window_thread`
+  (`present.rs:481`-`528`): class `XCLGameWindow`, size from `cfg.window_size()`
+  (`config.rs:279`), `kbm::attach` (`present.rs:520`), a 500 ms timer (`present.rs:521`).
+- The title text "XCL – <game> | N FPS | compiling shaders: ..." is built by `show_compiling`
+  (`present.rs:445`-`478`) on that timer (`present.rs:391`-`394`), from `FrameRate::sample`
+  (`present.rs:419`-`437`), `pso_async::counts()` and `dxc::compile_counts()`. It stays.
+- The process is not DPI-aware (no manifest or `SetProcessDpiAware*` anywhere in `crates/`), so
+  client sizes are 96-DPI logical pixels and Windows scales the whole window. The HUD needs no DPI
+  code.
+
+#### 3.3 Input
+
+- `wndproc` (`present.rs:374`-`396`) first gives every message to `kbm::on_message`
+  (`kbm.rs:299`-`351`), which handles raw mouse input, focus, sizing and the cursor only; key
+  messages fall through to `DefWindowProcW`.
+- The game's keyboard-as-gamepad reads keys by polling `GetAsyncKeyState` (`kbm.rs:354`-`357`,
+  `kbm.rs:392`-`445`). Handling `WM_KEYDOWN` in the window procedure therefore takes nothing from
+  the game. Mapped keys are WASD, E, Q, Shift, Ctrl, the mouse, Space, Enter, Escape, Backspace,
+  arrows, Tab and P (`kbm.rs:6`-`16`); no function key is used. F3 is free.
+
+#### 3.4 How a frame reaches the swap chain
+
+- `present_now` (`present.rs:1033`-`1257`) runs on the title's presenting thread under the
+  `PRESENTER` mutex (`present.rs:937`, `present.rs:1046`-`1056`).
+- The swap chain is sized to the **title's frame**, not the window: `ensure_swapchain(p, hwnd, w,
+  h, fmt)` with the frame's `w`, `h` (`present.rs:1087`-`1094`, `present.rs:1111`) and
+  `DXGI_SCALING_STRETCH` (`present.rs:1011`), so DWM stretches the back buffer to the client
+  area. `DXGI_ALPHA_MODE_IGNORE` (`present.rs:1013`). Three buffers (`present.rs:592`).
+- Format: `swap_format` (`present.rs:283`-`291`): R8G8B8A8_UNORM, B8G8R8A8_UNORM,
+  R10G10B10A2_UNORM or R16G16B16A16_FLOAT. No `SetColorSpace1` call exists, so the default colour
+  space applies (sRGB-encoded for UNORM, linear scRGB for FP16).
+- XCL records on its own list `p.list` (`present.rs:1116`), executed on the title's queue
+  (`present.rs:1217`-`1220`). One plane: `CopyResource` or `CopyTextureRegion` into the back
+  buffer, then `COPY_DEST -> PRESENT` (`present.rs:1159`-`1190`). Several planes: the compositor
+  draws into the back buffer (`present.rs:1122`-`1152`, `Compositor::record` `present.rs:845`-`901`),
+  then `RENDER_TARGET -> PRESENT`, or `-> COPY_SOURCE` for the `XCL_FRAME_DUMP` readback and then
+  `-> PRESENT` (`present.rs:1138`-`1147`).
+- The compositor is the model for XCL-owned drawing: its own root signature, PSOs per format,
+  RTV heap, FXC-compiled shaders (`compile_fx` `present.rs:678`-`700`, `D3DCompile` vs_5_0/ps_5_0)
+  and premultiplied blending (`present.rs:827`-`835`). It touches no title state: it binds only its
+  own objects on XCL's own list.
+- Command-allocator slots: `prepare_pipelined_slot` (`present.rs:647`-`666`) waits for the slot's
+  fence before reuse; `p.ring.cur` is the slot in use, and the compositor indexes its per-slot
+  descriptors by it (`present.rs:856`). With `XCL_PRESENT_SYNC=1` there is one slot
+  (`present.rs:639`-`645`).
+- `frame_shown(w, h)` (`present.rs:1259`-`1268`) runs once per shown frame, also on the
+  telemetry bypass paths (`present.rs:1095`, `present.rs:1100`).
+- `Drop for Presenter` waits for the last fence before its fields are released
+  (`present.rs:1488`-`1497`), so GPU objects kept in the presenter outlive their last use.
+- GPU tests of present code already run on WARP with no skip: `compositor_blends_ui_plane_over_scene_plane`
+  (`present.rs:1714`-`1854`), using `readback_copy` (`present.rs:1307`).
+
+#### 3.5 The figures and where they come from
+
+| Figure | Existing source | Cost / notes |
+|---|---|---|
+| Frames shown | `PRESENTS` (`present.rs:44`), `frame_shown` | one atomic |
+| FPS in title bar | `FrameRate` (`present.rs:413`-`437`) | 1 s window, coarse at 2 fps |
+| Process commit | `K32GetProcessMemoryInfo` `PrivateUsage` (`host.rs:92`-`98`, `telemetry_gpu.rs:3256`-`3262`) | microseconds |
+| System RAM | `GlobalMemoryStatusEx` (`report.rs:406`-`414`, `uma.rs:816`) | microseconds |
+| Video memory + budget | `real::video_memory()` (`real.rs:433`-`446`): `QueryVideoMemoryInfo` local and non-local | creates a DXGI factory on every call; the HUD caches the adapter instead |
+| `memory:` log line | `host.rs:91`-`117`, only with `XCL_ACTIVITY`, every 2 s | — |
+| Adapter name | `gpu::adapter::name(&DXGI_ADAPTER_DESC1)` (`adapter.rs:119`-`122`) | once |
+| Pipelines | `pso_async::counts()` -> (built, failed, pending) (`pso_async.rs:3182`-`3185`) | locks `PENDING` and walks every entry, locking each `done`: O(pending), 55 223 entries in the user's run. The title bar already calls it every 500 ms |
+| Pipeline queue gauges | `pso_async::queue_gauges()` (`pso_async.rs:912`-`934`), `real::gate_gauges()` (`real.rs:4308`-`4317`) | cheap, but "lanes" is not the title bar's "queued"; not used |
+| DXC compiles | `dxc::compile_counts()` (`dxc.rs:1059`-`1061`) | two atomics |
+| Driver code in use | `code_use` (`code_use.rs:1`-`8`), counted only when `on()` (`code_use.rs:25`-`28`: `XCL_CODE_IN_USE=1` or telemetry tier `frame`); limit `XCL_CODE_LIMIT_MB` (448) (`code_use.rs:31`-`34`) | no public getter; one is added (U4) |
+| Ray-tracing chain | `Config::raytracing_chain_mode()` (`config.rs:271`-`275`), `ChainMode` (`config.rs:313`) | once |
+| GPU time per frame | `frame_facts` computes `gpu_ms` (`telemetry_gpu.rs:3166`-`3213`), written by `write_frames` (`telemetry_gpu.rs:3217`-`3221`) | only at telemetry tier `frame` and up (`telemetry_gpu.rs:2910`-`2925`); not always available. Optional U7 exposes the last value |
+| CPU times | `GetSystemTimes` used once (`kernelx.rs:1673`); `GetProcessTimes` nowhere | new |
+| GPU utilisation | none | see 4.3 |
+
+`windows-sys` already enables `Win32_System_Threading`, `Win32_System_ProcessStatus`,
+`Win32_System_SystemInformation` and `Win32_System_Performance` (`crates/xcl/Cargo.toml`), so
+`GetProcessTimes`, `GetSystemTimes`, `GetActiveProcessorCount`, `K32GetProcessMemoryInfo`,
+`GlobalMemoryStatusEx` and PDH need no Cargo change. `windows` has Direct3D12, DXGI, Fxc and
+WindowsAndMessaging (`GetClientRect`, `WM_KEYDOWN`).
+
+#### 3.6 Other instruments that look at the final image
+
+- `XCL_FRAME_DUMP`: one plane reads the title's resource (`present.rs:1183`-`1187`); several
+  planes read the back buffer after compositing (`present.rs:1138`-`1145`). The HUD is recorded
+  after both, so dumps never contain it.
+- `XCL_TRACE_FRAME` readbacks (`present.rs:1193`-`1213`) copy the title's render targets, not the
+  back buffer: unaffected.
+- `XCL_PASS_STATS` / pass capture work on the title's command lists: unaffected.
+- Outside screenshot tools (PrintWindow, the PC's `pcshot`) see the window, so they see the HUD.
+  For a clean shot: `XCL_HUD=off` or press F3 until it is off.
+- The title never reads XCL's swap-chain buffers, so the HUD cannot appear in anything it reads.
+
+### 4. What it shows (decision B)
+
+Order, top to bottom, full mode. "Tick" = one sampler wake-up (250 ms).
+
+| # | Row | Value | Source (exact) | Rate | Cost |
+|---|---|---|---|---|---|
+| 1 | header | `XCL`, title name, run time `HH:MM:SS` | name passed by `window_thread` (`window_name()`), run time = `now_us()` since the sampler started | tick | none |
+| 2 | FPS group | FPS (coloured), newest frame interval, graph of the last 72 frame intervals | time stamps pushed by `frame_shown` into `FrameStamps`; `model::fps`, `sample::new_intervals` | tick | one `Instant::now()` + two atomics per frame |
+| 3 | CPU group | XCL process % of the whole machine, system %; graph of both | `GetProcessTimes(GetCurrentProcess())` kernel+user, `GetSystemTimes`, `GetActiveProcessorCount(0xFFFF)`; `model::cpu_percent` | tick | ~2 µs |
+| 4 | RAM group | process working set; system used / total; graph of both against total | `K32GetProcessMemoryInfo` (`PROCESS_MEMORY_COUNTERS_EX.WorkingSetSize`, `.PrivateUsage`), `GlobalMemoryStatusEx` (`ullTotalPhys - ullAvailPhys`, `ullTotalPhys`) | tick | ~5 µs |
+| 5 | VRAM group | local video memory in use (red when over budget); budget; graph with a budget line | cached `IDXGIAdapter3::QueryVideoMemoryInfo(0, LOCAL)`: `CurrentUsage`, `Budget` | tick | ~10-30 µs (kernel thunk) |
+| 6 | GPU | adapter name, first 21 characters | `IDXGIAdapter1::GetDesc1` -> `gpu::adapter::name` | once, when the device exists | — |
+| 7 | Commit | process commit | `PrivateUsage` (row 4's call) | tick | — |
+| 8 | PSO, Failed | `N queued`; a `Failed M` row (red) only when M > 0 | `pso_async::counts()` `.2` and `.1` (same numbers as the title bar) | every 4th tick (1 Hz) | O(pending) under `PENDING`: see 7.1 |
+| 9 | DXC | `R run, D done` | `dxc::compile_counts()` | 1 Hz | atomics |
+| 10 | Code (only when counting is on) | `312 / 448 MB`, amber at 75 %, red at 90 % | new `code_use::in_use()` (U4) | 1 Hz | two atomics |
+| 11 | GPU ms (only at telemetry tier `frame`+) | last frame's GPU time | new `report::last_gpu_ms()` (U7, optional) | 1 Hz | one atomic |
+| 12 | Res | `<frame w>x<h> > <client w>x<h>` | frame size = the back buffer's (`record`'s `w`, `h`); `GetClientRect(hwnd)` from the sampler thread | 1 Hz | ~1 µs |
+| 13 | RT | `on` / `off` | `state::config().raytracing_chain_mode()` | once | — |
+
+Compact mode: FPS and frame interval; CPU process %; RAM working set; VRAM used / budget; one
+graph (frame intervals, the newest 48).
+
+Left out, and why:
+- **GPU utilisation** in v1: see 4.3; a follow-up unit after a measurement.
+- **Frame-time percentiles (1 % low)**: at 2-3 fps a 72-frame window is half a minute; the graph
+  shows the spread better.
+- **Draws / dispatches per second, DirectStorage throughput**: diagnostic counters for
+  `XCL_ACTIVITY` logs (`host.rs:44`-`67`), not "basic stats"; they would widen the panel.
+- **Non-local video memory**: visible in the `memory:` log line; one figure (local vs budget) is
+  what decides spilling.
+- **Pipeline lanes and gates** (`queue_gauges`): numbers that do not match the title bar's.
+- **Frame clock target interval**: rarely changes; the FPS colour already says how far off 60 it is.
+- **Temperatures, clocks, fan**: vendor APIs only (NVML, ADLX): not allowed without a capability
+  check and not "ultra light".
+
+#### 4.1 FPS (exact rule, `model::fps`)
+
+Input: up to 128 frame time stamps in microseconds, newest first; `now` in microseconds.
+1. `n1` = number of stamps in `(now - 1_000_000, now]`. If `n1 >= 10`, FPS = `n1` (shown as an integer).
+2. Otherwise take the stamps in `(now - 5_000_000, now]`, at most the 5 newest. Fewer than 2: FPS = 0.
+3. `mean` = (newest - oldest of those) / (count - 1); `gap` = now - newest.
+4. FPS = 1 000 000 / max(mean, gap) (shown with one decimal below 10).
+
+This is steady at 2-3 fps, falls while the title stalls, and needs no allocation.
+
+#### 4.2 CPU percent (exact rule, `model::cpu_percent`)
+
+Two samples `a`, `b` of `CpuTimes { wall, proc, idle, kernel, user }` (all in 100 ns units; `wall`
+from the sampler's `Instant`, `proc` = process kernel + user, `idle`/`kernel`/`user` from
+`GetSystemTimes`, where kernel includes idle):
+- process % = `(b.proc - a.proc) / ((b.wall - a.wall) * cpus) * 100`, clamped to 0..100; 0 when the
+  wall delta is 0.
+- system % = `(1 - (b.idle - a.idle) / ((b.kernel - a.kernel) + (b.user - a.user))) * 100`, clamped
+  to 0..100; 0 when the denominator is 0.
+- All subtractions saturate.
+
+#### 4.3 GPU utilisation: PDH or nothing
+
+Vendor-neutral source: the Windows performance counters Task Manager uses, `\GPU Engine(*)\Utilization
+Percentage` (instances `pid_<pid>_luid_<hi>_<lo>_phys_0_eng_<n>_engtype_<type>`) and `\GPU Adapter
+Memory(*)\Dedicated Usage`, through PDH (`PdhOpenQueryW`, `PdhAddEnglishCounterW`,
+`PdhCollectQueryData`, `PdhGetFormattedCounterArrayW`), Windows 10 1709+.
+
+Tradeoffs:
+- For: no vendor API; per process; matches Task Manager.
+- Against: the wildcard re-enumerates every engine of every process on each collection (dozens to
+  hundreds of instances); its cost on this PC is unknown and is reported in the literature as
+  milliseconds; a rate counter needs two collections before the first value; the instance list
+  changes when processes start; `PdhGetFormattedCounterArrayW` needs a buffer whose size changes
+  (allocate once with headroom, refuse to grow on the fly). "GPU Adapter Memory" duplicates what
+  `QueryVideoMemoryInfo` already gives cheaply.
+
+Recommendation: **not in v1**. U8 (deferred) adds it at 1 Hz on the sampler thread only if a probe
+on the PC measures `PdhCollectQueryData` under 2 ms with the title running; the GPU row then reads
+`NVIDIA GeForce RTX 5080  87%`, the value being the maximum over the process's engines of type
+`3D` / `Compute` (summed per engine, then max over engines). If PDH fails at any step, the row
+shows the name only and PDH is not retried.
+
+### 5. Architecture and data flow
+
+New module `crates/xcl/src/hle/d3d12x/hud/`:
+
+| File | Unit | Contents |
+|---|---|---|
+| `mod.rs` | U0, U6 | module list; mode; `start`, `note_frame`, `on_key`, `active`, `record`; the cached layout |
+| `font.rs` | U1 | the 95-glyph table, `glyph_index`, `packed` |
+| `model.rs` | U2a | `Mode`, `Inst`, `rgba`, `Ring`, `FrameStamps`, `fps`, `CpuTimes`, `cpu_percent`, `nice_ceiling`, `column_height`, `Snapshot` |
+| `text.rs` | U2b | `FixedText`, number formatting, `Statics` |
+| `layout.rs` | U3 | `InstBuf`, `dot_px`, colours, `build` (snapshot -> quads) |
+| `sample.rs` | U4 | `Shared`/`SHARED`, `now_us`, the sampler thread |
+| `draw.rs` | U5 | `HudDraw`: root signature, PSOs, upload ring, `record`; HLSL |
+
+```
+ title thread (present_now, under PRESENTER)          xcl-hud thread (4 Hz)            xcl-window thread
+ ------------------------------------------           ---------------------            -----------------
+ frame_shown --push t_us--> SHARED.frames  -------> new_intervals, fps               WM_KEYDOWN F3
+                                                       GetProcessTimes/GetSystemTimes   -> hud::on_key
+                                                       K32GetProcessMemoryInfo          -> MODE.store
+ after copy/composite/dump:                            GlobalMemoryStatusEx
+   hud::record(dev, list, bb, w, h, fmt, slot)         QueryVideoMemoryInfo (cached)
+     try_lock SHARED.snapshot --(gen changed?)-->      1 Hz: counts(), compile_counts(),
+       layout::build into CACHE.insts                        code_use::in_use(), GetClientRect
+     HudDraw::record: memcpy quads to upload[slot]     --lock--> SHARED.snapshot = snap (gen+1)
+       RTV, root sig, root SRV, PSO, DrawInstanced(6,n)
+ -> barrier to PRESENT, ExecuteCommandLists, Present
+```
+
+Rules that keep the title's frame safe:
+- The HUD binds only its own root signature, PSO, RTV and buffer, on XCL's present list `p.list`,
+  after XCL's own copy into XCL's own back buffer. It never sees a title list, root argument,
+  descriptor heap or resource. The next title list sets its own state (D3D12 command lists do not
+  inherit state).
+- It never blocks: `try_lock` on the snapshot (keeps the last layout when busy), no fence wait (the
+  upload region of slot `p.ring.cur` is free because `prepare_pipelined_slot` already waited for
+  that slot, `present.rs:647`-`666`), no allocation after the first frame.
+- It never ends a frame early: every HUD failure is a `false` return; `present_now` continues to the
+  barrier to `PRESENT` and `Present` exactly as today.
+- A HUD that fails to build its root signature or PSO logs one warning and turns itself off for the
+  rest of the run (`FAILED` flag).
+
+### 6. Dependencies
+
+None new. `windows` 0.62 and `windows-sys` 0.61 features already enabled cover every call (3.5).
+FXC (`D3DCompile`, `d3dcompiler_47.dll`, part of Windows) compiles the two small shaders, as the
+compositor does; DXC is not needed. No font, UI or graphing crate; the glyphs are authored in this
+design (10.2), not taken from any font.
+
+### 7. Constraints and considerations
+
+#### 7.1 Cost
+
+Per shown frame, present thread (target < 0.1 ms CPU, one draw):
+- `note_frame`: `Instant::now()`, one store and one `fetch_add`.
+- `record`: one `try_lock`; layout rebuild only when the generation, mode or frame size changed
+  (at most 4 times a second, ~1 300 quads, estimated 20-40 µs); `memcpy` of n x 32 bytes
+  (~40 KB, ~3 µs); `CreateRenderTargetView`, 2 barriers, ~10 list calls, one `DrawInstanced(6, n)`.
+- GPU: ~1 300 small quads over ~360 x 370 px: a few microseconds.
+- Once per run: FXC compiles the two shaders on the window thread at start (`draw::warm`), and the
+  first HUD frame creates the PSO for the back buffer's format (one small driver compile).
+- U6 logs, once after 600 drawn frames, the mean and maximum time of `record` so the cost is a
+  measured number (section 12).
+
+Sampler thread: ~50 µs per tick plus `pso_async::counts()` once a second. `counts()` walks every
+pending build under the `PENDING` lock (`pso_async.rs:3183`), and title threads that create
+pipelines take that lock; the title bar already pays this twice a second. To be checked on the PC
+(claim): if the 1 Hz call shows in the title's frame time, U6 reads it at 0.5 Hz instead.
+
+#### 7.2 Back-buffer size, window size and scale
+
+The back buffer has the frame's size and is stretched to the window (3.4). The HUD is laid out in
+**dots**: 1 dot = `P` back-buffer pixels, `P = max(1, round(frame_h / 540))` (`layout::dot_px`):
+360-809 lines -> 1, 810-1349 -> 2, 1350-1889 -> 3, 2160 -> 4. Because `P` is an integer, glyph
+edges are sharp in the back buffer; the panel always covers the same fraction of the window
+(about 19 % of a 16:9 width and 34 % of the height in full mode; 18 % x 8 % compact), whatever the
+window size. A window whose aspect differs from the frame's stretches the HUD as it stretches the
+game (accepted). At 720 lines `P = 1` and caps are 7 px of a 720-line frame: small but readable;
+on a 1280x720 window with a 1080-line frame they are 9 px.
+
+#### 7.3 HDR and 10-bit back buffers
+
+- UNORM 8-bit and 10-bit: colours are written sRGB-encoded (the default colour space treats the
+  values as sRGB); blending happens in that space, as UI usually does.
+- FP16: the default colour space for FP16 swap chains is linear scRGB, so the pixel shader converts
+  each colour from sRGB to linear (exact piecewise curve) before premultiplying. White is 1.0
+  (80 nits): on an HDR display the HUD looks dimmer than SDR white (accepted; no paper-white
+  setting in v1).
+- One PSO per format, made on first use (as `Compositor::psos_for`, `present.rs:803`-`849`).
+
+#### 7.4 Failure modes
+
+| Failure | Behaviour |
+|---|---|
+| FXC compile, root signature or PSO creation fails | warn once, `FAILED = true`, `record` returns false for the rest of the run |
+| upload buffer creation or `Map` fails | same |
+| snapshot lock busy | last layout is drawn again |
+| no snapshot yet (first 250 ms) | panel drawn with zeros and `--` for names (EMPTY snapshot) |
+| more than 2048 quads | the rest are dropped (`InstBuf::push` returns false) |
+| device not created yet when the sampler starts | GPU name stays empty, retried every tick |
+| `GetClientRect` fails or the window is minimised (0 x 0) | `Res` shows only the frame size |
+| title stops presenting | nothing is drawn (the HUD is part of the title's frames); the title bar still updates |
+| device removed | `present_now` already disables itself (`present.rs:1102`-`1107`); the HUD draws nothing |
+| `XCL_HUD=off` / `hud = "off"` | no thread, no PSO, no upload buffer; `note_frame` returns at once |
+
+### 8. Switches (decision E)
+
+- `xcl.toml`: `hud = "full"` (new key, default `"full"`). Values `off`, `compact`, `full`.
+- `XCL_HUD`: same values, overrides `xcl.toml`. Spellings (ASCII case-insensitive, trimmed):
+  `off`/`0`/`false`/`no`/`none` -> Off; `compact`/`1`/`small` -> Compact; `full`/`2`/`on`/`true`/`yes` -> Full.
+  Anything else: warn once (`hud: "<v>" is not off, compact or full – using full`) and use Full.
+- Default **full**: the user asked to see all of it; the file default is written into new
+  `xcl.toml` files and an older file without the key gets it by `#[serde(default)]`. For an
+  upstream PR the maintainer may want `off` (PR #450 was off by default): a one-word change in
+  `Config::default` (claim for the orchestrator).
+- **F3** cycles Full -> Compact -> Off -> Full while the XCL window has the focus. It is safe because
+  the game reads keys by polling `GetAsyncKeyState` (3.3): the window procedure handles
+  `WM_KEYDOWN` with `wParam == 0x72` and bit 30 of `lParam` clear (not an auto-repeat) and returns 0;
+  the key's state for `GetAsyncKeyState` is unchanged, and no game mapping uses F3. When the
+  configured mode is Off, nothing is created and F3 is not handled (passes to `DefWindowProcW`).
+
+### 9. Tests (decision F) and docs (decision G)
+
+Tests by name are listed in each unit (section 10). Summary:
+- font: coverage of all 95 printable ASCII characters, 5-bit rows, distinct glyphs, packing.
+- model: ring, frame stamps, FPS (high rate, low rate, stall, empty), CPU percent, graph scale,
+  column heights, modes, `Inst` size and colour packing.
+- text: truncation, non-ASCII, each formatter.
+- layout: dot size, panel geometry in both modes, glyph advance, colour rules, absent rows,
+  capacity, every character the layout prints has a glyph.
+- sample: interval extraction, FILETIME conversion, VRAM scale; `code_use::in_use`.
+- draw: generated HLSL font table; two GPU tests on WARP (RGBA8: panel, rounded corner, glyph
+  pixels; FP16: linear output). WARP is always present on Windows, as in
+  `compositor_blends_ui_plane_over_scene_plane`; if WARP device creation fails the tests call
+  `gpu::recomp::runner::skip_test("no GPU")` and return.
+- wiring: mode resolution, F3 key filter, tail barriers per present path, config default.
+
+Docs (U6):
+- `README.md`, in the "Switches for how a title runs" list (after the `XCL_FRAME_INTERVAL_US`
+  bullet, `README.md:257`-`260`), one bullet:
+  `- XCL_HUD (or hud in the game's xcl.toml): the statistics panel in the top-left corner of the
+  window – frames per second and frame time, CPU, memory, the graphics card and its video memory,
+  pipelines being built, with live graphs. full (default), compact or off; F3 cycles them while
+  the window has the focus. XCL's frame dumps never contain it; screenshots of the window do.`
+  And in Controls (`README.md:182`-`186`), append: `F3 cycles the statistics panel (full, compact, off).`
+- `docs/guide/cli-and-config.md` (fork-only file): a row in the `xcl.toml` table after
+  `mouse_sensitivity` (`cli-and-config.md:179`):
+  `| hud (crates/xcl/src/config.rs:<line>) | "full" | statistics panel in the window: "full", "compact" or "off"; XCL_HUD overrides; F3 cycles it |`
+  and a row in "Settings that override xcl.toml" (`cli-and-config.md:249`):
+  `| XCL_HUD | crates/xcl/src/hle/d3d12x/hud/mod.rs:<line> | Statistics panel: off, compact or full. Overrides hud. | hud from xcl.toml (full) |`
+  (the writer fills `<line>` and matches the table's existing columns exactly).
+
+### 10. Work breakdown
+
+All paths below are under `crates/xcl/src/hle/d3d12x/` unless they start with `crates/`, `README` or
+`docs/`. Every unit: no `cargo fmt` (format only the lines you write, in the style of the file
+around them), no new dependency, tests in the file's `#[cfg(test)] mod tests`, English comments in
+the repository's style (short `//!` module doc, `///` on public items). The crate builds only on
+Windows: a writer on macOS writes the code and the orchestrator builds and runs the tests on the PC.
+
+Shared constants used by several units (defined where noted, used as is by the others):
+- `model::MAX_INST = 2048`, `model::HISTORY = 72`, `model::STAMPS = 128`, `model::GIB = 1073741824.0_f32`.
+- `font::COUNT = 95`, `font::FIRST = 0x20`.
+
+#### 10.1 U0 – scaffold (about 15 lines; orchestrator or any writer)
+
+Files: new `hud/mod.rs`, `hud/font.rs`, `hud/model.rs`, `hud/text.rs`, `hud/layout.rs`,
+`hud/sample.rs`, `hud/draw.rs`; edit `mod.rs` (the d3d12x one).
+
+- `mod.rs` (d3d12x): after `pub mod guard;` (`mod.rs:24`) add `pub(crate) mod hud;`.
+- `hud/mod.rs`:
+  ```rust
+  //! The statistics panel ("HUD") in the top-left corner of the XCL window: `sample` reads the
+  //! figures on a thread of its own, `layout` turns them into quads, `draw` records one draw of
+  //! them on XCL's present list, after the title's frame.
+  #![allow(dead_code)] // until present.rs calls in
+
+  pub(crate) mod draw;
+  mod font;
+  mod layout;
+  mod model;
+  mod sample;
+  mod text;
+  ```
+- Each other file holds one line: `//! <one sentence of what the unit puts there>`.
+
+Acceptance: `cargo build --workspace` passes on the PC.
+
+#### 10.2 U1 – the bitmap font (`hud/font.rs`, about 190 lines)
+
+The font is a 5 x 9 grid per character, drawn for this project on that grid (no font was looked
+at). Specification:
+- Characters: printable ASCII 0x20 (space) to 0x7E (`~`), 95 glyphs, index = byte - 0x20.
+- Each glyph is 9 rows, row 0 at the top. Each row is one byte; its low 5 bits are the 5 columns,
+  **bit 4 = leftmost column**, bit 0 = rightmost. Bits 5-7 are always 0.
+- Rows 0-6 hold capitals and digits (row 6 is the baseline row); lowercase x-height is rows 2-6;
+  descenders (`g j p q y`, `,`) use rows 7-8; `_` sits on row 7.
+- In the layout, a glyph occupies 5 x 9 dots inside a 6-dot advance.
+
+Code:
+```rust
+//! The statistics panel's font: 95 glyphs of 5 x 9 dots, printable ASCII.
+
+pub const FIRST: u8 = 0x20;
+pub const COUNT: usize = 95;
+
+/// Row bytes of each glyph, top row first; bit 4 is the leftmost column.
+pub const GLYPHS: [[u8; 9]; COUNT] = [
+    /* the 95 lines of the table below, verbatim */
+];
+
+/// The glyph of byte `c`; anything outside 0x20..=0x7E is drawn as '?'.
+pub fn glyph_index(c: u8) -> u8 {
+    if (0x20..=0x7E).contains(&c) { c - FIRST } else { b'?' - FIRST }
+}
+
+/// Two words per glyph for the pixel shader: word 0 holds rows 0-5 (row r at bit 5 * r), word 1
+/// rows 6-8 (row r at bit 5 * (r - 6)).
+pub fn packed() -> [[u32; 2]; COUNT] { /* loop over GLYPHS */ }
+```
+
+The table (copy verbatim; the comment is the character):
+```rust
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // ' '
+    [0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04, 0x00, 0x00], // '!'
+    [0x0A, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // '"'
+    [0x0A, 0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x0A, 0x00, 0x00], // '#'
+    [0x04, 0x0F, 0x14, 0x0E, 0x05, 0x1E, 0x04, 0x00, 0x00], // '$'
+    [0x19, 0x19, 0x02, 0x04, 0x08, 0x13, 0x13, 0x00, 0x00], // '%'
+    [0x0C, 0x12, 0x14, 0x08, 0x15, 0x12, 0x0D, 0x00, 0x00], // '&'
+    [0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // "'"
+    [0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02, 0x00, 0x00], // '('
+    [0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08, 0x00, 0x00], // ')'
+    [0x00, 0x04, 0x15, 0x0E, 0x15, 0x04, 0x00, 0x00, 0x00], // '*'
+    [0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00, 0x00, 0x00], // '+'
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x04, 0x08, 0x00], // ','
+    [0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00], // '-'
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00, 0x00], // '.'
+    [0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10, 0x00, 0x00], // '/'
+    [0x0E, 0x11, 0x11, 0x15, 0x11, 0x11, 0x0E, 0x00, 0x00], // '0'
+    [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00], // '1'
+    [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F, 0x00, 0x00], // '2'
+    [0x0E, 0x11, 0x01, 0x06, 0x01, 0x11, 0x0E, 0x00, 0x00], // '3'
+    [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02, 0x00, 0x00], // '4'
+    [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E, 0x00, 0x00], // '5'
+    [0x0E, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x0E, 0x00, 0x00], // '6'
+    [0x1F, 0x01, 0x02, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00], // '7'
+    [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E, 0x00, 0x00], // '8'
+    [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E, 0x00, 0x00], // '9'
+    [0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00, 0x00, 0x00], // ':'
+    [0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x04, 0x08, 0x00, 0x00], // ';'
+    [0x02, 0x04, 0x08, 0x10, 0x08, 0x04, 0x02, 0x00, 0x00], // '<'
+    [0x00, 0x00, 0x1F, 0x00, 0x1F, 0x00, 0x00, 0x00, 0x00], // '='
+    [0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08, 0x00, 0x00], // '>'
+    [0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04, 0x00, 0x00], // '?'
+    [0x0E, 0x11, 0x17, 0x15, 0x17, 0x10, 0x0F, 0x00, 0x00], // '@'
+    [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11, 0x00, 0x00], // 'A'
+    [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E, 0x00, 0x00], // 'B'
+    [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E, 0x00, 0x00], // 'C'
+    [0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C, 0x00, 0x00], // 'D'
+    [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F, 0x00, 0x00], // 'E'
+    [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10, 0x00, 0x00], // 'F'
+    [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F, 0x00, 0x00], // 'G'
+    [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11, 0x00, 0x00], // 'H'
+    [0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00], // 'I'
+    [0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C, 0x00, 0x00], // 'J'
+    [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11, 0x00, 0x00], // 'K'
+    [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F, 0x00, 0x00], // 'L'
+    [0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11, 0x00, 0x00], // 'M'
+    [0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x00, 0x00], // 'N'
+    [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00], // 'O'
+    [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10, 0x00, 0x00], // 'P'
+    [0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D, 0x00, 0x00], // 'Q'
+    [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11, 0x00, 0x00], // 'R'
+    [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E, 0x00, 0x00], // 'S'
+    [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00], // 'T'
+    [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00], // 'U'
+    [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04, 0x00, 0x00], // 'V'
+    [0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A, 0x00, 0x00], // 'W'
+    [0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11, 0x00, 0x00], // 'X'
+    [0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00], // 'Y'
+    [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F, 0x00, 0x00], // 'Z'
+    [0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E, 0x00, 0x00], // '['
+    [0x10, 0x08, 0x08, 0x04, 0x02, 0x02, 0x01, 0x00, 0x00], // '\\'
+    [0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E, 0x00, 0x00], // ']'
+    [0x04, 0x0A, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // '^'
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F, 0x00], // '_'
+    [0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // '`'
+    [0x00, 0x00, 0x0E, 0x01, 0x0F, 0x11, 0x0F, 0x00, 0x00], // 'a'
+    [0x10, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x1E, 0x00, 0x00], // 'b'
+    [0x00, 0x00, 0x0F, 0x10, 0x10, 0x10, 0x0F, 0x00, 0x00], // 'c'
+    [0x01, 0x01, 0x0F, 0x11, 0x11, 0x11, 0x0F, 0x00, 0x00], // 'd'
+    [0x00, 0x00, 0x0E, 0x11, 0x1F, 0x10, 0x0F, 0x00, 0x00], // 'e'
+    [0x06, 0x08, 0x1E, 0x08, 0x08, 0x08, 0x08, 0x00, 0x00], // 'f'
+    [0x00, 0x00, 0x0F, 0x11, 0x11, 0x11, 0x0F, 0x01, 0x0E], // 'g'
+    [0x10, 0x10, 0x1E, 0x11, 0x11, 0x11, 0x11, 0x00, 0x00], // 'h'
+    [0x04, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00], // 'i'
+    [0x02, 0x00, 0x06, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C], // 'j'
+    [0x10, 0x10, 0x12, 0x14, 0x18, 0x14, 0x12, 0x00, 0x00], // 'k'
+    [0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E, 0x00, 0x00], // 'l'
+    [0x00, 0x00, 0x1A, 0x15, 0x15, 0x15, 0x15, 0x00, 0x00], // 'm'
+    [0x00, 0x00, 0x1E, 0x11, 0x11, 0x11, 0x11, 0x00, 0x00], // 'n'
+    [0x00, 0x00, 0x0E, 0x11, 0x11, 0x11, 0x0E, 0x00, 0x00], // 'o'
+    [0x00, 0x00, 0x1E, 0x11, 0x11, 0x11, 0x1E, 0x10, 0x10], // 'p'
+    [0x00, 0x00, 0x0F, 0x11, 0x11, 0x11, 0x0F, 0x01, 0x01], // 'q'
+    [0x00, 0x00, 0x16, 0x19, 0x10, 0x10, 0x10, 0x00, 0x00], // 'r'
+    [0x00, 0x00, 0x0F, 0x10, 0x0E, 0x01, 0x1E, 0x00, 0x00], // 's'
+    [0x08, 0x08, 0x1E, 0x08, 0x08, 0x08, 0x06, 0x00, 0x00], // 't'
+    [0x00, 0x00, 0x11, 0x11, 0x11, 0x13, 0x0D, 0x00, 0x00], // 'u'
+    [0x00, 0x00, 0x11, 0x11, 0x11, 0x0A, 0x04, 0x00, 0x00], // 'v'
+    [0x00, 0x00, 0x11, 0x11, 0x15, 0x15, 0x0A, 0x00, 0x00], // 'w'
+    [0x00, 0x00, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x00, 0x00], // 'x'
+    [0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x0F, 0x01, 0x0E], // 'y'
+    [0x00, 0x00, 0x1F, 0x02, 0x04, 0x08, 0x1F, 0x00, 0x00], // 'z'
+    [0x03, 0x04, 0x04, 0x08, 0x04, 0x04, 0x03, 0x00, 0x00], // '{'
+    [0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04], // '|'
+    [0x18, 0x04, 0x04, 0x02, 0x04, 0x04, 0x18, 0x00, 0x00], // '}'
+    [0x00, 0x00, 0x08, 0x15, 0x02, 0x00, 0x00, 0x00, 0x00], // '~'
+```
+
+(The table was generated from a 5 x 9 `#`/`.` drawing by a throw-away script in the design's
+scratch folder; it is the source of truth. `0` has a centre dot to differ from `O`.)
+
+Tests (`mod tests`):
+- `every_printable_ascii_has_a_glyph`: `GLYPHS.len() == 95`; `glyph_index(c) == c - 0x20` for every
+  `c` in 0x20..=0x7E.
+- `rows_use_five_bits`: every row byte < 32.
+- `space_is_empty_and_every_other_glyph_has_ink`: glyph 0 all zero; each other glyph has a non-zero row.
+- `glyphs_are_distinct`: no two of the 95 are equal.
+- `unknown_bytes_map_to_question_mark`: 0x00, 0x1F, 0x7F, 0xC3 -> `b'?' - 0x20`.
+- `caps_and_digits_stay_above_the_descender`: for `A..=Z` and `0..=9`, rows 7 and 8 are 0.
+- `packed_decodes_back_to_the_rows`: decoding `packed()` with the shader's rule gives `GLYPHS`.
+
+Acceptance: the 7 tests pass.
+
+#### 10.3 U2a – model: modes, quads, rings, rates (`hud/model.rs`, about 370 lines)
+
+Public items (exact signatures; everything `pub` inside the private module):
+
+```rust
+pub const MAX_INST: usize = 2048;
+pub const HISTORY: usize = 72;
+pub const STAMPS: usize = 128;
+pub const GIB: f32 = 1_073_741_824.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Mode { Off = 0, Compact = 1, Full = 2 }
+impl Mode {
+    /// ASCII case-insensitive, trimmed: off/0/false/no/none, compact/1/small, full/2/on/true/yes.
+    pub fn parse(s: &str) -> Option<Mode>;
+    /// 0 Off, 1 Compact, anything else Full.
+    pub fn from_u8(v: u8) -> Mode;
+    /// F3: Full -> Compact -> Off -> Full.
+    pub fn next(self) -> Mode;
+    /// "off" / "compact" / "full".
+    pub fn name(self) -> &'static str;
+}
+
+/// One quad: `rect` = x, y, width, height in back-buffer pixels; `color` = 0xAABBGGRR
+/// (straight alpha); `param` bits 0-3 kind, bits 8-23 the corner radius in pixels (round) or
+/// bits 8-15 the glyph index (glyph).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Inst { pub rect: [f32; 4], pub color: u32, pub param: u32, pub pad: [u32; 2] }
+pub const KIND_RECT: u32 = 0;
+pub const KIND_ROUND: u32 = 1;
+pub const KIND_GLYPH: u32 = 2;
+impl Inst {
+    pub fn rect(x: f32, y: f32, w: f32, h: f32, color: u32) -> Inst;
+    pub fn round(x: f32, y: f32, w: f32, h: f32, radius_px: u32, color: u32) -> Inst; // param = 1 | (min(r, 0xFFFF) << 8)
+    pub fn glyph(x: f32, y: f32, w: f32, h: f32, index: u8, color: u32) -> Inst;      // param = 2 | (index << 8)
+}
+/// 0xRRGGBB and an alpha -> 0xAABBGGRR.
+pub fn rgba(rgb: u32, alpha: u8) -> u32;
+
+/// The newest N values; index 0 is the oldest kept.
+#[derive(Clone, Copy, Debug)]
+pub struct Ring<const N: usize> { vals: [f32; N], head: usize, len: usize }
+impl<const N: usize> Ring<N> {
+    pub const fn new() -> Self;
+    pub fn push(&mut self, v: f32);          // overwrites the oldest when full
+    pub fn len(&self) -> usize;
+    pub fn get(&self, i: usize) -> f32;      // 0 = oldest .. len-1 = newest; 0.0 past len
+    pub fn max(&self) -> f32;                // 0.0 when empty
+    pub fn last(&self) -> Option<f32>;
+}
+
+/// Time stamps (µs) of shown frames: one writer (the presenting thread), any reader.
+pub struct FrameStamps { t: [AtomicU64; STAMPS], n: AtomicU64 }
+impl FrameStamps {
+    pub const fn new() -> Self;               // [const { AtomicU64::new(0) }; STAMPS]
+    pub fn push(&self, t_us: u64);            // t[n % STAMPS].store(t, Relaxed); n.fetch_add(1, Release)
+    pub fn total(&self) -> u64;               // n.load(Acquire)
+    /// Copies min(total, STAMPS) stamps into `out`, newest first; returns how many.
+    pub fn newest_first(&self, out: &mut [u64; STAMPS]) -> usize;
+}
+
+/// Frames a second from stamps (newest first) at `now_us`: section 4.1 of the design.
+pub fn fps(newest_first: &[u64], now_us: u64) -> f32;
+
+/// 100 ns units: wall clock, process kernel + user, and GetSystemTimes' idle, kernel, user.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CpuTimes { pub wall: u64, pub proc: u64, pub idle: u64, pub kernel: u64, pub user: u64 }
+/// (process %, system %) between two samples: section 4.2.
+pub fn cpu_percent(a: CpuTimes, b: CpuTimes, cpus: u32) -> (f32, f32);
+
+/// Top of the frame-time graph (ms): the first of 16.7, 33.3, 50, 100, 200, 500, 1000, 2000,
+/// 5000, 10000 that is >= v; v itself above 10000; 16.7 for v <= 0 or NaN.
+pub fn nice_ceiling(v: f32) -> f32;
+/// Height in pixels of a column of `v` in a graph of `h` pixels whose top is `scale`:
+/// 0 when v <= 0, scale <= 0 or not finite; else max(1, round(min(v / scale, 1) * h)).
+pub fn column_height(v: f32, scale: f32, h: u32) -> u32;
+/// Top of the video-memory graph (GiB): max(budget, peak) * 1.05, or 1.0 when both are 0.
+pub fn vram_scale(budget_gib: f32, peak_gib: f32) -> f32;
+
+/// What the sampler publishes (copied whole; no heap).
+#[derive(Clone, Copy, Debug)]
+pub struct Snapshot {
+    pub generation: u64,
+    pub uptime_s: u64,
+    pub frames_seen: bool,                 // at least two frames ever shown
+    pub fps: f32,
+    pub frame_ms: f32,                     // newest interval
+    pub frame_ms_hist: Ring<HISTORY>,
+    pub gpu_ms: Option<f32>,
+    pub cpu_proc: f32,
+    pub cpu_sys: f32,
+    pub cpu_proc_hist: Ring<HISTORY>,
+    pub cpu_sys_hist: Ring<HISTORY>,
+    pub ws_bytes: u64,
+    pub commit_bytes: u64,
+    pub sys_used_bytes: u64,
+    pub sys_total_bytes: u64,
+    pub ws_hist: Ring<HISTORY>,            // GiB
+    pub sys_used_hist: Ring<HISTORY>,      // GiB
+    pub vram_bytes: u64,
+    pub vram_budget_bytes: u64,
+    pub vram_hist: Ring<HISTORY>,          // GiB
+    pub pso_pending: u64,
+    pub pso_failed: u64,
+    pub dxc_running: u64,
+    pub dxc_done: u64,
+    pub code: Option<(u64, u64)>,          // driver code in use, limit (bytes)
+    pub client_w: u32,
+    pub client_h: u32,
+    pub rt_on: bool,
+}
+impl Snapshot { pub const EMPTY: Snapshot = /* zeros, None, Ring::new(), false */; }
+```
+
+Tests:
+- `mode_parses_every_spelling` (all spellings, case and spaces; `"maybe"` -> None).
+- `mode_cycles_full_compact_off` (and `from_u8(Mode::X as u8) == X`).
+- `inst_is_32_bytes_and_packs_params` (`size_of::<Inst>() == 32`; round radius 8 -> param `0x801`;
+  glyph 40 -> `0x2802`).
+- `rgba_puts_red_in_the_low_byte` (`rgba(0x4CC2FF, 0x80) == 0x80FFC24C`).
+- `ring_keeps_the_newest_oldest_first` (push 1..=5 into `Ring<3>`: get 3, 4, 5; last 5; max 5).
+- `ring_max_of_empty_is_zero`.
+- `frame_stamps_wrap_and_copy_newest_first` (push 200 stamps; total 200; 128 copied; out[0] = the
+  200th, out[127] = the 73rd).
+- `fps_counts_the_last_second_at_high_rates` (60 stamps 16 667 µs apart ending at now -> 60).
+- `fps_uses_the_mean_interval_at_low_rates` (stamps every 400 ms, now = newest + 100 ms -> 2.5).
+- `fps_falls_while_the_title_stalls` (same stamps, now = newest + 2 s -> 0.5).
+- `fps_is_zero_with_fewer_than_two_frames` (empty; one stamp; two stamps older than 5 s).
+- `cpu_percent_from_two_samples` (wall +10 000 000, proc +20 000 000, 8 CPUs -> 25 %; idle +6, kernel
+  +8 (incl. idle), user +2 -> 40 %).
+- `cpu_percent_with_no_elapsed_time_is_zero`.
+- `cpu_percent_clamps_to_100`.
+- `nice_ceiling_picks_the_next_step` (10 -> 16.7, 16.7 -> 16.7, 17 -> 33.3, 412 -> 500, 20000 -> 20000, -1 -> 16.7).
+- `column_height_scales_rounds_and_clamps` (50/100 of 18 -> 9; 0.01/100 of 18 -> 1; 200/100 -> 18; 0 -> 0; scale 0 -> 0).
+- `vram_scale_covers_budget_and_peak` (14.6, 15.1 -> 15.855; 14.6, 2 -> 15.33; 0, 0 -> 1).
+
+Acceptance: the 17 tests pass; no `unsafe`; no heap use in any function.
+
+#### 10.4 U2b – text: fixed buffers and number formats (`hud/text.rs`, about 200 lines)
+
+```rust
+/// Up to N bytes of printable ASCII, on the stack.
+#[derive(Clone, Copy)]
+pub struct FixedText<const N: usize> { buf: [u8; N], len: usize }
+impl<const N: usize> FixedText<N> {
+    pub const fn new() -> Self;
+    pub fn clear(&mut self);
+    /// Each char: 0x20..=0x7E kept, anything else becomes '?'; stops silently at N bytes.
+    pub fn push_str(&mut self, s: &str);
+    pub fn as_str(&self) -> &str;            // always valid UTF-8 (ASCII only)
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+}
+impl<const N: usize> core::fmt::Write for FixedText<N> { /* push_str, always Ok(()) */ }
+
+// Each writes (appends) into `t` with write!(); none allocates.
+pub fn gb<const N: usize>(t: &mut FixedText<N>, bytes: u64);              // GiB: < 100 -> "9.8 GB", else "128 GB"
+pub fn gb_short<const N: usize>(t: &mut FixedText<N>, bytes: u64);        // "9.8G" / "128G"
+pub fn gb_pair_short<const N: usize>(t: &mut FixedText<N>, a: u64, b: u64); // "15.1/14.6G" (each number by the < 100 rule)
+pub fn mb_pair<const N: usize>(t: &mut FixedText<N>, a: u64, b: u64);     // "312 / 448 MB" (MiB, integer)
+pub fn ms<const N: usize>(t: &mut FixedText<N>, v: f32);                  // NaN/neg "--"; < 10 "4.12 ms"; < 100 "41.2 ms"; else "412 ms"
+pub fn fps<const N: usize>(t: &mut FixedText<N>, v: f32);                 // NaN/neg "0.0"; < 10 "2.4"; else "60"
+pub fn percent<const N: usize>(t: &mut FixedText<N>, v: f32);             // clamp 0..=100, "38%"
+pub fn count<const N: usize>(t: &mut FixedText<N>, n: u64);               // "55,223"
+pub fn uptime<const N: usize>(t: &mut FixedText<N>, s: u64);              // "01:12:34", hours unbounded ("123:04:05")
+
+/// Text that does not change during a run.
+pub struct Statics { pub gpu: FixedText<40>, pub title: FixedText<32> }
+impl Statics { pub const fn new() -> Self; }
+```
+
+Tests:
+- `fixed_text_truncates_without_panicking` (`FixedText<4>` given "abcdef" -> "abcd").
+- `fixed_text_replaces_non_printable_and_non_ascii` ("Ü\tx" -> "??x").
+- `formats_gibibytes` (9.8 GiB -> "9.8 GB"; 128 GiB -> "128 GB"; short and pair forms; 0 -> "0.0 GB").
+- `formats_milliseconds` (4.123, 41.23, 412.3, NaN).
+- `formats_fps` (2.43 -> "2.4", 59.6 -> "60", NaN -> "0.0").
+- `formats_percent_clamped` (-3 -> "0%", 38.4 -> "38%", 140 -> "100%").
+- `groups_thousands` (0, 999, 1000, 55223, 1234567).
+- `formats_uptime_past_99_hours` (4354 -> "01:12:34"; 443045 -> "123:04:05").
+
+Acceptance: the 8 tests pass.
+
+#### 10.5 U3 – layout (`hud/layout.rs`, about 400 lines)
+
+Depends on U1, U2a, U2b.
+
+```rust
+pub struct InstBuf { pub items: [Inst; MAX_INST], pub len: usize }
+impl InstBuf {
+    pub const fn new() -> Self;
+    pub fn clear(&mut self);
+    pub fn push(&mut self, i: Inst) -> bool;   // false (and nothing written) when full
+    pub fn as_slice(&self) -> &[Inst];
+}
+/// Back-buffer pixels per dot: max(1, round(frame_h / 540)).
+pub fn dot_px(frame_h: u32) -> u32;
+/// Clears `out` and fills it for `mode` (nothing for Off), frame of `frame_w` x `frame_h`.
+pub fn build(s: &Snapshot, st: &Statics, mode: Mode, frame_w: u32, frame_h: u32, out: &mut InstBuf);
+```
+
+Colours (0xRRGGBB, alpha 0-255), as `const`s:
+
+| Name | RGB | Alpha | Use |
+|---|---|---|---|
+| `BG` | `0x0E1117` | 199 (0.78) | panel |
+| `TEXT` | `0xE6EAF2` | 255 | values |
+| `LABEL` | `0x8B93A7` | 255 | labels, run time |
+| `ACCENT` | `0x4CC2FF` | 255 | `XCL`, frame-time graph |
+| `CPU` | `0xA78BFA` | — | CPU graph |
+| `RAM` | `0x34D399` | — | RAM graph |
+| `VRAM` | `0xF59E0B` | — | VRAM graph |
+| `GOOD` | `0x34D399` | 255 | FPS >= 55 |
+| `WARN` | `0xFBBF24` | 255 | FPS 25-55, code >= 75 % |
+| `BAD` | `0xF87171` | 255 | FPS < 25, VRAM over budget, code >= 90 % |
+| `GRAPH_BG` | `0xFFFFFF` | 13 (0.05) | graph background |
+| `GRID` | `0xFFFFFF` | 15 (0.06) | graph mid line |
+| `SEP` | `0xFFFFFF` | 20 (0.08) | separators |
+| series fill | its colour | 89 (0.35) | primary series columns |
+| secondary fill | its colour | 46 (0.18) | system series columns (no cap) |
+| cap | its colour | 255 | 1-dot top of each primary column |
+| budget line | `TEXT` 140, or `BAD` 255 when over budget | | VRAM budget |
+
+Units: `P = dot_px(frame_h)`. A dot coordinate `(x, y)` relative to the panel maps to pixels
+`(8P + x * P, 8P + y * P)` (the panel's top-left is 8 dots from the frame's corner). A hairline is
+`max(1, P / 2)` pixels tall. Padding `PAD = 6` dots. Text: column `c` of a line starts at dot
+`PAD + 6c`; glyph quad = 5P x 9P pixels at the line's top; spaces emit nothing; each byte goes
+through `font::glyph_index`.
+
+Full mode (panel 180 dots wide):
+1. Panel: `Inst::round(8P, 8P, 180P, H*P, 4P, rgba(BG, 199))`, `H = 118 + 10 * rows + 5`, `rows` =
+   number of detail lines (step 6). It is pushed first (computed before anything else).
+2. Header at y = 6: `XCL` (`ACCENT`) column 0; `st.title` cut to 15 characters (`TEXT`) column 4;
+   run time `uptime` (`LABEL`) right-aligned: column `28 - len`.
+3. Separator: rect at dot (PAD, 18), 168 dots wide, hairline tall, `SEP`.
+4. Groups g = 0..3 at `yg = 21 + 24g`; line 1 at `yg`, line 2 at `yg + 10`; label column 0 (`LABEL`),
+   value column 5; values formatted into `FixedText<11>`. Graph: dot (PAD + 96, yg + 1), 72 x 18 dots.
+   - g0: `FPS` / `fps` in `fps_colour`; line 2 `ms(frame_ms)` (`TEXT`; `--` when `!frames_seen`).
+     Graph: `frame_ms_hist` primary `ACCENT`, scale `nice_ceiling(frame_ms_hist.max())`.
+   - g1: `CPU` / `percent(cpu_proc)`; line 2 `sys` / `percent(cpu_sys)`. Graph: `cpu_sys_hist`
+     secondary `CPU`, then `cpu_proc_hist` primary `CPU`; scale 100.
+   - g2: `RAM` / `gb(ws_bytes)`; line 2 `sys` / `gb_pair_short(sys_used, sys_total)`. Graph:
+     `sys_used_hist` secondary `RAM`, then `ws_hist` primary `RAM`; scale `sys_total_bytes / GIB`
+     (1.0 when 0).
+   - g3: `VRAM` / `gb(vram_bytes)` in `BAD` when `vram_budget_bytes > 0 && vram_bytes >
+     vram_budget_bytes`, else `TEXT`; line 2 `of` / `gb(vram_budget_bytes)`. Graph: `vram_hist`
+     primary `VRAM`; scale `vram_scale(budget / GIB, vram_hist.max())`; then the budget line.
+5. Separator at y = 115.
+6. Detail lines from y = 118, 10 dots apart; label column 0 (`LABEL`), value column 7 (`TEXT`
+   unless said), values in `FixedText<21>`:
+   `GPU` (`st.gpu`, `--` when empty); `Commit` (`gb(commit_bytes)`); `PSO` (`count(pending)` +
+   ` queued`); `Failed` only when `pso_failed > 0` (`count(failed)` in `BAD`); `DXC` (`R run, ` +
+   `count(done)` + ` done`); `Code` only when `code` is `Some((b, l))` (`mb_pair(b, l)` in
+   `pct_colour(b, l)`); `GPU ms` only when `gpu_ms` is `Some(v)` (`ms(v)`); `Res`
+   (`{frame_w}x{frame_h} > {client_w}x{client_h}`, only the frame part when client is 0 x 0);
+   `RT` (`on` / `off`).
+
+Compact mode (panel 168 x 42 dots): panel quad first; lines at y = 6, 16, 26:
+- `FPS` column 0 (`LABEL`), `fps` column 4 (`fps_colour`), `ms(frame_ms)` column 10 (`TEXT`);
+- `CPU` column 0, `percent(cpu_proc)` column 4, `RAM` column 9 (`LABEL`), `gb_short(ws)` column 13;
+- `VRAM` column 0, `gb_pair_short(vram, budget)` column 5 (`BAD` when over budget).
+- Graph at dot (PAD + 108, 7), 48 x 28 dots: `frame_ms_hist` primary `ACCENT`, scale `nice_ceiling`.
+
+Graph drawing (both modes): background rect (`GRAPH_BG`); mid line at half height (hairline,
+`GRID`); for each series in order, `m = min(len, columns)` newest values, value `j` (0 = oldest of
+the m) in column `columns - m + j` (1 dot wide), height `column_height(v, scale, gh * P)` pixels
+from the bottom; skip zero heights; fill rect with the series' fill alpha; for a primary series a
+cap rect of `min(P, height)` pixels at the column's top. Budget line: hairline across the graph at
+`bottom - column_height(budget_gib, scale, gh * P)`.
+
+Colour rules: `fps_colour(fps, frames_seen)`: `LABEL` when `!frames_seen`; `GOOD` >= 55; `WARN` >= 25;
+else `BAD`. `pct_colour(used, limit)`: `BAD` at >= 90 % of limit, `WARN` at >= 75 %, else `TEXT`
+(`TEXT` when limit is 0).
+
+Tests:
+- `dot_size_follows_frame_height` (0, 360, 720 -> 1; 1080 -> 2; 1440 -> 3; 2160 -> 4).
+- `full_panel_is_180_dots_wide_at_8_dots_from_the_corner` (h 1080, 6 rows: first item
+  `round(16, 16, 360, 366)` with radius 8).
+- `compact_panel_is_168_by_42_dots` (h 1080: `round(16, 16, 336, 84)`).
+- `absent_rows_shorten_the_panel` (`code`, `gpu_ms` Some and `pso_failed` 3 -> 30 dots taller).
+- `glyphs_advance_six_dots_and_skip_spaces` (header `XCL` + title "A B": glyph x positions).
+- `uptime_is_right_aligned_to_the_inner_edge` (last glyph ends at dot 6 + 168 - 1).
+- `fps_colour_thresholds` (0 unseen, 10, 25, 54.9, 55).
+- `vram_over_budget_is_red`.
+- `graph_columns_are_right_aligned_newest_last` (3 values in a 72-column graph: columns 69-71).
+- `layout_never_exceeds_capacity` (every ring full of maximum values, both modes: `len <= MAX_INST`
+  and the count is below 1 600 in full mode).
+- `every_character_the_layout_prints_has_a_glyph` (ASCII statics, extreme numbers: no glyph quad
+  carries the index of `?`).
+- `off_mode_builds_nothing`.
+
+Acceptance: the 12 tests pass; `build` does not allocate (only `FixedText` and `write!`).
+
+#### 10.6 U4 – sampler thread (`hud/sample.rs`, about 260 lines; `code_use.rs`, about 25 lines)
+
+Depends on U2a, U2b.
+
+`hud/sample.rs`:
+```rust
+/// State shared by the presenting thread, the sampler and the window thread.
+pub(super) struct Shared {
+    pub snapshot: Mutex<Snapshot>,
+    pub statics: Mutex<Statics>,
+    pub frames: FrameStamps,
+    pub mode: AtomicU8,        // Mode as u8
+}
+pub(super) static SHARED: Shared = Shared { /* Snapshot::EMPTY, Statics::new(), FrameStamps::new(), 0 */ };
+
+/// Microseconds since the first call (one clock for stamps and the sampler).
+pub(super) fn now_us() -> u64;          // OnceLock<Instant>
+/// Copies `title` into SHARED.statics.title and starts thread "xcl-hud" (a spawn failure logs one
+/// warning and nothing else).
+pub(super) fn spawn(hwnd: isize, title: &str);
+/// Pushes into `out`, oldest first, the interval (ms) of every frame f with seen < f <= total
+/// (frames numbered from 1; newest_first[k] is frame total - k) whose own and previous stamps are
+/// both in `newest_first`; returns `total`.
+pub(super) fn new_intervals(newest_first: &[u64], total: u64, seen: u64, out: &mut Ring<HISTORY>) -> u64;
+fn filetime(f: FILETIME) -> u64;        // (high << 32) | low
+```
+`new_intervals`: `lo = max(seen + 1, total + 2 - n, 2)` (saturating, `n = newest_first.len()`); for
+`f in lo..=total`: `k = total - f`; push `(newest_first[k] - newest_first[k + 1]) / 1000.0`.
+
+Thread body `run(hwnd)` (never returns; all buffers made before the loop):
+- Before the loop: `cpus = max(1, GetActiveProcessorCount(0xFFFF))`; `rt_on =
+  matches!(crate::state::config().raytracing_chain_mode(), crate::config::ChainMode::On)`; `start =
+  now_us()`; a `Snapshot::EMPTY`; `[0u64; STAMPS]`; `adapter: Option<IDXGIAdapter3> = None`;
+  `prev: Option<CpuTimes> = None`; `seen = 0`; `tick = 0`.
+- Each loop: `sleep(250 ms)`; `tick += 1`; if `Mode::from_u8(SHARED.mode)` is Off, continue.
+  1. Frames: `total`, `newest_first`; `fps`; `seen = new_intervals(...)`; `frame_ms` = newest
+     interval (0 when fewer than 2); `frames_seen = total >= 2`.
+  2. CPU: `GetProcessTimes(GetCurrentProcess(), ..)` (kernel + user), `GetSystemTimes`; `wall =
+     now_us() * 10`; with `prev`, `cpu_percent`, push both histories; `prev = Some(now)`.
+  3. Memory: `K32GetProcessMemoryInfo` with `PROCESS_MEMORY_COUNTERS_EX` (`WorkingSetSize`,
+     `PrivateUsage`); `GlobalMemoryStatusEx` (`ullTotalPhys - ullAvailPhys`, `ullTotalPhys`); push
+     `ws / GIB`, `used / GIB`.
+  4. Adapter: while `adapter` is None and `crate::hle::d3d12x::real::device_raw()` is not null:
+     `ID3D12Device::from_raw_borrowed`, `GetAdapterLuid`, `CreateDXGIFactory1::<IDXGIFactory4>`,
+     `EnumAdapterByLuid::<IDXGIAdapter3>`; name = `crate::gpu::adapter::name(&a.cast::<IDXGIAdapter1>()?.GetDesc1()?)`
+     into `SHARED.statics.gpu` (lock). Then each tick `QueryVideoMemoryInfo(0,
+     DXGI_MEMORY_SEGMENT_GROUP_LOCAL)` -> `CurrentUsage`, `Budget`; push `usage / GIB`. Failure: the
+     values stay as they were.
+  5. Every 4th tick (`tick % 4 == 1`): `crate::hle::d3d12x::pso_async::counts()` -> `pso_failed =
+     .1`, `pso_pending = .2`; `crate::gpu::recomp::dxc::compile_counts()`;
+     `crate::hle::d3d12x::code_use::in_use()`; `GetClientRect(HWND(hwnd as _))` -> client size (0 x 0
+     on failure).
+  6. `uptime_s = (now_us() - start) / 1_000_000`; `rt_on`; `generation += 1`; `*SHARED.snapshot.lock()
+     .unwrap_or_else(|e| e.into_inner()) = snap`.
+
+`code_use.rs` additions (after `removal_line`, `code_use.rs:329`-`331`):
+```rust
+impl State {
+    fn in_use_with(&self, on: bool, limit: u64) -> Option<(u64, u64)> {
+        on.then(|| (self.in_use_bytes.load(Ordering::Relaxed), limit))
+    }
+}
+/// Driver code of the pipelines in use and the limit, in bytes (the statistics panel); None
+/// while it is not counted (`on()`).
+pub fn in_use() -> Option<(u64, u64)> {
+    state().in_use_with(on(), limit_bytes())
+}
+```
+
+Tests:
+- `sample.rs`: `new_intervals_pushes_each_frame_once` (stamps of 5 frames, seen 0 -> 4 intervals; again
+  with seen 5 -> none; one more frame -> 1), `new_intervals_skips_frames_that_left_the_ring` (total
+  300, 128 stamps, seen 10 -> 127 intervals, last 72 kept by the ring), `filetime_joins_high_and_low`.
+- `code_use.rs`: `in_use_reports_bytes_and_limit_when_on` (a `State::default()` with 5 MiB in use ->
+  `Some((5 MiB, 448 MiB))`), `in_use_is_none_when_off`.
+
+Acceptance: the 5 tests pass; the loop allocates nothing after its first pass (no `format!`,
+`Vec`, `String`; the adapter name is written once).
+
+#### 10.7 U5 – the draw (`hud/draw.rs`, about 390 lines; `present.rs`, 3 words)
+
+Depends on U1, U2a.
+
+`present.rs`: make three existing functions visible to the HUD by changing `fn` to `pub(super) fn`:
+`compile_fx` (`present.rs:678`), `transition` (`present.rs:939`), `readback_copy` (`present.rs:1307`).
+Nothing else in `present.rs`.
+
+`hud/draw.rs`:
+```rust
+const SLOTS: usize = 2; // one upload region per present slot (present.rs PRESENT_SLOTS)
+
+pub(crate) struct HudDraw {
+    root_sig: ID3D12RootSignature,
+    psos: HashMap<i32, ID3D12PipelineState>,
+    rtv_heap: ID3D12DescriptorHeap,      // 1 RTV, not shader visible
+    upload: ID3D12Resource,              // UPLOAD heap, SLOTS * MAX_INST * 32 bytes, GENERIC_READ
+    mapped: *mut Inst,                   // Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 })) once
+}
+impl HudDraw {
+    /// Root signature, RTV heap, upload buffer; None on any failure.
+    pub(crate) unsafe fn new(dev: &ID3D12Device) -> Option<HudDraw>;
+    /// The PSO for `fmt`, made on first use (as Compositor::psos_for).
+    unsafe fn pso_for(&mut self, dev: &ID3D12Device, fmt: DXGI_FORMAT) -> Option<ID3D12PipelineState>;
+    /// Records the quads into `dst` (already in RENDER_TARGET state) on `list`, using upload
+    /// region `slot % SLOTS`. False (and nothing recorded) when `insts` is empty or a PSO is missing.
+    pub(crate) unsafe fn record(&mut self, dev: &ID3D12Device, list: &ID3D12GraphicsCommandList,
+        dst: &ID3D12Resource, dst_w: u32, dst_h: u32, dst_fmt: DXGI_FORMAT, insts: &[Inst], slot: usize) -> bool;
+}
+fn shaders() -> Option<&'static (Vec<u8>, Vec<u8>)>;  // OnceLock: compile_fx(VS, "vs_5_0"), compile_fx(&ps_source(), "ps_5_0")
+/// Compiles the two shaders now (called by `hud::start` on the window thread, so the first
+/// HUD frame does not wait for FXC).
+pub(crate) fn warm();
+fn ps_source() -> String;                              // "static const uint FONT[190] = { 0x........u, ... };\n" + PS_BODY
+```
+- Root signature (v1.0, flags NONE): parameter 0 = 4 32-bit constants at `b0`, visibility ALL
+  (`inv_w`, `inv_h`, `linear_out` 0.0/1.0, 0.0); parameter 1 = root SRV at `t0`, visibility VERTEX.
+  No static samplers, no tables.
+- PSO: as the compositor's blended one (`present.rs:808`-`845`): VS/PS, `SampleMask` all,
+  triangles, one RT of `fmt`, cull none, no depth, blend `ONE` / `INV_SRC_ALPHA` for colour and
+  alpha, write mask ALL, no input layout.
+- `record`: `n = min(insts.len(), MAX_INST)`; 0 -> false; `pso_for` None -> false; `copy_nonoverlapping`
+  into `mapped + (slot % SLOTS) * MAX_INST`; `CreateRenderTargetView(dst, {dst_fmt, TEXTURE2D},
+  heap start)`; `OMSetRenderTargets`; viewport and scissor of `dst_w x dst_h`; root signature;
+  `SetGraphicsRoot32BitConstants(0, 4, [1/w, 1/h, linear, 0], 0)` with `linear = 1.0` exactly when
+  `dst_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT`; `SetGraphicsRootShaderResourceView(1,
+  upload.GetGPUVirtualAddress() + ((slot % SLOTS) * MAX_INST * 32) as u64)`; `SetPipelineState`;
+  `IASetPrimitiveTopology(TRIANGLELIST)`; `DrawInstanced(6, n, 0, 0)`; true. No descriptor heap is
+  set (none is used).
+- It never waits and never touches any resource but `dst`, its upload buffer and its RTV heap.
+
+HLSL (FXC, SM 5.0). Vertex shader `VS`:
+```hlsl
+struct Inst { float4 rect; uint color; uint param; uint pad0; uint pad1; };
+StructuredBuffer<Inst> insts : register(t0);
+cbuffer C : register(b0) { float inv_w; float inv_h; float linear_out; float unused; };
+struct VSOut {
+    float4 pos : SV_Position;
+    float2 local : TEXCOORD0;
+    nointerpolation float2 size : TEXCOORD1;
+    nointerpolation float4 color : COLOR0;
+    nointerpolation uint param : PARAM0;
+};
+VSOut main(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
+    Inst i = insts[iid];
+    float2 c = float2((vid == 1 || vid == 2 || vid == 4) ? 1.0 : 0.0,
+                      (vid == 2 || vid == 4 || vid == 5) ? 1.0 : 0.0);
+    float2 px = i.rect.xy + c * i.rect.zw;
+    VSOut o;
+    o.pos = float4(px.x * inv_w * 2.0 - 1.0, 1.0 - px.y * inv_h * 2.0, 0.0, 1.0);
+    o.local = c * i.rect.zw;
+    o.size = i.rect.zw;
+    o.color = float4(i.color & 0xFF, (i.color >> 8) & 0xFF, (i.color >> 16) & 0xFF, i.color >> 24) / 255.0;
+    o.param = i.param;
+    return o;
+}
+```
+Pixel shader `PS_BODY` (after the generated `FONT` line; the same `cbuffer` and `VSOut` repeated):
+```hlsl
+cbuffer C : register(b0) { float inv_w; float inv_h; float linear_out; float unused; };
+struct VSOut { /* identical to the vertex shader's */ };
+float3 to_linear(float3 c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
+float4 main(VSOut v) : SV_Target {
+    uint kind = v.param & 0xF;
+    float a = v.color.a;
+    if (kind == 1) {
+        float r = (float)((v.param >> 8) & 0xFFFF);
+        float2 h = v.size * 0.5;
+        float2 q = abs(v.local - h) - (h - r);
+        float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+        a *= saturate(0.5 - d);
+    } else if (kind == 2) {
+        uint g = (v.param >> 8) & 0xFF;
+        uint2 cell = (uint2)min(floor(v.local / v.size * float2(5.0, 9.0)), float2(4.0, 8.0));
+        uint word = cell.y < 6 ? FONT[g * 2] : FONT[g * 2 + 1];
+        uint row = (word >> (5 * (cell.y < 6 ? cell.y : cell.y - 6))) & 31;
+        if (((row >> (4 - cell.x)) & 1) == 0) discard;
+    }
+    float3 c = v.color.rgb;
+    if (linear_out > 0.5) c = to_linear(c);
+    return float4(c * a, a);
+}
+```
+
+Tests (GPU tests on WARP, as `compositor_blends_ui_plane_over_scene_plane`, `present.rs:1714`;
+when the WARP device cannot be made: `crate::gpu::recomp::runner::skip_test("no GPU")` and return):
+- `ps_source_holds_the_whole_font`: the generated initializer has exactly 190 `0x` entries and
+  starts with `static const uint FONT[190]`.
+- `hud_draws_rects_rounded_corners_and_glyphs_on_warp`: RGBA8 target 64 x 32 (COMMON -> RENDER_TARGET);
+  quads: rect (0,0,64,32) black opaque; rect (0,0,32,32) `rgba(0xFFFFFF, 128)`; round (32,0,32,32)
+  radius 8 `rgba(0xFF0000, 255)`; glyph `H` (`glyph_index(b'H')`) at (8,2,15,27) `rgba(0x00FF00,255)`.
+  `record(.., slot 0)` returns true; RT -> COPY_SOURCE; `readback_copy`; execute, signal, wait.
+  Expect: (4,20) each of R,G,B in 126..=130; (33,1) R <= 2 (outside the rounded corner); (48,16)
+  `[255,0,0,255]`; (9,3) `[0,255,0,255]` (H row 0, column 0 lit); (15,3) grey 126..=130 (row 0,
+  column 2 unlit); (15,12) `[0,255,0,255]` (row 3 is the bar).
+- `hud_writes_linear_colour_into_fp16_targets_on_warp`: R16G16B16A16_FLOAT target 8 x 8; one rect
+  (0,0,8,8) `rgba(0x808080, 255)`; pixel (4,4): R, G, B in 0.211..=0.221 (linear of 128/255 =
+  0.2159), A = 1.0 (a 6-line f16 decode in the test).
+- `empty_quads_record_nothing` (`record` with `&[]` returns false).
+
+Acceptance: the 4 tests pass on the PC, not skipped; the three words in `present.rs` are the only
+change outside `hud/`.
+
+#### 10.8 U6 – wiring, switches, docs (about 300 lines)
+
+Depends on all above. Files: `hud/mod.rs`, `present.rs`, `crates/xcl/src/config.rs`, `README.md`,
+`docs/guide/cli-and-config.md`.
+
+`hud/mod.rs` (remove the `#![allow(dead_code)]` line; keep the module list):
+```rust
+static STARTED: AtomicBool;   // the sampler runs (configured mode is not Off)
+static FAILED: AtomicBool;    // pipeline creation failed: no more drawing this run
+struct Cache { insts: InstBuf, snap: Snapshot, statics: Statics, gen: u64, mode: Mode, wh: (u32, u32) }
+static CACHE: Mutex<Cache>;   // only the presenting thread takes it
+static TIMING: (AtomicU64 frames, AtomicU64 total_ns, AtomicU64 max_ns);
+
+/// XCL_HUD first, else `hud` from xcl.toml; an invalid value gives a warning text and falls back
+/// (invalid env -> the config's value; invalid config -> Full).
+fn resolve(env: Option<&str>, cfg: &str) -> (Mode, Option<String>);
+fn configured() -> Mode;      // OnceLock: resolve(std::env::var("XCL_HUD").ok(), &state::config().hud), warning logged once
+/// Window thread, once the window exists: Off -> nothing (one info line "hud: off"); else
+/// STARTED, SHARED.mode = mode, draw::warm(), sample::spawn(hwnd, title), info line
+/// "hud: <mode> (F3: full / compact / off; XCL_HUD or hud in xcl.toml)".
+pub(crate) fn start(hwnd: isize, title: &str);
+/// Presenting thread, every shown frame: pushes `now_us()` into SHARED.frames (returns at once
+/// when not STARTED).
+pub(crate) fn note_frame();
+/// F3 key-down, not a repeat: wParam == 0x72 and bit 30 of lParam clear.
+fn is_toggle(vk: usize, lparam: isize) -> bool;
+/// Window procedure, WM_KEYDOWN: true when it was F3 and the HUD runs (mode -> next, info line
+/// "hud: <mode>").
+pub(crate) fn on_key(vk: usize, lparam: isize) -> bool;
+/// STARTED, not FAILED, mode not Off.
+pub(crate) fn active() -> bool;
+/// The barriers around the panel: with the HUD, `state -> RENDER_TARGET` (none when already
+/// there) then `RENDER_TARGET -> PRESENT`; without, `state -> PRESENT` (none when already there).
+pub(crate) fn tail_barriers(state: D3D12_RESOURCE_STATES, hud: bool)
+    -> [Option<(D3D12_RESOURCE_STATES, D3D12_RESOURCE_STATES)>; 2];
+/// Presenting thread: makes `draw` on first use (failure: FAILED, one warning "hud: off – <why>"),
+/// rebuilds the layout when the snapshot generation (try_lock), the mode or (w, h) changed, then
+/// HudDraw::record. Times itself; after 600 drawn frames logs once
+/// "hud: 600 frames drawn, record mean <x> µs, max <y> µs, <n> quads".
+pub(crate) unsafe fn record(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, bb: &ID3D12Resource,
+    w: u32, h: u32, fmt: DXGI_FORMAT, slot: usize, draw: &mut Option<draw::HudDraw>) -> bool;
+```
+`record` takes `CACHE` with `try_lock` (busy -> return false), reads `SHARED.snapshot` and
+`SHARED.statics` with `try_lock` (busy -> keep the cached copies), never waits.
+
+`present.rs` (exact changes):
+1. `struct Presenter` (`present.rs:904`-`925`): add field `hud: Option<super::hud::draw::HudDraw>,`;
+   `new_presenter` (`present.rs:968`-`975`): `hud: None,`.
+2. In `present_now` after `let mut composited = false;` (`present.rs:1121`): `let mut bb_state =
+   D3D12_RESOURCE_STATE_PRESENT;`.
+3. Composited success branch (`present.rs:1137`-`1148`): with `due`, keep `RENDER_TARGET ->
+   COPY_SOURCE` and the readback, replace the `COPY_SOURCE -> PRESENT` barrier by `bb_state =
+   D3D12_RESOURCE_STATE_COPY_SOURCE;`; without `due`, replace the `RENDER_TARGET -> PRESENT` barrier
+   by `bb_state = D3D12_RESOURCE_STATE_RENDER_TARGET;`. The failure branch (`present.rs:1149`-`1151`)
+   is unchanged (it returns the buffer to `PRESENT` for the copy path).
+4. Copy path: replace `let b2 = ...; p.list.ResourceBarrier(&b2);` (`present.rs:1188`-`1189`) by
+   `bb_state = D3D12_RESOURCE_STATE_COPY_DEST;`.
+5. After the `if !composited { ... }` block, before the `XCL_TRACE_FRAME` comment (`present.rs:1191`):
+   ```rust
+   // the statistics panel: on XCL's back buffer, after the title's frame and any frame dump
+   let hud = super::hud::active();
+   let [before, after] = super::hud::tail_barriers(bb_state, hud);
+   if let Some((b, a)) = before {
+       p.list.ResourceBarrier(&[transition(&bb, b, a)]);
+   }
+   if hud {
+       super::hud::record(&p.dev, &p.list, &bb, p.w, p.h, p.fmt, p.ring.cur, &mut p.hud);
+   }
+   if let Some((b, a)) = after {
+       p.list.ResourceBarrier(&[transition(&bb, b, a)]);
+   }
+   ```
+6. `frame_shown` (`present.rs:1259`): first line `super::hud::note_frame();`.
+7. `wndproc` (`present.rs:374`-`396`): before `_ =>`, add
+   `WM_KEYDOWN if super::hud::on_key(wp.0, lp.0) => LRESULT(0),`.
+8. `window_thread` after `crate::hle::kbm::attach(hwnd.0);` (`present.rs:520`):
+   `super::hud::start(hwnd.0 as isize, &title);` (`title` is `window_name()`, `present.rs:494`).
+
+`config.rs`: field after `mouse_sensitivity` (`config.rs:82`):
+```rust
+    /// The statistics panel in the window's top-left corner: "full", "compact" or "off".
+    /// `XCL_HUD` overrides; F3 cycles it while the window has the focus.
+    pub hud: String,
+```
+and `hud: "full".into(),` in `Config::default` after `mouse_sensitivity: 1.0,` (`config.rs:199`).
+
+Docs: the README and `cli-and-config.md` lines of section 9.
+
+Tests:
+- `hud/mod.rs`: `env_beats_config`, `invalid_env_falls_back_to_config`, `invalid_config_is_full`,
+  `f3_down_toggles_and_repeats_do_not` (`is_toggle(0x72, 0)`, `!is_toggle(0x72, 1 << 30)`,
+  `!is_toggle(0x71, 0)`), `tail_barriers_cover_every_present_path` (COPY_DEST, COPY_SOURCE,
+  RENDER_TARGET, PRESENT, each with and without the HUD: 8 cases).
+- `config.rs`: `hud_defaults_to_full` (default value and `hud = "full"` in the serialized TOML),
+  `partial_file_without_hud_gets_full` (`toml::from_str::<Config>("gamertag = \"x\"")`).
+
+Acceptance: whole suite passes on the PC; the acceptance run (section 12) shows the panel.
+
+#### 10.9 U7 – GPU time per frame when telemetry measures it (optional, about 40 lines)
+
+Depends on U6. Files: `crates/xcl/src/telemetry_gpu.rs`, `hud/sample.rs`.
+- `telemetry_gpu.rs`: `static LAST_GPU_US: AtomicU64 = AtomicU64::new(u64::MAX);` In `write_frames`
+  (`telemetry_gpu.rs:3217`), for each `f` with `f.gpu_ms == Some(ms)`, store `(ms * 1000.0) as u64`.
+  `pub fn last_gpu_ms() -> Option<f32>`: None when `!xlog::telemetry_on(Tier::Frame)` or the value is
+  `u64::MAX`, else `us / 1000`. It is reachable as `crate::report::last_gpu_ms()` (`report.rs:255`-`257`).
+- `sample.rs`, every 4th tick: `snap.gpu_ms = crate::report::last_gpu_ms();`.
+- Test (`telemetry_gpu.rs`): `last_gpu_ms_follows_the_newest_written_frame` (write two facts with
+  3.0 and 4.5 ms through `write_frames` with a no-op sink; the raw atomic holds 4500).
+
+#### 10.10 U8 – GPU utilisation through PDH (deferred)
+
+Only after the acceptance run and a probe: a test binary or an ignored test that opens a PDH query
+on `\GPU Engine(pid_<own pid>*)\Utilization Percentage` (fallback `\GPU Engine(*)\...` filtered by
+the `pid_<pid>_` prefix) and times `PdhCollectQueryData` over 60 collections with the title running.
+If the mean is under 2 ms: a `gpu_util.rs` in `hud/` (about 200 lines) owned by the sampler, 1 Hz,
+buffer allocated once with room for 4 x the first instance count, value = max over engine
+instances of type `3D` or `Compute` of this process; the `GPU` row appends ` 87%`. Any PDH error ->
+None for the rest of the run. Its own decision; not part of v1.
+
+### 11. Concurrency plan
+
+| Wave | Units (in parallel) | Files written | Conflicts |
+|---|---|---|---|
+| 0 | U0 | `hud/*` (one line each), d3d12x `mod.rs` | — |
+| 1 | U1, U2a, U2b | `hud/font.rs` / `hud/model.rs` / `hud/text.rs` | none: one file each |
+| 2 | U3, U4, U5 | `hud/layout.rs` / `hud/sample.rs` + `code_use.rs` / `hud/draw.rs` + `present.rs` (3 words) | none: disjoint files |
+| 3 | U6 | `hud/mod.rs`, `present.rs`, `config.rs`, `README.md`, `docs/guide/cli-and-config.md` | `present.rs` after U5 (sequential) |
+| 4 | U7 (optional) | `telemetry_gpu.rs`, `hud/sample.rs` | after U6 |
+| later | U8 (deferred) | `hud/gpu_util.rs`, `hud/sample.rs`, `hud/layout.rs` | after the probe |
+
+Wave 2 needs wave 1 merged (types). Each unit builds on its own: U1-U5 add code that nothing calls
+yet (`#![allow(dead_code)]` from U0 keeps the build quiet); U6 turns it on.
+
+For an upstream PR (if the user ever wants one), the same order maps to the split CONTRIBUTING.md
+asks for: (1) U0+U1+U2a+U2b, (2) U3+U4, (3) U5, (4) U6, (5) U7. `code_use` and the telemetry module
+are fork-only today (`report.rs:250`-`257`), so U4's `in_use()` and U7 would need gating there
+(claim).
+
+### 12. Acceptance run on the PC (RTX 5080 16 GB, Windows 11)
+
+1. Build: `cargo build --release --workspace`; tests: `cargo test -p xcl --lib hud`, `cargo test -p
+   xcl --lib code_use`, `cargo test -p xcl --lib config`, then `cargo test --workspace --
+   --test-threads=4`; report passed / failed / ignored and any `SKIPPED` (the two WARP tests must not
+   skip).
+2. Run the title with no `XCL_HUD` (default full) until the 3D scene shows; screenshot with `pcshot`.
+   The screenshot must show, top-left, a dark translucent rounded panel with the game visible through
+   it, and: `XCL`, the title name and a run time; `FPS` with a value (red at 2-3 fps) and a frame-time
+   graph with columns; `CPU` and `sys` percentages with a violet graph; `RAM` and `sys` with a green
+   graph; `VRAM` in red (over budget, as today) with `of <budget>`, an amber graph and the budget
+   line under the top of the columns; `GPU NVIDIA GeForce RTX 50` (cut at 21); `Commit`; `PSO ...
+   queued` (and `Failed` if any); `DXC ... run, ... done`; `Res <frame> > 1280x720`; `RT off`.
+3. Press F3: compact panel (3 lines + graph), screenshot; F3 again: no panel, screenshot; F3 again:
+   full. The game shows no reaction to F3 and `xcl.log` has `hud: compact`, `hud: off`, `hud: full`.
+4. Cost, two runs of 120 s each on the same title and save: `XCL_TELEMETRY=frame XCL_HUD=off` and
+   `XCL_TELEMETRY=frame XCL_HUD=full`. Compare the mean and 95th percentile of `present_ms` in the
+   `frame` events (target: full minus off < 0.1 ms) and frames shown; read the `hud: 600 frames
+   drawn, record mean ... µs, max ... µs` line (target: mean < 100 µs, max < 1 ms). If the title shows
+   fewer than 600 frames in the run, run longer or note the line's absence.
+5. `XCL_FRAME_DUMP=60` with the HUD on: the written `frame_<n>.bmp` has no panel.
+6. Resize the window by dragging and maximise it: the panel keeps its share of the window; no
+   `present: CreateSwapChainForHwnd` / resize error in `xcl.log`.
+7. `XCL_HUD=off`: no `xcl-hud` thread (no `hud:` line but `hud: off`), panel absent.
+
+### 13. What is left out
+
+- GPU utilisation (U8, deferred behind a measurement); temperatures, clocks, fan speeds (vendor APIs).
+- Drawing while the title does not present (a stalled title shows its last frame with the panel
+  frozen; the title bar keeps updating).
+- Sharp text when the window is not an integer multiple of the frame: DWM's stretch softens it;
+  drawing in window space would need a window-sized swap chain and a scaled blit of the title's frame.
+- HDR paper-white for FP16 output; per-monitor DPI (the process is DPI-unaware).
+- Mouse interaction, dragging the panel, other corners, user-chosen rows or colours.
+- Percentiles, per-queue or per-pass timings, DirectStorage throughput, draws per second.
+- A HUD in `graphics = "null"` or `present = "off"` runs (no window).
+- Changing the title bar text (it stays as it is).
