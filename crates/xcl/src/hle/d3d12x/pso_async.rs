@@ -3,9 +3,10 @@
 //! it loads. When a pipeline's DXIL is not in the disk cache yet, the title gets a stand-in
 //! pipeline (shaders that draw nothing) at once and the real one is built on a worker; binding
 //! (`SetPipelineState`, console list replay, the two-pass lookups) uses the real one as soon
-//! as it is there. A draw waits for its graphics pipeline at most the frame budget (`frame_wait_budget`,
-//! all threads together) and then draws nothing until it is built; a compute pipeline is waited
-//! for where it is used, a `Dispatch` at its submit (a skipped dispatch would corrupt what it computes).
+//! as it is there. A draw and a compute bind wait for their pipeline at most their frame budget
+//! (`frame_wait_budget`, `compute_wait`; all threads together), each pipeline once, and are then
+//! left out until it is built; `XCL_PSO_COMPUTE_WAIT_MS` restores waiting for compute, a `Dispatch`
+//! at its submit (a skipped dispatch would corrupt what it computes).
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
@@ -45,6 +46,8 @@ struct Demand {
     by_submit: bool,
     /// thread id of the preload worker (lowest priority) building it, 0 = none
     preload_thread: u32,
+    /// when a title thread first needed it (`need_now`): its one chance to be waited for runs from here
+    needed_at: Option<std::time::Instant>,
 }
 
 thread_local! {
@@ -732,14 +735,15 @@ mod used_tests {
     }
 
     /// Two draws share one frame budget: what the first spent is gone for the second, and the
-    /// next frame has it again.
+    /// next frame has it again for a pipeline first needed there; one that had its chance is not
+    /// waited for again.
     #[test]
     fn the_frame_budget_is_shared_and_resets_on_the_next_frame() {
         let _g = DRAW_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (a, b) = (0x7E57_DD11usize, 0x7E57_DD12usize);
+        let (a, b, c) = (0x7E57_DD11usize, 0x7E57_DD12usize, 0x7E57_DD13usize);
         let (go, finish) = mpsc::channel::<()>();
         let finish = Arc::new(Mutex::new(finish));
-        for (s, real) in [(a, 0x6011), (b, 0x6012)] {
+        for (s, real) in [(a, 0x6011), (b, 0x6012), (c, 0x6013)] {
             let finish = finish.clone();
             submit_lazy(s, false, Box::new(move || {
                 let _ = finish.lock().unwrap().recv();
@@ -752,10 +756,50 @@ mod used_tests {
         let t = std::time::Instant::now();
         assert_eq!(resolve_draw_with(b, 1_000_007, ms(60)), (b, true));
         assert!(t.elapsed() < ms(15), "the second waited {:?} in a spent budget", t.elapsed());
-        // (the second never waited: it is not late and waits again in the next frame)
+        // (a pipeline first needed in the next frame has the whole budget)
         let t = std::time::Instant::now();
-        assert_eq!(resolve_draw_with(b, 1_000_008, ms(60)), (b, true));
-        assert!(t.elapsed() >= ms(55), "a new frame has its budget again ({:?})", t.elapsed());
+        assert_eq!(resolve_draw_with(c, 1_000_008, ms(60)), (c, true));
+        assert!(t.elapsed() >= ms(55) && t.elapsed() < ms(400), "a new frame has its budget again ({:?})", t.elapsed());
+        // (the first one had its chance in the earlier frame)
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_draw_with(a, 1_000_008, ms(60)), (a, true));
+        assert!(t.elapsed() < ms(15), "waited again {:?}", t.elapsed());
+        drop(go);
+        wait_built(a);
+        wait_built(b);
+        wait_built(c);
+        let _ = (released(a), released(b), released(c));
+    }
+
+    /// A pipeline is waited for during the first budget after it was first needed, and no
+    /// longer: a burst of pipelines costs one budget, not one each.
+    #[test]
+    fn a_pipeline_gets_one_chance_to_be_waited_for() {
+        let _g = DRAW_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (a, b) = (0x7E57_F501usize, 0x7E57_F502usize);
+        let (go, finish) = mpsc::channel::<()>();
+        let finish = Arc::new(Mutex::new(finish));
+        for s in [a, b] {
+            let finish = finish.clone();
+            submit_lazy(s, false, Box::new(move || {
+                let _ = finish.lock().unwrap().recv();
+                0x6F01
+            }), 0);
+        }
+        let late = |s: usize| entry(s).unwrap().late.load(Ordering::Acquire);
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_draw_with(a, 1_000_101, ms(60)), (a, true));
+        assert!(t.elapsed() >= ms(55) && t.elapsed() < ms(400), "the first waited {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_draw_with(b, 1_000_101, ms(60)), (b, true));
+        assert!(t.elapsed() < ms(15), "the second waited {:?}", t.elapsed());
+        assert!(!late(b), "it never waited, but it is late");
+        // (the next frame, more than the budget after its first need)
+        std::thread::sleep(ms(65));
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_draw_with(b, 1_000_102, ms(60)), (b, true));
+        assert!(t.elapsed() < ms(15), "waited after its chance {:?}", t.elapsed());
+        assert!(late(b), "its chance is over, but it is not late");
         drop(go);
         wait_built(a);
         wait_built(b);
@@ -773,7 +817,10 @@ mod used_tests {
             0x6021
         }), 0);
         let late = || entry(standin).unwrap().late.load(Ordering::Acquire);
-        assert_eq!(resolve_draw_with(standin, 1_000_021, std::time::Duration::ZERO), (standin, true));
+        // (frame 1_000_021 has no budget left: other draws waited in it)
+        frame_allowance(&FRAME_SPENT, 1_000_021, ms(30));
+        frame_spend(&FRAME_SPENT, 1_000_021, ms(1000));
+        assert_eq!(resolve_draw_with(standin, 1_000_021, ms(30)), (standin, true));
         assert!(!late(), "no wait ran, but the pipeline is late");
         assert_eq!(resolve_draw_with(standin, 1_000_022, ms(30)), (standin, true));
         assert!(late(), "the wait ran out, but the pipeline is not late");
@@ -1223,6 +1270,83 @@ mod used_tests {
         let _ = released(standin);
     }
 
+    /// A compute bind in frame mode waits for a worker inside the frame budget, then gets the
+    /// stand-in and the pipeline is late; once built, the real one.
+    #[test]
+    fn a_compute_bind_waits_inside_the_frame_budget() {
+        let _g = DRAW_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let standin = 0x7E57_F511usize;
+        let (info_tx, info) = mpsc::channel();
+        let (go, finish) = mpsc::channel::<()>();
+        submit_lazy(standin, true, Box::new(move || {
+            let _ = info_tx.send(std::thread::current().name().map(str::to_owned));
+            let _ = finish.recv_timeout(std::time::Duration::from_secs(20));
+            0x7F11
+        }), 0);
+        let mode = ComputeWait::Frame(ms(60));
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_wait_inner(standin, None, mode, 2_000_001), standin);
+        assert!(t.elapsed() >= ms(55) && t.elapsed() < ms(400), "waited {:?}", t.elapsed());
+        let name = info.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker builds it");
+        assert!(name.is_some_and(|n| n.starts_with("xcl-pso")), "built on the waiting thread");
+        assert!(entry(standin).unwrap().late.load(Ordering::Acquire), "the wait ran out, but the pipeline is not late");
+        go.send(()).unwrap();
+        wait_built(standin);
+        assert_eq!(resolve_wait_inner(standin, None, mode, 2_000_002), 0x7F11, "built by a worker");
+        let _ = released(standin);
+    }
+
+    /// Compute binds of one frame share its compute budget: what the first spent is gone for the next.
+    #[test]
+    fn compute_binds_share_the_frame_budget() {
+        let _g = DRAW_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (a, b) = (0x7E57_F521usize, 0x7E57_F522usize);
+        let (go, finish) = mpsc::channel::<()>();
+        let finish = Arc::new(Mutex::new(finish));
+        for s in [a, b] {
+            let finish = finish.clone();
+            submit_lazy(s, true, Box::new(move || {
+                let _ = finish.lock().unwrap().recv_timeout(std::time::Duration::from_secs(20));
+                0x7F21
+            }), 0);
+        }
+        let mode = ComputeWait::Frame(ms(60));
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_wait_inner(a, None, mode, 2_000_011), a);
+        assert!(t.elapsed() >= ms(55) && t.elapsed() < ms(400), "the first waited {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_wait_inner(b, None, mode, 2_000_011), b);
+        assert!(t.elapsed() < ms(15), "the second waited {:?} in a spent budget", t.elapsed());
+        assert!(!entry(b).unwrap().late.load(Ordering::Acquire), "it never waited, but it is late");
+        drop(go);
+        wait_built(a);
+        wait_built(b);
+        let _ = (released(a), released(b));
+    }
+
+    #[test]
+    fn compute_wait_mode_follows_the_switches() {
+        let (frame, limit) = (|n| ComputeWait::Frame(ms(n)), |n| ComputeWait::Limit(Some(ms(n))));
+        assert_eq!(compute_wait_from(None, None), frame(100));
+        assert_eq!(compute_wait_from(Some("0"), None), ComputeWait::Limit(None));
+        assert_eq!(compute_wait_from(Some("0"), Some("250")), ComputeWait::Limit(None));
+        assert_eq!(compute_wait_from(Some("5000"), Some("250")), limit(5000));
+        assert_eq!(compute_wait_from(None, Some("250")), frame(250));
+        assert_eq!(compute_wait_from(None, Some("0")), frame(0));
+        assert_eq!(compute_wait_from(Some(" 5000 "), None), limit(5000));
+        assert_eq!(compute_wait_from(None, Some(" 250 ")), frame(250));
+        assert_eq!(compute_wait_from(Some("soon"), Some("many")), frame(100), "values that are no numbers count as unset");
+    }
+
+    #[test]
+    fn waits_are_bounded_in_frame_mode() {
+        assert!(waits_bounded_for(&ComputeWait::Frame(ms(100)), false));
+        assert!(waits_bounded_for(&ComputeWait::Frame(ms(0)), true));
+        assert!(waits_bounded_for(&ComputeWait::Limit(None), true));
+        assert!(!waits_bounded_for(&ComputeWait::Limit(None), false));
+        assert!(!waits_bounded_for(&ComputeWait::Limit(Some(ms(5000))), false));
+    }
+
     #[test]
     fn image_skip_is_on_unless_turned_off() {
         assert!(image_skip_from(None));
@@ -1279,24 +1403,39 @@ pub fn resolve_wait(pso: usize) -> usize {
     resolve_wait_for(pso, wait_budget())
 }
 
-/// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built, or for a compute
-/// pipeline until `compute_wait_limit`).
+/// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built, or a compute
+/// pipeline as `compute_wait` says).
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
-    resolve_wait_inner(pso, budget, compute_wait_limit())
+    resolve_wait_inner(pso, budget, compute_wait(), super::present::presents())
 }
 
 /// `resolve_wait_for` with no budget, a compute pipeline waited for at most `limit` (None: no limit).
+#[cfg(test)]
 fn resolve_wait_limited(pso: usize, limit: Option<std::time::Duration>) -> usize {
-    resolve_wait_inner(pso, None, limit)
+    resolve_wait_inner(pso, None, ComputeWait::Limit(limit), 0)
 }
 
-fn resolve_wait_inner(pso: usize, budget: Option<std::time::Duration>, limit: Option<std::time::Duration>) -> usize {
+/// `resolve_wait_for` with no budget for frame `frame`; a compute pipeline waits as `mode` says.
+fn resolve_wait_inner(pso: usize, budget: Option<std::time::Duration>, mode: ComputeWait, frame: u64) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
     if p.spared.load(Ordering::Acquire) {
         return resolve_spared(&p, pso);
     }
     let already = *p.done.lock().unwrap();
+    if let (None, true, ComputeWait::Frame(frame_budget)) = (budget, p.compute, mode) {
+        let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
+            0 => p.stand(pso),
+            r => r,
+        };
+        if already {
+            return built(&p);
+        }
+        return match wait_in_frame(&p, pso, frame, frame_budget, &COMPUTE_FRAME_SPENT, None) {
+            Some(true) => built(&p),
+            _ => p.stand(pso),
+        };
+    }
     let started = std::time::Instant::now();
     // (the title's thread is held from here until the pipeline is built or the budget is over)
     let _held = (!already).then(Held::new);
@@ -1310,7 +1449,10 @@ fn resolve_wait_inner(pso: usize, budget: Option<std::time::Duration>, limit: Op
         }
         return r;
     }
-    let limit = limit.filter(|_| p.compute);
+    let limit = match mode {
+        ComputeWait::Limit(limit) if p.compute => limit,
+        _ => None,
+    };
     // (its wait ran out earlier: its dispatches are skipped until a worker has built it)
     if !already && limit.is_some() && p.late.load(Ordering::Acquire) {
         return p.stand(pso);
@@ -1355,15 +1497,36 @@ fn resolve_wait_inner(pso: usize, budget: Option<std::time::Duration>, limit: Op
     }
 }
 
-/// How long a bind waits for a compute pipeline a worker is building (`XCL_PSO_COMPUTE_WAIT_MS`,
-/// default 120 000; 0: no limit). A safety limit for a build that never ends: the pipeline is then
-/// `late` and its dispatches are skipped until it is built.
-fn compute_wait_limit() -> Option<std::time::Duration> {
-    static L: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *L.get_or_init(|| match std::env::var("XCL_PSO_COMPUTE_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
-        Some(0) => None,
-        Some(ms) => Some(std::time::Duration::from_millis(ms)),
-        None => Some(std::time::Duration::from_millis(120_000)),
+/// How a compute bind waits for a pipeline a worker is building.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ComputeWait {
+    /// at most this much per shown frame, all threads together, once per pipeline (`wait_in_frame`)
+    Frame(std::time::Duration),
+    /// at most this long per bind (None: until it is built); the pipeline is then `late`
+    Limit(Option<std::time::Duration>),
+}
+
+/// The `ComputeWait` for the values of `XCL_PSO_COMPUTE_WAIT_MS` (0: no limit, n: n ms per bind)
+/// and `XCL_PSO_COMPUTE_FRAME_WAIT_MS` (default 100; 0: never wait). With the first unset, a compute
+/// bind waits inside the frame budget. A value that is not a number counts as unset.
+fn compute_wait_from(wait_ms: Option<&str>, frame_ms: Option<&str>) -> ComputeWait {
+    let ms = |v: Option<&str>| v.and_then(|v| v.trim().parse::<u64>().ok());
+    match ms(wait_ms) {
+        Some(0) => ComputeWait::Limit(None),
+        Some(n) => ComputeWait::Limit(Some(std::time::Duration::from_millis(n))),
+        None => ComputeWait::Frame(std::time::Duration::from_millis(ms(frame_ms).unwrap_or(100))),
+    }
+}
+
+/// `compute_wait_from` for the environment, read once (a unit test is not affected by it: it
+/// waits until built, as before frame mode).
+fn compute_wait() -> ComputeWait {
+    if cfg!(test) {
+        return ComputeWait::Limit(None);
+    }
+    static W: OnceLock<ComputeWait> = OnceLock::new();
+    *W.get_or_init(|| {
+        compute_wait_from(std::env::var("XCL_PSO_COMPUTE_WAIT_MS").ok().as_deref(), std::env::var("XCL_PSO_COMPUTE_FRAME_WAIT_MS").ok().as_deref())
     })
 }
 
@@ -1380,19 +1543,22 @@ fn frame_wait_budget() -> std::time::Duration {
 /// (frames shown when the spending began, µs spent)
 static FRAME_SPENT: Mutex<(u64, u64)> = Mutex::new((0, 0));
 
-/// What is left of the frame budget `budget` for frame `frame` (it starts again when `frame`
-/// differs from the stored one).
-fn frame_allowance(frame: u64, budget: std::time::Duration) -> std::time::Duration {
-    let mut g = FRAME_SPENT.lock().unwrap();
+/// the same for compute binds (`compute_wait`)
+static COMPUTE_FRAME_SPENT: Mutex<(u64, u64)> = Mutex::new((0, 0));
+
+/// What is left of the frame budget `budget` for frame `frame` in `counter` (it starts again when
+/// `frame` differs from the stored one).
+fn frame_allowance(counter: &Mutex<(u64, u64)>, frame: u64, budget: std::time::Duration) -> std::time::Duration {
+    let mut g = counter.lock().unwrap();
     if g.0 != frame {
         *g = (frame, 0);
     }
     budget.saturating_sub(std::time::Duration::from_micros(g.1))
 }
 
-/// Adds `spent` to frame `frame` (ignored if a newer frame has started).
-fn frame_spend(frame: u64, spent: std::time::Duration) {
-    let mut g = FRAME_SPENT.lock().unwrap();
+/// Adds `spent` to frame `frame` in `counter` (ignored if a newer frame has started).
+fn frame_spend(counter: &Mutex<(u64, u64)>, frame: u64, spent: std::time::Duration) {
+    let mut g = counter.lock().unwrap();
     if g.0 > frame {
         return;
     }
@@ -1405,11 +1571,65 @@ fn frame_spend(frame: u64, spent: std::time::Duration) {
 /// A title thread needs `p` now: wanted, and ahead of the workers' FIFO.
 fn need_now(p: &Arc<Pending>) {
     p.want();
-    if !std::mem::replace(&mut p.demand.lock().unwrap().by_submit, true) {
+    let first = {
+        let mut d = p.demand.lock().unwrap();
+        d.needed_at.get_or_insert_with(std::time::Instant::now);
+        !std::mem::replace(&mut d.by_submit, true)
+    };
+    if first {
         NEEDED.lock().unwrap().push_back(p.clone());
         let _ = queue().lock().unwrap().send(Box::new(|| ()));
     }
     p.sent.store(true, Ordering::Release);
+}
+
+/// How much of `budget` is left of `p`'s one chance to be waited for, counted from when it was
+/// first needed (all of it before that).
+fn chance_left(p: &Pending, budget: std::time::Duration) -> std::time::Duration {
+    match p.demand.lock().unwrap().needed_at {
+        Some(at) => budget.saturating_sub(at.elapsed()),
+        None => budget,
+    }
+}
+
+/// A bind of `p` (not built) in frame `frame` with a frame budget of `budget` kept in `counter`:
+/// its wait goes first to a worker (`need_now`, never this thread). In this order: a `late`
+/// pipeline is not waited for; one whose chance (`budget` from when it was first needed) is over
+/// becomes `late`; one that finds the frame's budget spent is left out for now, not late; else it
+/// waits for the least of what is left of the frame's budget, its chance and `cap`, and becomes
+/// `late` if that was not enough. `None`: it did not wait or was not built; `Some(done)` otherwise.
+fn wait_in_frame(p: &Arc<Pending>, pso: usize, frame: u64, budget: std::time::Duration, counter: &Mutex<(u64, u64)>, cap: Option<std::time::Duration>) -> Option<bool> {
+    need_now(p);
+    if p.late.load(Ordering::Acquire) {
+        return None;
+    }
+    let chance = chance_left(p, budget);
+    if chance.is_zero() {
+        p.late.store(true, Ordering::Release);
+        return None;
+    }
+    let mut allowance = frame_allowance(counter, frame, budget);
+    if allowance.is_zero() {
+        return None;
+    }
+    allowance = allowance.min(chance);
+    if let Some(cap) = cap {
+        allowance = allowance.min(cap);
+    }
+    let started = std::time::Instant::now();
+    let done = {
+        let _held = Held::new();
+        let _open = OpenWait::new(pso, p.compute, false, started);
+        let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), allowance, |d| !*d).unwrap();
+        *done
+    };
+    let took = started.elapsed();
+    frame_spend(counter, frame, took);
+    note_blocked(p.compute, false, took);
+    if !done {
+        p.late.store(true, Ordering::Release);
+    }
+    Some(done)
 }
 
 /// The pipeline a draw or graphics ExecuteIndirect uses now, and whether it is not built (the
@@ -1435,29 +1655,10 @@ fn resolve_draw_with(pso: usize, frame: u64, budget: std::time::Duration) -> (us
     if p.real.load(Ordering::Acquire) != 0 || *p.done.lock().unwrap() {
         return built(&p);
     }
-    need_now(&p);
-    let mut allowance = frame_allowance(frame, budget);
-    if let Some(cap) = wait_budget() {
-        allowance = allowance.min(cap);
+    match wait_in_frame(&p, pso, frame, budget, &FRAME_SPENT, wait_budget()) {
+        Some(true) => built(&p),
+        _ => (p.stand(pso), true),
     }
-    if allowance.is_zero() || p.late.load(Ordering::Acquire) {
-        return (p.stand(pso), true);
-    }
-    let started = std::time::Instant::now();
-    let done = {
-        let _held = Held::new();
-        let _open = OpenWait::new(pso, false, false, started);
-        let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), allowance, |d| !*d).unwrap();
-        *done
-    };
-    let took = started.elapsed();
-    frame_spend(frame, took);
-    note_blocked(false, false, took);
-    if done {
-        return built(&p);
-    }
-    p.late.store(true, Ordering::Release);
-    (p.stand(pso), true)
 }
 
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
@@ -1469,10 +1670,16 @@ fn wait_budget() -> Option<std::time::Duration> {
     *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
 }
 
-/// Binds wait at most `XCL_PSO_WAIT_MS`: a dispatch is then not put off to the submit
-/// (`list_x::defer`), where it would only wait as long.
+/// Binds wait a bounded time (`XCL_PSO_WAIT_MS`, or the compute frame budget): a dispatch is then
+/// not put off to the submit (`list_x::defer`), where it would only wait as long: it is recorded at
+/// its bind, which waits inside the budget or leaves it out. Put-off to the submit remains only with
+/// `XCL_PSO_COMPUTE_WAIT_MS` set and `XCL_PSO_WAIT_MS` unset.
 pub fn waits_bounded() -> bool {
-    wait_budget().is_some()
+    waits_bounded_for(&compute_wait(), wait_budget().is_some())
+}
+
+fn waits_bounded_for(mode: &ComputeWait, wait_budget_set: bool) -> bool {
+    wait_budget_set || matches!(mode, ComputeWait::Frame(_))
 }
 
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
