@@ -270,7 +270,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
         return super::pso_async::need_by_submit(raw_pso);
     }
-    let pso = super::pso_async::resolve_wait(raw_pso);
+    let (pso, unbuilt) = super::pso_async::resolve_draw(raw_pso);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
     if !gfx && !compute {
@@ -279,7 +279,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // call with that pair is invalid (debug layer 953, "the currently set Root Signature
         // doesn't match the currently set Pipeline State Object"; a retail title's world then
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
-        if super::pso_async::is_pending(raw_pso) {
+        if unbuilt {
             count(DRAWS_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -543,8 +543,9 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
-    // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    let real = super::pso_async::resolve_wait(pso);
+    // a pipeline still being built in the background is waited for inside the frame budget (its
+    // stand-in draws nothing)
+    let (real, unbuilt) = super::pso_async::resolve_draw(pso);
     crate::report::telemetry_draw(this, real);
     if !super::real::is_translated_graphics(real) {
         // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
@@ -569,7 +570,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             let mut g = SEEN.lock().unwrap();
             if !g.contains(&pso) && g.len() < 12 {
                 g.push(pso);
-                let real = super::pso_async::resolve_wait(pso);
+                let real = super::pso_async::resolve(pso);
                 crate::xlog_info!(
                     "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {real:#x}; pending {}, two-pass {}, RT0 {:?})",
                     super::pso_async::is_pending(pso),
@@ -581,7 +582,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // a PC pipeline (also a stand-in or fallback: made with the title's root signature):
         // the title's root signature, which nothing else binds on the PC list – a draw without
         // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
-        if super::pso_async::is_pending(pso) {
+        if unbuilt {
             super::list_x::note_dropped_draw(this);
         }
         let rs = with(this, |s| s.rs_gfx) as *mut c_void;

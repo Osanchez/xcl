@@ -3,7 +3,8 @@
 //! it loads. When a pipeline's DXIL is not in the disk cache yet, the title gets a stand-in
 //! pipeline (shaders that draw nothing) at once and the real one is built on a worker; binding
 //! (`SetPipelineState`, console list replay, the two-pass lookups) uses the real one as soon
-//! as it is there. A graphics pipeline draws nothing until then; a compute pipeline is waited
+//! as it is there. A draw waits for its graphics pipeline at most the frame budget (`frame_wait_budget`,
+//! all threads together) and then draws nothing until it is built; a compute pipeline is waited
 //! for where it is used, a `Dispatch` at its submit (a skipped dispatch would corrupt what it computes).
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
@@ -691,6 +692,114 @@ mod used_tests {
         let _ = released(waited);
     }
 
+    /// (the draw tests share the frame budget: one at a time)
+    static DRAW_LOCK: Mutex<()> = Mutex::new(());
+
+    fn ms(n: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(n)
+    }
+
+    fn wait_built(standin: usize) {
+        let start = std::time::Instant::now();
+        while is_pending(standin) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(ms(5));
+        }
+    }
+
+    /// A draw never builds the pipeline on its thread: a worker does, wanted and ahead of the
+    /// queue, and the draw gets the stand-in once its allowance is over.
+    #[test]
+    fn a_draw_never_builds_the_pipeline_on_its_thread() {
+        let _g = DRAW_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let standin = 0x7E57_DD01usize;
+        let (info_tx, info) = mpsc::channel();
+        let (go, finish) = mpsc::channel::<()>();
+        submit_lazy(standin, false, Box::new(move || {
+            let _ = info_tx.send((std::thread::current().name().map(str::to_owned), build_is_wanted()));
+            let _ = finish.recv();
+            0x6001
+        }), 0);
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_draw_with(standin, 1_000_001, ms(100)), (standin, true));
+        assert!(t.elapsed() < ms(400), "waited {:?}", t.elapsed());
+        let (name, wanted) = info.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker builds it");
+        assert!(name.is_some_and(|n| n.starts_with("xcl-pso")), "built on a thread that is not a worker");
+        assert!(wanted, "the build did not hear that a draw waits for it");
+        go.send(()).unwrap();
+        wait_built(standin);
+        assert_eq!(resolve_draw_with(standin, 1_000_001, ms(100)), (0x6001, false));
+        let _ = released(standin);
+    }
+
+    /// Two draws share one frame budget: what the first spent is gone for the second, and the
+    /// next frame has it again.
+    #[test]
+    fn the_frame_budget_is_shared_and_resets_on_the_next_frame() {
+        let _g = DRAW_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (a, b) = (0x7E57_DD11usize, 0x7E57_DD12usize);
+        let (go, finish) = mpsc::channel::<()>();
+        let finish = Arc::new(Mutex::new(finish));
+        for (s, real) in [(a, 0x6011), (b, 0x6012)] {
+            let finish = finish.clone();
+            submit_lazy(s, false, Box::new(move || {
+                let _ = finish.lock().unwrap().recv();
+                real
+            }), 0);
+        }
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_draw_with(a, 1_000_007, ms(60)), (a, true));
+        assert!(t.elapsed() >= ms(55) && t.elapsed() < ms(400), "the first waited {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_draw_with(b, 1_000_007, ms(60)), (b, true));
+        assert!(t.elapsed() < ms(15), "the second waited {:?} in a spent budget", t.elapsed());
+        // (the second never waited: it is not late and waits again in the next frame)
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_draw_with(b, 1_000_008, ms(60)), (b, true));
+        assert!(t.elapsed() >= ms(55), "a new frame has its budget again ({:?})", t.elapsed());
+        drop(go);
+        wait_built(a);
+        wait_built(b);
+        let _ = (released(a), released(b));
+    }
+
+    /// A draw that found the budget spent does not mark the pipeline late; one whose wait ran out does.
+    #[test]
+    fn a_spent_budget_does_not_mark_the_pipeline_late() {
+        let _g = DRAW_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let standin = 0x7E57_DD21usize;
+        let (go, finish) = mpsc::channel::<()>();
+        submit_lazy(standin, false, Box::new(move || {
+            let _ = finish.recv();
+            0x6021
+        }), 0);
+        let late = || entry(standin).unwrap().late.load(Ordering::Acquire);
+        assert_eq!(resolve_draw_with(standin, 1_000_021, std::time::Duration::ZERO), (standin, true));
+        assert!(!late(), "no wait ran, but the pipeline is late");
+        assert_eq!(resolve_draw_with(standin, 1_000_022, ms(30)), (standin, true));
+        assert!(late(), "the wait ran out, but the pipeline is not late");
+        go.send(()).unwrap();
+        wait_built(standin);
+        assert_eq!(resolve_draw_with(standin, 1_000_023, ms(30)), (0x6021, false));
+        let _ = released(standin);
+    }
+
+    /// A built pipeline is returned at once, a failed one is the stand-in and not "unbuilt".
+    #[test]
+    fn a_built_graphics_pipeline_is_returned_at_once() {
+        let _g = DRAW_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (built, failed) = (0x7E57_DD31usize, 0x7E57_DD32usize);
+        submit_lazy(built, false, Box::new(|| 0x6031), 0);
+        submit_lazy(failed, false, Box::new(|| 0), 0);
+        assert_eq!(resolve_draw_with(built, 1_000_031, ms(2000)), (0x6031, false));
+        assert_eq!(resolve_draw_with(failed, 1_000_031, ms(2000)), (failed, false));
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_draw_with(built, 1_000_031, std::time::Duration::ZERO), (0x6031, false));
+        assert_eq!(resolve_draw_with(failed, 1_000_031, std::time::Duration::ZERO), (failed, false));
+        assert!(t.elapsed() < ms(20), "{:?}", t.elapsed());
+        assert_eq!(resolve_draw_with(0x7E57_DDFF, 1_000_031, ms(10)), (0x7E57_DDFF, false), "no entry");
+        let _ = (released(built), released(failed));
+    }
+
     #[test]
     fn a_pipeline_a_submit_needs_is_built_before_the_queue() {
         let order = Arc::new(Mutex::new(Vec::new()));
@@ -1119,8 +1228,12 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
         }
         return r;
     }
-    let job = p.job.lock().unwrap().take();
+    // (a graphics pipeline is never built on this thread: a worker builds it, ahead of the queue)
+    let job = if p.compute { p.job.lock().unwrap().take() } else { None };
     let built_here = job.is_some();
+    if !p.compute && !already {
+        need_now(&p);
+    }
     let _open = (!already).then(|| OpenWait::new(pso, p.compute, built_here, started));
     if let Some(job) = job {
         complete(&p, job());
@@ -1138,6 +1251,99 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
         0 => p.stand(pso),
         r => r,
     }
+}
+
+/// Draw waits per shown frame, all threads together (`XCL_PSO_FRAME_WAIT_MS`, default 100;
+/// 0: a draw never waits).
+fn frame_wait_budget() -> std::time::Duration {
+    static B: OnceLock<std::time::Duration> = OnceLock::new();
+    *B.get_or_init(|| {
+        let ms = std::env::var("XCL_PSO_FRAME_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(100);
+        std::time::Duration::from_millis(ms)
+    })
+}
+
+/// (frames shown when the spending began, µs spent)
+static FRAME_SPENT: Mutex<(u64, u64)> = Mutex::new((0, 0));
+
+/// What is left of the frame budget `budget` for frame `frame` (it starts again when `frame`
+/// differs from the stored one).
+fn frame_allowance(frame: u64, budget: std::time::Duration) -> std::time::Duration {
+    let mut g = FRAME_SPENT.lock().unwrap();
+    if g.0 != frame {
+        *g = (frame, 0);
+    }
+    budget.saturating_sub(std::time::Duration::from_micros(g.1))
+}
+
+/// Adds `spent` to frame `frame` (ignored if a newer frame has started).
+fn frame_spend(frame: u64, spent: std::time::Duration) {
+    let mut g = FRAME_SPENT.lock().unwrap();
+    if g.0 > frame {
+        return;
+    }
+    if g.0 != frame {
+        *g = (frame, 0);
+    }
+    g.1 = g.1.saturating_add(spent.as_micros() as u64);
+}
+
+/// A title thread needs `p` now: wanted, and ahead of the workers' FIFO.
+fn need_now(p: &Arc<Pending>) {
+    p.want();
+    if !std::mem::replace(&mut p.demand.lock().unwrap().by_submit, true) {
+        NEEDED.lock().unwrap().push_back(p.clone());
+        let _ = queue().lock().unwrap().send(Box::new(|| ()));
+    }
+    p.sent.store(true, Ordering::Release);
+}
+
+/// The pipeline a draw or graphics ExecuteIndirect uses now, and whether it is not built (the
+/// stand-in). Never builds on the calling thread: it waits for a worker only inside the frame
+/// budget (`frame_wait_budget`), shared by all threads. A compute pipeline goes to `resolve_wait`.
+pub fn resolve_draw(pso: usize) -> (usize, bool) {
+    resolve_draw_with(pso, super::present::presents(), frame_wait_budget())
+}
+
+/// `resolve_draw` for frame `frame` with a frame budget of `budget` (what the frame's earlier
+/// waits left of it is waited at most).
+fn resolve_draw_with(pso: usize, frame: u64, budget: std::time::Duration) -> (usize, bool) {
+    let Some(p) = entry(pso) else { return (pso, false) };
+    if p.compute {
+        let r = resolve_wait(pso);
+        return (r, is_pending(pso));
+    }
+    p.note_use();
+    let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
+        0 => (p.stand(pso), false),
+        r => (r, false),
+    };
+    if p.real.load(Ordering::Acquire) != 0 || *p.done.lock().unwrap() {
+        return built(&p);
+    }
+    need_now(&p);
+    let mut allowance = frame_allowance(frame, budget);
+    if let Some(cap) = wait_budget() {
+        allowance = allowance.min(cap);
+    }
+    if allowance.is_zero() || p.late.load(Ordering::Acquire) {
+        return (p.stand(pso), true);
+    }
+    let started = std::time::Instant::now();
+    let done = {
+        let _held = Held::new();
+        let _open = OpenWait::new(pso, false, false, started);
+        let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), allowance, |d| !*d).unwrap();
+        *done
+    };
+    let took = started.elapsed();
+    frame_spend(frame, took);
+    note_blocked(false, false, took);
+    if done {
+        return built(&p);
+    }
+    p.late.store(true, Ordering::Release);
+    (p.stand(pso), true)
 }
 
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
@@ -1392,11 +1598,7 @@ pub fn is_pending(pso: usize) -> bool {
 /// workers' queue, as a wanted one.
 pub fn need_by_submit(pso: usize) {
     let Some(p) = entry(pso) else { return };
-    if !std::mem::replace(&mut p.demand.lock().unwrap().by_submit, true) {
-        p.want();
-        NEEDED.lock().unwrap().push_back(p);
-        let _ = queue().lock().unwrap().send(Box::new(|| ()));
-    }
+    need_now(&p);
 }
 
 /// (built in the background, failed, still building)
@@ -1409,20 +1611,20 @@ pub fn counts() -> (usize, usize, usize) {
 mod tests {
     use super::*;
 
-    /// A bind that waits for a lazy pipeline nobody has started builds it itself, and the time
+    /// A bind that waits for a lazy compute pipeline nobody has started builds it itself, and the time
     /// it was held up is counted under its kind (other tests wait too: increases are checked).
     #[test]
     fn a_wait_that_builds_the_pipeline_is_counted_with_its_time() {
         let standin = 0x7E57_8001usize;
         let before = blocked();
-        submit_lazy(standin, false, Box::new(|| {
+        submit_lazy(standin, true, Box::new(|| {
             std::thread::sleep(std::time::Duration::from_millis(50));
             0x4401
         }), 0);
         assert_eq!(resolve_wait(standin), 0x4401);
         let after = blocked();
-        let (b, a) = (before[0], after[0]);
-        assert!(a[WAITS] > b[WAITS], "the graphics wait is counted");
+        let (b, a) = (before[1], after[1]);
+        assert!(a[WAITS] > b[WAITS], "the compute wait is counted");
         assert!(a[BUILT_HERE] > b[BUILT_HERE], "built by the caller: nobody had started it");
         assert!(a[TOTAL_US] - b[TOTAL_US] >= 50_000, "its 50 ms are in the total");
         assert!(a[LONGEST_US] >= 50_000);
