@@ -11283,3 +11283,158 @@ are fork-only today (`report.rs:250`-`257`), so U4's `in_use()` and U7 would nee
 - Percentiles, per-queue or per-pass timings, DirectStorage throughput, draws per second.
 - A HUD in `graphics = "null"` or `present = "off"` runs (no window).
 - Changing the title bar text (it stays as it is).
+
+## 2026-11-26 Statistics overlay, refinement: the GPU tests share one WARP device; card name and title cuts (orchestrator approved; inside the approved design)
+
+### Review and measurements
+
+- **Symptom:** the overlay's GPU tests ended the test process with an access violation inside
+  `d3d10warp.dll` when run in parallel. Measured on the PC (Windows 11, WARP 10.0.26100.9818),
+  40 runs each: each GPU test alone 0 crashes; all four tests one at a time 0; all four in
+  parallel 6; the two drawing tests alone on two threads 5; the non-drawing GPU test with either
+  drawing test 0. Windows Error Reporting shows six different fault offsets in two clusters, so
+  it is not one instruction.
+- **Cause as far as it is established:** `D3D12CreateDevice` gives the process's one device per
+  adapter, so the tests do not each have their own device: two tests drawing through their own
+  queues on the one WARP device at the same time is what crashes. In the runtime the overlay has
+  one `HudDraw` per presenter on one queue, so two overlay draws on one device do not occur
+  outside the tests. Which WARP path faults is not established (no debugger on the PC).
+- **Orchestrator decisions:** the tests are serialised with a lock, as the repository's other
+  GPU tests are (`gpu/recomp/runner.rs:70-73`, `hle/d3d12x/vram.rs:1234`). The lock is ONE lock
+  for every test that draws on WARP: it is declared in `hle/d3d12x/present.rs` as
+  `#[cfg(test)] pub(super) static WARP_TEST_LOCK: std::sync::Mutex<()>` and taken by the existing
+  compositor test that draws on WARP (`compositor_blends_ui_plane_over_scene_plane`) as well as
+  the overlay's three GPU tests (this replaces the `WARP_LOCK` in `draw.rs` that section 4 below
+  names). The test that leaves a command list open closes it. The pixel shader clamps the glyph
+  index to the font's last entry. The two display rules of sections 5 and 6 are adopted as
+  written.
+- **Acceptance:** 40 parallel runs each of the overlay's draw tests alone and of the filters
+  `hud code_use config present::` together end with 0 abnormal exits.
+### 0. The fact that changes the picture
+
+The brief says each GPU test makes its own WARP device. It does not. `D3D12CreateDevice` returns
+the process's one device per adapter (documented D3D12 behaviour; the repo says so at
+`hle/d3d12x/real.rs:8678`: "D3D12CreateDevice gives the process's one device"). So the three GPU
+tests in `hud/draw.rs` share ONE `ID3D12Device`. Each has its own queue, allocator, list, fence,
+`HudDraw` and PSO. "Run in parallel" means several threads and several queues working on one
+WARP device at the same time.
+
+The control set does not test that. In `present.rs` only ONE test draws on WARP
+(`compositor_blends_ui_plane_over_scene_plane`, `present.rs:1730`). The other WARP test
+(`mapped_frame_dump_distinguishes_...`, `present.rs:1660`) only maps an upload buffer: no queue, no
+PSO, no draw. The other 7 tests use no GPU. So "present:: runs clean in parallel" says nothing about
+two concurrent drawers. (Also 0 of 20 at a 15 % rate has a 4 % chance by luck alone.)
+
+### 4. The fix, per cause
+
+- **A, B or C (a property of several tests using the one WARP device at once).** This is the
+  repository's known situation, and it handles it by serialising GPU tests that share the device:
+  `gpu/recomp/runner.rs:70-73` (one shared `Gpu` behind `static GPU: Mutex`, "access is serialised
+  by the mutex"), `hle/d3d12x/pso_async.rs:1333-1334` (`DRAW_LOCK`, "the draw tests ... one at a
+  time"), `hle/d3d12x/vram.rs:1234` (`VRAM_TEST_LOCK`). Same pattern here, in `draw.rs` `mod tests`:
+  ```rust
+  /// The GPU tests share the process's one WARP device (D3D12CreateDevice): one at a time.
+  static WARP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+  ```
+  and as the first line inside `unsafe {` of each of the three GPU tests:
+  `let _gpu = WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner());` (declared before `dev`, so it
+  is dropped after the device: the device's last release is inside the lock too). This does not
+  hide an overlay defect: in XCL the overlay has one `HudDraw` per presenter, used under the
+  presenter's lock on one queue, so two HUD draws on one device never happen outside these tests.
+  Say this in the commit body with the E1-E5 numbers. Expected after the fix:
+  `Loop 'hle::d3d12x::hud::draw::tests::' 4` and `Loop @('hud','code_use','config') 0` (default threads)
+  at 0 of 40.
+- **E1 shows the open list matters.** Also add `list.Close().unwrap();` at `draw.rs:424` (the lock
+  alone would cover it, but the test should not leave a list open).
+- **D (only if E2 points at a HUD call with the other tests idle).** It is a defect in `draw.rs`;
+  no lock. Send the `AV-PROBE` line back for a specific change; nothing in the current code is a
+  known fault site.
+
+### 5. Display refinement 1: the graphics card's name keeps its end
+
+Rule (vendor-neutral): when the name does not fit in the row, drop whole leading words until it
+fits; if one word is still too long, keep its last characters. Results at 21 columns:
+"NVIDIA GeForce RTX 5080" -> "GeForce RTX 5080"; "NVIDIA GeForce RTX 5090 Laptop GPU" ->
+"RTX 5090 Laptop GPU"; "AMD Radeon RX 7900 XTX" -> "Radeon RX 7900 XTX";
+"Intel(R) Arc(TM) A770 Graphics" -> "Arc(TM) A770 Graphics"; "Microsoft Basic Render Driver" ->
+"Basic Render Driver".
+
+Changes:
+- `hle/d3d12x/hud/layout.rs`, new function near `line` (ASCII only, as `FixedText` guarantees):
+  ```rust
+  /// The end of `s` that fits in `max` columns: leading words are dropped until the rest fits;
+  /// a single word longer than `max` keeps its last `max` characters.
+  fn tail_words(s: &str, max: usize) -> &str {
+      let mut rest = s.trim();
+      while rest.len() > max {
+          match rest.find(' ') {
+              Some(i) => rest = rest[i + 1..].trim_start(),
+              None => return &rest[rest.len() - max..],
+          }
+      }
+      rest
+  }
+  ```
+- `layout.rs:331` in `build_full`: `v.push_str(tail_words(st.gpu.as_str(), 21));` (the row's value
+  starts at column 7 of 28, so 21 stays the width).
+- `hle/d3d12x/hud/text.rs:152`: `gpu: FixedText<40>` -> `FixedText<128>` (DXGI's description is up
+  to 128 characters; at 40 the end, which is the part kept now, could be lost before the rule runs).
+  `sample.rs:215-216` (`find_adapter`) stays as is.
+- Tests in `layout.rs` `mod tests`:
+  - `gpu_name_keeps_its_end`: the five examples above, a name that fits unchanged, and one
+    26-letter word -> its last 21 letters.
+  - `gpu_row_shows_the_model_number`: `st.gpu = "NVIDIA GeForce RTX 5080"`, `built(.., Full, 1080)`;
+    the glyphs at y = `(MARGIN + 118) * 2` from x = `(MARGIN + PAD + 6 * 7) * 2` spell
+    "GeForceRTX5080" (spaces emit nothing).
+  - Existing `layout_never_exceeds_capacity` and `every_character_the_layout_prints_has_a_glyph`
+    keep passing unchanged.
+
+### 6. Display refinement 2: a long title is cut at a word, with "..."
+
+Rule: the title gets the columns between "XCL " and the uptime, with one free column before the
+uptime: `room = 28 - (len(uptime) + 1) - 4` (15 for "HH:MM:SS", 14 past 99 hours). If it fits,
+print it whole. Otherwise print the longest run of whole words that fits in `room - 3`, trailing
+`, : ; -` and spaces removed, then "..." ('.' is in the font). If the first word alone is longer,
+cut it at `room - 3` and add "...". "Grand Theft Auto V" -> "Grand Theft...";
+"Halo: The Master Chief Collection" -> "Halo: The..."; "Abc: Defghijklmnop" -> "Abc...".
+
+Changes:
+- `layout.rs`, new function:
+  ```rust
+  /// `s` in at most `max` columns: whole words and "..." when it does not fit (a first word
+  /// longer than the room is cut). Nothing when `max < 4` and `s` does not fit.
+  fn head_words<const N: usize>(out: &mut FixedText<N>, s: &str, max: usize) {
+      let s = s.trim();
+      if s.len() <= max {
+          return out.push_str(s);
+      }
+      if max < 4 {
+          return;
+      }
+      let room = max - 3;
+      let head = s[..room + 1]
+          .rfind(' ')
+          .map(|i| s[..i].trim_end_matches([' ', ',', ':', ';', '-']))
+          .filter(|h| !h.is_empty())
+          .unwrap_or(&s[..room]);
+      out.push_str(head);
+      out.push_str("...");
+  }
+  ```
+  (`s[..room + 1]` lets a word that ends exactly at `room` count.)
+- `layout.rs:220-224` in `build_full` becomes: make `up` first, then
+  ```rust
+  let room = 28usize.saturating_sub(up.len() + 1 + 4);
+  let mut tt = FixedText::<28>::new();
+  head_words(&mut tt, st.title.as_str(), room);
+  line(out, p, 4, 6, tt.as_str(), TEXT);
+  line(out, p, 28 - up.len() as u32, 6, up.as_str(), LABEL);
+  ```
+- Tests in `layout.rs` `mod tests`:
+  - `long_title_is_cut_at_a_word_with_dots`: the three examples above at 15; "Halo" unchanged;
+    "Supercalifragilistic" -> "Supercalifr..." ; result length always <= max; `max = 3` -> empty.
+  - `title_leaves_a_column_before_the_uptime`: `st.title = "Grand Theft Auto V"`, Full at 1080;
+    on the header row the last title glyph's right edge is at least one column (12 px) left of the
+    first uptime glyph.
+  - Existing `glyphs_advance_six_dots_and_skip_spaces` ("A B") and
+    `uptime_is_right_aligned_to_the_inner_edge` keep passing unchanged.
