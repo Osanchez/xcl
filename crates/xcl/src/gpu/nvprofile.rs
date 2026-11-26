@@ -103,9 +103,10 @@ struct Api {
 }
 
 fn api() -> Result<Api, String> {
-    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
     unsafe {
-        let lib = LoadLibraryW(windows::core::w!("nvapi64.dll")).map_err(|e| format!("no nvapi64.dll: {e}"))?;
+        // System32 only: `xcl nvprofile install` runs elevated, so the executable's own folder is not searched
+        let lib = LoadLibraryExW(windows::core::w!("nvapi64.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32).map_err(|e| format!("no nvapi64.dll in System32: {e}"))?;
         let qi = GetProcAddress(lib, windows::core::s!("nvapi_QueryInterface")).ok_or("no nvapi_QueryInterface")?;
         let qi: unsafe extern "C" fn(u32) -> *const c_void = std::mem::transmute(qi);
         let get = |id: u32| {
