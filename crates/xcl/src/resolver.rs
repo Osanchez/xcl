@@ -324,6 +324,7 @@ pub fn resolve_import(dll: &str, what: &ImportName, importer: &str, delay: bool)
             addr = crate::hle::d3d12x::guard::make_call_tracer(addr, format!("{key}!{what}"));
         }
     }
+    crate::report::telemetry_unresolved_import(&source, &key, &fname(what), importer, delay);
     RECORDS.lock().unwrap().push(ImportRecord {
         importer: importer.to_string(),
         dll: key,

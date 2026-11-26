@@ -365,6 +365,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         WM_CLOSE => {
             crate::xlog_info!("XCL window closed – ending the game process");
+            crate::report::telemetry_end("window_closed", Some(0));
             crate::report::write_final(None);
             crate::log::flush();
             windows::Win32::System::Threading::ExitProcess(0);

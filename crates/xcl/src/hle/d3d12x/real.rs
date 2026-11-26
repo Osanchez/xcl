@@ -7506,6 +7506,7 @@ pub fn log_device_removed() {
         return;
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    crate::report::telemetry_device_removed(e.code().0, &e.message().to_string());
     unsafe {
         let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
         if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
@@ -7522,6 +7523,7 @@ pub fn log_device_removed() {
             let va = pf.PageFaultVA;
             let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
             crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+            crate::report::telemetry_gpu_fault(va, &window, &names(pf.pHeadExistingAllocationNode), &names(pf.pHeadRecentFreedAllocationNode));
         }
         if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
             report_dred_lists(bc.pHeadAutoBreadcrumbNode, |node, done| {
@@ -7537,6 +7539,7 @@ pub fn log_device_removed() {
                     bound += &format!("; bound after it: {}", after.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
                 }
                 crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}{bound}", list, node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
+                crate::report::telemetry_gpu_fault_list(list as usize, done, count, &bound);
             });
         }
     }

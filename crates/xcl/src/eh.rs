@@ -109,6 +109,7 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             modules::describe_address(addr)
         );
         crate::xlog_error!("{msg}");
+        crate::report::telemetry_title_exception(rec.ExceptionCode as u32, addr, &msg);
         crate::report::write_final(Some(msg));
         crate::log::flush();
     }
@@ -135,6 +136,7 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
         } else {
             crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
         }
+        crate::report::telemetry_exit(status);
         crate::log::flush();
     }
     let orig: unsafe extern "system" fn(isize, i32) -> i32 = std::mem::transmute(ORIG_NT_TERMINATE.load(Ordering::Acquire));

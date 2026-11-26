@@ -114,6 +114,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                crate::report::telemetry_activity(d[0], mb(private as u64));
                 // `XCL_VRAM_HEADROOM_MB` (1024): local video memory that close to the budget warns
                 // (once a minute) – past the budget Windows moves video memory to system memory
                 if budget > 0 && local + (headroom_mb << 20) > budget && warned.is_none_or(|t: std::time::Instant| t.elapsed().as_secs() >= 60) {
@@ -182,6 +183,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
             std::thread::sleep(std::time::Duration::from_secs(secs));
             let (shown, presented) = crate::hle::d3d12x::present::counters();
             crate::xlog_info!("XCL_RUN_SECONDS: {secs} s – ending the title ({shown} frames shown, {presented} PresentX calls)");
+            crate::report::telemetry_end("run_seconds", Some(0));
             crate::report::write_final(None);
             crate::log::flush();
             crate::hle::d3d12x::real::end_title(0);
@@ -218,6 +220,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
         Ok(m) => m,
         Err(e) => {
             crate::xlog_error!("loading the game failed: {e}");
+            crate::report::telemetry_load_failed(&e);
             crate::report::write_final(Some(format!("loader: {e}")));
             return 0x7C1_0002;
         }
@@ -226,6 +229,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::report::write_final(None);
     let code = crate::loader::run_main(&main);
     crate::xlog_info!("game entry point returned code {code}");
+    crate::report::telemetry_end("entry_returned", Some(code as i64));
     crate::report::write_final(None);
     crate::log::flush();
     code as i32

@@ -287,6 +287,17 @@ struct Manifest {
     switches: BTreeMap<String, String>,
     started: String,
     events_dropped: u64,
+    /// `window` | `headless` | `skip`
+    present_mode: String,
+    window_size: String,
+    loop_budget: u32,
+    loop_counters: bool,
+    /// `wave_lane_count_max == 32`: the 64-lane waves are split in two
+    split_wave64: Option<bool>,
+    /// switches that change generated code or presentation, `NAME=value`
+    diagnostic: Vec<String>,
+    /// the same joined by `,`; `""` for a normal run (runs are compared only when equal)
+    compare_key: String,
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -344,6 +355,8 @@ pub fn telemetry_start(boot: &crate::config::Boot) {
 /// The manifest of a run at its start (device and DXC fields still null).
 fn new_manifest(boot: &crate::config::Boot, run_id: &str, tier: Tier, started: &str, switches: BTreeMap<String, String>, commit: Option<String>) -> Manifest {
     let (major, minor, build) = crate::hle::kernelx::host_os_version();
+    let (diagnostic, compare_key) = run_tel::diagnostic_switches(&switches);
+    let (ww, wh) = boot.config.window_size();
     Manifest {
         schema: 1,
         run_id: run_id.to_string(),
@@ -366,6 +379,12 @@ fn new_manifest(boot: &crate::config::Boot, run_id: &str, tier: Tier, started: &
         switches,
         started: started.to_string(),
         events_dropped: 0,
+        present_mode: present_mode_name().to_string(),
+        window_size: format!("{ww}x{wh}"),
+        loop_budget: crate::gpu::recomp::loop_budget(),
+        loop_counters: false,
+        diagnostic,
+        compare_key,
         ..Default::default()
     }
 }
@@ -433,6 +452,7 @@ pub fn telemetry_device(adapter: &str) {
         m.vram_mb = vram;
         m.wave_lane_count_min = waves.map(|w| w.0);
         m.wave_lane_count_max = waves.map(|w| w.1);
+        m.split_wave64 = waves.map(|w| w.1 == 32);
     });
 }
 
@@ -463,6 +483,15 @@ pub fn telemetry_shader_refused(reason: &str) {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     let Some(n) = xlog::sampled(&COUNT) else { return };
     xlog::event(Tier::Frame, "shader_refused", &shader_refused_fields(reason, n));
+    let (stage, hresult) = refusal_parts(reason);
+    let hr = hresult.and_then(|h| u32::from_str_radix(h.trim_start_matches("0x"), 16).ok()).map(|v| v as i32);
+    let mut extra: Vec<(&'static str, serde_json::Value)> = Vec::new();
+    if let Some(s) = stage {
+        extra.push(("stage", s.into()));
+    }
+    extra.push(("reason", reason.into()));
+    extra.push(("n", n.into()));
+    telemetry_error(ErrKind::ShaderRefused, "shader", "console shader not translated", hr, false, &extra);
 }
 
 /// A PSO the driver refused (`real::note_fallback`); `standin_built`: the stand-in pipeline was made.
@@ -473,6 +502,13 @@ pub fn telemetry_pipeline_refused(what: &str, hr: i32, standin_built: bool) {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     let Some(n) = xlog::sampled(&COUNT) else { return };
     xlog::event(Tier::Frame, "pipeline", &pipeline_fields(what, hr, standin_built, n));
+    let mut extra: Vec<(&'static str, serde_json::Value)> = Vec::new();
+    if let Some(s) = ["graphics", "compute", "stream"].into_iter().find(|s| what.contains(s)) {
+        extra.push(("stage", s.into()));
+    }
+    extra.push(("standin", standin_built.into()));
+    extra.push(("n", n.into()));
+    telemetry_error(ErrKind::PipelineRejected, "d3d12", "pipeline refused by the driver", Some(hr), false, &extra);
 }
 
 /// The `XCL_STALL_DUMP` watcher fired: the run ends right after.
@@ -481,6 +517,8 @@ pub fn telemetry_stall(last_frame: u64, idle_s: f64, limit_s: f64) {
         return;
     }
     xlog::event(Tier::Frame, "stall", &stall_fields(last_frame, idle_s, limit_s));
+    let extra: [(&'static str, serde_json::Value); 3] = [("last_frame", last_frame.into()), ("idle_s", idle_s.into()), ("limit_s", limit_s.into())];
+    telemetry_error(ErrKind::Timeout, "stall_dump", "no frame presented", None, true, &extra);
 }
 
 /// A stub was called: written at its 1st, 10th, 100th ... call.
@@ -755,10 +793,11 @@ mod telemetry_tests {
         for k in [
             "schema", "run_id", "xcl_version", "commit", "commit_source", "dirty", "rust", "profile", "os", "cpu", "cores", "threads", "ram_mb", "adapter", "driver",
             "vram_mb", "wave_lane_count_min", "wave_lane_count_max", "dxc", "title", "title_version", "exe", "log", "tier", "switches", "started", "events_dropped",
+            "present_mode", "window_size", "loop_budget", "loop_counters", "split_wave64", "diagnostic", "compare_key",
         ] {
             assert!(o.contains_key(k), "manifest lacks {k}");
         }
-        assert_eq!(o.len(), 27);
+        assert_eq!(o.len(), 34);
         assert_eq!(o["schema"], 1);
         assert!(o["commit"].is_null() && o["commit_source"].is_null() && o["dirty"].is_null() && o["rust"].is_null());
         assert!(o["cores"].is_null() && o["adapter"].is_null() && o["title_version"].is_null());

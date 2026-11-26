@@ -282,6 +282,7 @@ impl Vfs {
                     let mut u = self.unmapped.lock().unwrap();
                     if u.len() < 1000 && u.insert(p.clone()) {
                         crate::xlog_warn!("[VFS] unmapped console path: {p}");
+                        crate::report::telemetry_vfs_unmapped(&p);
                     }
                     return Target::Pass;
                 }
