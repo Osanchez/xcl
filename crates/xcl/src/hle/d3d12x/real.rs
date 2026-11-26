@@ -566,6 +566,7 @@ pub fn init() -> Result<String, String> {
         }
         open_uma(&device);
         super::device_x::probe_dynamic_depth_bias(&device);
+        super::removal::arm(&device);
         let raw = device.into_raw(); // one reference kept for the process lifetime
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
@@ -7966,7 +7967,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
     if n == 0 || lists.is_null() {
         f(this, n, lists);
-        stop_if_device_removed();
+        stop_if_device_removed(this, "execute");
         return;
     }
     // from here to the end: XCL's uploads and tile mappings before the lists, then the driver's
@@ -8001,7 +8002,8 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
     super::present::note_execute(this, &mapped);
-    stop_if_device_removed();
+    super::removal::after_execute(this, &mapped, crate::report::telemetry_last_seq());
+    stop_if_device_removed(this, "execute");
 }
 
 /// Wait (up to 10 s) until the GPU has finished the work submitted to the queues console code
@@ -8227,22 +8229,40 @@ mod dred_tests {
         assert_eq!(device_state_text(D3D12_DRED_DEVICE_STATE_FAULT), "fault");
         assert_eq!(device_state_text(D3D12_DRED_DEVICE_STATE_PAGEFAULT), "pagefault");
     }
+
+    #[test]
+    fn log_once_blocks_second_caller() {
+        use std::sync::atomic::AtomicBool;
+        static FINISHED: AtomicBool = AtomicBool::new(false);
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        let first = std::thread::spawn(|| {
+            once_report(|| {
+                STARTED.store(true, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                FINISHED.store(true, Ordering::SeqCst);
+            })
+        });
+        while !STARTED.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        once_report(|| panic!("the body runs once"));
+        assert!(FINISHED.load(Ordering::SeqCst), "the second caller returned before the first one finished");
+        first.join().unwrap();
+    }
 }
 
 /// If the device was removed: the reason, DRED's page fault (address, the allocations around
 /// it) and the operations each command list got to – into the log, once.
 pub fn log_device_removed() {
-    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let raw = device_raw();
     let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
     let Err(e) = (unsafe { dev.GetDeviceRemovedReason() }) else { return };
-    if DONE.swap(true, Ordering::AcqRel) {
-        return;
-    }
+    // the fence callback (a pool thread) and the submitting thread can both get here: the second
+    // blocks until the first has written the whole report
+    once_report(|| {
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
-    crate::report::telemetry_device_removed(e.code().0, &e.message().to_string());
-    unsafe {
-        let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
+    let state = (|| unsafe {
+        let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return "unavailable" };
         let dred1 = dev.cast::<ID3D12DeviceRemovedExtendedData1>().ok();
         let dred2 = dev.cast::<ID3D12DeviceRemovedExtendedData2>().ok();
         let state = dred2.as_ref().map_or("unavailable", |d| device_state_text(d.GetDeviceState()));
@@ -8315,7 +8335,24 @@ pub fn log_device_removed() {
             }
         }
         crate::report::telemetry_dred_summary(state, lists, fault.as_ref().map(|f| f.0));
-    }
+        state
+    })();
+    let code = super::code_use::removal_line();
+    let code_fields = match code {
+        Some((line, fields)) => {
+            crate::xlog_error!("{line}");
+            fields
+        }
+        None => Vec::new(),
+    };
+    crate::report::telemetry_device_removed_full(e.code().0, &e.message().to_string(), state, super::removal::report(), code_fields);
+    });
+}
+
+/// The body of `log_device_removed` runs once; a second caller returns only after it has finished.
+fn once_report(f: impl FnOnce()) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(f);
 }
 
 /// The summary of DRED's lists and a line for each list that did not finish.
@@ -8358,10 +8395,11 @@ unsafe fn log_dred_lists<N: DredNode>(head: *const N) -> (usize, usize, usize) {
 /// The GPU hung or the device was removed: the title is stopped at once (a title that goes on
 /// submitting work to a hung device can keep the driver from recovering), with the reason in
 /// the log and the report.
-pub fn stop_if_device_removed() {
+pub fn stop_if_device_removed(queue: *mut c_void, site: &'static str) {
     let raw = device_raw();
     let Some(dev) = (unsafe { ID3D12Device::from_raw_borrowed(&raw) }) else { return };
     if let Err(e) = unsafe { dev.GetDeviceRemovedReason() } {
+        super::removal::detected_at(site, queue);
         log_device_removed();
         let msg = format!("the D3D12 device was removed ({:#x}: {}) – the title is stopped", e.code().0 as u32, e.message());
         crate::xlog_error!("{msg}");

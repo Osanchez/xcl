@@ -2048,6 +2048,12 @@ pub fn telemetry_execute(queue: *mut c_void, lists: &[*mut c_void], submit: impl
     tel.execute(queue, lists, origin, submit, &mut global_sink);
 }
 
+/// The number of the last submission `telemetry_execute` stamped (`None` before the first, or
+/// with the engine off).
+pub(crate) fn telemetry_last_seq() -> Option<u64> {
+    GPU.get()?.seq.load(Ordering::Relaxed).checked_sub(1)
+}
+
 /// The engine, once started.
 pub(super) fn gpu() -> Option<&'static GpuTel> {
     GPU.get()

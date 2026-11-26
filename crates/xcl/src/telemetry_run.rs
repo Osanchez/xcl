@@ -207,6 +207,44 @@ pub fn telemetry_device_removed(hr: i32, message: &str) {
     telemetry_error(ErrKind::DeviceRemoved, "d3d12", "device removed", Some(hr), true, &[("message", message.into())]);
 }
 
+/// pure: the fields of the `device_removed` event.
+fn device_removed_fields(
+    hr: i32,
+    message: &str,
+    device_state: &str,
+    removal: Vec<(&'static str, serde_json::Value)>,
+    code: Vec<(&'static str, serde_json::Value)>,
+) -> Vec<(&'static str, serde_json::Value)> {
+    let mut f: Vec<(&'static str, serde_json::Value)> = vec![("hresult", super::hresult_text(hr).into()), ("message", message.into()), ("device_state", device_state.into())];
+    f.extend(removal);
+    f.extend(code);
+    f
+}
+
+/// `device_removed` first, then `fatal` (the `error` event and the `end` it writes).
+fn device_removed_in_order(emit: &mut dyn FnMut(&'static str, Vec<(&'static str, serde_json::Value)>), fields: Vec<(&'static str, serde_json::Value)>, fatal: impl FnOnce()) {
+    emit("device_removed", fields);
+    fatal();
+}
+
+/// `log_device_removed`, last: one `device_removed` event with the DRED state, the removal's
+/// moment, site and queues, and the code in use; then the fatal `error`, which writes `end`.
+pub fn telemetry_device_removed_full(
+    hr: i32,
+    message: &str,
+    device_state: &str,
+    removal: Vec<(&'static str, serde_json::Value)>,
+    code: Vec<(&'static str, serde_json::Value)>,
+) {
+    if !crate::log::telemetry_on(crate::log::Tier::Frame) {
+        return;
+    }
+    let fields = device_removed_fields(hr, message, device_state, removal, code);
+    device_removed_in_order(&mut |ev, f| crate::log::event(crate::log::Tier::Frame, ev, &f), fields, || {
+        telemetry_error(ErrKind::DeviceRemoved, "d3d12", "device removed", Some(hr), true, &[("message", message.into())])
+    });
+}
+
 /// DRED's page fault after a device removal (`va` is written as hex text).
 pub fn telemetry_gpu_fault(va: u64, window: &str, allocations: &str, freed: &str) {
     if !crate::log::telemetry_on(crate::log::Tier::Frame) {
@@ -469,6 +507,20 @@ mod telemetry_p5b_tests {
             assert_eq!(f[3].1, false);
             assert_eq!(f[4].1, true);
         }
+    }
+
+    #[test]
+    fn device_removed_event_precedes_end() {
+        let mut seen: Vec<&'static str> = Vec::new();
+        let fields = device_removed_fields(0x887A0005u32 as i32, "m", "hung", vec![("site", "execute".into())], vec![("code_in_use_bytes", 1.into())]);
+        assert_eq!(keys(&fields), ["hresult", "message", "device_state", "site", "code_in_use_bytes"]);
+        assert_eq!(fields[0].1, "0x887A0005");
+        let mut events: Vec<&'static str> = Vec::new();
+        device_removed_in_order(&mut |ev, _| events.push(ev), fields, || seen.push("error"));
+        // the fatal error writes `end` straight after itself (`telemetry_error`)
+        seen.push("end");
+        events.extend(seen);
+        assert_eq!(events, ["device_removed", "error", "end"]);
     }
 
     #[test]
