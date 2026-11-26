@@ -7939,3 +7939,731 @@ likely to fail without prewarm.
 | D20 | 9.3 item 4, Q6 | measure the EXEC-emulation share | not measured | needs a translator switch, which is out of scope |
 | D21 | 3.3 | every pipeline state object, graphics and compute | mesh/stream pipelines counted, not recorded or prewarmed | their replay needs the stream path; v1 covers VS/PS/GS graphics and compute |
 | D22 | 6.2, AC5 | precache priority P2 | existing preload threads stay; their count rises from 3 to 7 on the PC (Proposed) | AC5 arithmetic (section 4.D) |
+
+## 2026-11-26 Ray tracing: on/off toggle for the whole chain, leave-out switch, loop-work bound per dispatch (user approved all; default "off until proven")
+
+### 0. Approval and orchestrator review
+
+- **User decisions (2026-11-26):** "Approve all": build U1-U3 first and run with ray tracing off,
+  then the loop cap, the on path and the hit checks. Default of `raytracing = "auto"`: "Off until
+  proven" (the chain is left out until acceptance run R4 passes; a later one-line change flips it).
+- **Why this design exists:** run 16 (every used compute pipeline prebuilt, 0 draws and 0
+  dispatches left out) lost the device 3-4 s into the scene; runs with fewer compute passes
+  running lasted longer. The title's passes hang the GPU when they run.
+- **Citations spot-checked by the orchestrator at 2265e889:** `gpu/effects.rs:27-79` (`of`
+  decodes the whole program; `Effects` is filled per instruction), `gpu/effects.rs:97-105`
+  (`BIG_CODE`, `big_and_image_only`), `config.rs:250-257` and `:281-291` (tier override and its
+  parser), `hle/d3d12x/real.rs:6354-6370` (`create_compute_pso`, `attempt`, `own_compute`,
+  `go_background`), `hle/waits.rs:83-92` (`caller`), `tests/console_dlls_e2e.rs:628` (the builder
+  constructor symbol), `telemetry_gpu.rs:2254-2264` (`COUNT_NAMES`, 33 names, `reserved_0`),
+  `hle/d3d12x/pso_async.rs:18-42` (`Pending`). All hold.
+- **Refinements made in review (inside the approved design):**
+  - U1: a loop is `rdna2::branch_target(d).is_some_and(|t| t <= d.pc)` (`branch_target` already
+    returns the far target when there is one, `gpu/rdna2.rs:588-591`).
+  - U2 names "`modules::find_export` style lookups"; no such function exists. The lookup is
+    `modules::mapped_modules()` + `resolver::resolve_export_of_mapped`; the designer pins the
+    exact calls and the seam in a refinement entry before U2 is routed.
+  - U2/U3/U8: a pipeline made from the cache has no `Pending` entry, so a role kept only in
+    `Pending` is lost for it. Where roles live and when they are dropped goes back to the
+    designer before U2 is routed.
+  - R1 needs the consumer list, which U4's pack-tool option generates: R1 runs after U2 and U4.
+- **Title data:** nothing in this entry or in the code built from it names a title's shaders or
+  record keys. Lists of a title's programs live in the title's data folder on the user's machine.
+- **Evidence status:** correlation over runs 10-16 on one machine (RTX 5080 16 GB, driver
+  32.0.16.2140, Windows 11). Not tested on AMD. Which programs hang the GPU is not yet known.
+
+Design for the dev branch at 2265e889. Written on macOS: nothing here was built or run. All
+`path:line` references are under `crates/xcl/src/` unless they say otherwise. Run facts cite
+`events.jsonl` / `log.txt` lines of runs 13-15 (read here) and run 16 (facts the orchestrator
+sent; its folder was not on this machine).
+
+### 1. Summary (recommendation first)
+
+**Run 16 changes the picture.** With every compute pipeline prebuilt and nothing left out
+(log: "65536 dispatches (0 skipped)"), the device was lost 3-4 s into the scene. Runs where
+fewer passes ran lasted longer (runs 10/11: 600-900 s, most compute never built; run 15:
+16 s; run 16: 3-4 s). So the title's passes hang the GPU **when they run**. A left-out
+producer (reading a) is not the main cause. The cause is (b) wrong inputs on our runtime, or
+(c) work that is too long as XCL emulates it. Both show up as loops that run to the guard.
+
+**Recommendation, in build order:**
+
+1. **G1 + A together (units U1-U3): ray tracing OFF and a leave-out switch. No shader change, so
+   the cache stays warm.** The `raytracing` setting (`xcl.toml`, `XCL_RAYTRACING`) gets a second
+   job. `off` now also leaves out the whole ray-tracing chain:
+   - the title's acceleration-structure builds (pipelines made by the console BVH builder
+     module);
+   - every trace program (a program whose code has `IMAGE_BVH*_INTERSECT_RAY`; the translator
+     can see this);
+   - the consumers named in a list on the user's machine.
+
+   The same machinery serves `XCL_LEAVE_OUT` / `leave_out`, which leaves out chosen programs by
+   record key, name pattern or class (`class:trace`, `class:build`, `class:consumer`,
+   `class:loops`). Dispatches that are left out go through the existing skip path and are
+   counted under new reasons. **This is the first picture: run 17 with `raytracing=off`.**
+2. **D (one run each, no rebuild):** find which programs hang. Leave out `class:trace`, then
+   the consumer list, then `class:loops` (section 5.D).
+3. **B + E + G2 (units U5-U7): one shader-text change, so one cold rebuild.**
+   - B: a loop budget per dispatch, passed in an io word: lanes x budget <= 2^28, with a floor
+     of 1,024 passes per lane.
+   - E: the loop-guard trip counter always compiled in and switched by the io word. Trips can
+     then be counted in any run without a rebuild.
+   - G2: the BVH emulation returns a miss on unmapped memory (as upstream #2542) and moves into
+     its own prelude.
+
+   **With ray tracing ON, B is a precondition, not a safety net:** run 16 shows that the passes
+   as they run today hang the GPU.
+4. **G3 (unit U8): ray tracing ON with a per-frame chain gate.** The chain runs in a frame only
+   when every builder, trace and producer pipeline is built and none of them was left out
+   earlier in that frame. Otherwise all of its consumers are left out for that frame.
+5. **G4 (unit U9): checks that the hits are right.** A structural check of the acceleration
+   structure, per-module slot counts for the builder, and the existing BVH GPU tests run on the
+   32-lane PC (they run there; they do not print SKIPPED: section 3).
+
+**Defaults:**
+- `raytracing = "auto"`. On a machine where the chain is not proven, `auto` means chain
+  **off**. A later one-line PR makes `auto` mean "on with the gate" once acceptance run R4
+  passes.
+- `XCL_PSO_IMAGE_SKIP` stays on.
+- B stays on by default once it has landed.
+
+### 2. Goal and scope
+
+**In scope:**
+- The ray-tracing toggle, with its OFF and ON semantics and how chain parts are recognised.
+- The leave-out switch.
+- A per-dispatch loop-work bound on the HLSL and direct DXIL paths.
+- The telemetry these need: per-frame chain counters, loop trips without a rebuild, and the last
+  dispatches written from the CPU side when the device is removed.
+- The run plan.
+
+**Out of scope:**
+- Making the emulated traversal faster.
+- Clearing a left-out consumer's outputs to "no hit" values (rejected in section 5.G).
+- Bounding a whole frame's GPU time.
+- ExecuteIndirect argument clamps (#1795, not adopted).
+- Graphics-shader loop budgets (they keep 65,536).
+- Hooking `BuildRaytracingAccelerationStructure`.
+- Any title data in the repository.
+
+### 3. What exists today (verified)
+
+| Fact | Where |
+|---|---|
+| `raytracing` / `XCL_RAYTRACING` (`auto`/`off`/`tier1_0`/`tier1_1`) only sets the tier `CheckFeatureSupport(OPTIONS5)` reports | `config.rs:52-56`, `:183`, `:250-257`, `:281-291`; used at `hle/d3d12x/real.rs:3048`, `null.rs:419` |
+| Loop guard: 65,536 passes per lane, all loops together; `XCL_LOOP_BUDGET` changes it, and a translation made with it set is not cached | `gpu/recomp/mod.rs:645-652`, `:665-674`, `:690-692`; `gpu/recomp/pso.rs:922-925`; prelude `gpu/recomp/emit.rs:4861-4865`, `:6381-6382` |
+| Direct DXIL backend has its own budget slot | `gpu/dxil/compact.rs:240`, `:303-316`; `gpu/dxil/lower.rs` `LOOP_BUDGET` |
+| io words: `KERNEL_SGPRS` 128, used slots 110-112 and 120 (loop counter); 113-119 free on dev | `gpu/recomp/mod.rs:100`, `:204-208` |
+| io words are written per dispatch on the CPU, into the list's UMA arena | `hle/d3d12x/bind.rs:1083-1089`; `console_list.rs:902` |
+| Image-only rule: >= 16 KiB of code and writes only images, on unless `XCL_PSO_IMAGE_SKIP=0`; it targets the ray-tracing resolve programs, which "write no buffer" | `gpu/effects.rs:97-105`; `hle/d3d12x/pso_async.rs:2897-2914`; decided at `real.rs:6258`, `:6275-6277` |
+| `effects::of` already decodes the whole program, so a `traces`/`loops` flag costs one more comparison per instruction | `gpu/effects.rs:27-79` |
+| Quarantine by shader key (`shaders_key`, not the record) | `pso_async.rs:303-314`, `:113-120`; `real.rs:6003-6009` |
+| Reasons a pipeline is unbuilt, and the dispatch skip counters (33 slots, `reserved_0` free) | `pso_async.rs:208-262`; `telemetry_gpu.rs:2253-2321` |
+| Skip sites already count by reason: direct dispatch, ExecuteIndirect, console lists | `bind.rs:905-930`, `:299`, `:330`; `console_list.rs:890` |
+| Deferred dispatches replay through `bind::dispatch` | `list_x.rs:2763` |
+| Record key = `fnv64` of the console CS bytes (what `pipeline_bind.records` shows) | `telemetry_gpu.rs:2609-2615` |
+| Ray-tracing SRVs: an in-UMA acceleration-structure SRV gets an RDNA2 BVH descriptor; outside UMA it gets an empty one and a warning. Runs 13-15 log no such warning | `real.rs:2251-2265` |
+| Trace emulation: `bvh_intersect` is in `PRELUDE_MEM`, which every memory-using program gets; instance nodes are left to the shader | `emit.rs:2520-2555`, `:4893`, `:6046-6050` |
+| XCL's own builder now has instance nodes and a top level (the HANDOFF "missing" note at HANDOFF.md:248-253 is old). The title uses its own builder DLL instead, and `BuildRaytracingAccelerationStructure` is not hooked (it appears only in the layout tables) | `gpu/bvh.rs:18`, `:85`, `:98`; `hle/d3d12_layout.rs:57-66` |
+| Builder list methods of the older layout: #146 UAV barrier, #148 AllocateUploadMemory. The newer-layout remap table does not include them | `real.rs:1047-1049`; `NEWER_LIST_SLOTS` `real.rs:7728` |
+| Unmodelled methods in run 14 (`report.json` `called_stubs`): list #126 is RSSetShadingRate on the newer layout (comment at `real.rs:7725-7727`); allocator #9 registers the title's command-memory callback (HANDOFF.md:1754); list #142 and queue #31 are not named anywhere in the source. None was first called from the builder module (every `first_caller` is the game exe) | run14 `report.json` |
+| Culprit markers sit in a persistently mapped readback buffer, but are read only on a watchdog release | `hle/d3d12x/culprit.rs:1-13`, `:180`, `:269-300`; caller `list_x.rs:1670` |
+| Device-removed telemetry hook | `telemetry_run.rs:202-208` |
+| The BVH GPU tests use `gpu_ready()`, which accepts a 32-lane-only GPU, so `gpu_bvh_intersect_ray`, `gpu_built_bvh_nodes_match_the_cpu_node_test` and `gpu_triangle_pair_and_box16_nodes` run on the RTX 5080 | `gpu/recomp/tests.rs:13-22`, `:5003`, `:5279`, `:5349`; `runner.rs:562-566` |
+| `xbox_bvh_builder_builds_on_the_gpu` needs `XCL_SAMPLE_DLLS`, `XCL_CONSOLE_LISTS=1` and `XCL_PROBE_BVH_GPU=1`; otherwise it returns at once (counted as passed) | `tests/console_dlls_e2e.rs:614-620` |
+| Console lists are opt-in. In the retail runs the title and the builder record through `title_list` (inline writes become method calls), not `console_list` | `console_list.rs:48-51`; `device_x.rs:95-121`; `title_list.rs:1-14` |
+| Names: the container parser has no name. The pack tool's name comes from the pack index | `gpu/xbox.rs:163-175`; `shaders.rs:721`. `gpu/shader.rs:19` knows the `ILDN` part fourcc; no parser reads it |
+
+**Run facts that bear on the suspect program:**
+- It finished building 12 s before the loss in run 13 (`pipeline` id 5440 at 223.0 s, bind 5441)
+  and 22 s before it in run 14 (cache, bind 5625 at 265.4 s).
+- **It does not appear in any sampled `pass` event after its bind.** In run 13, bind 5441 is
+  absent through frame 2460 (the loss was at frame 2487). In run 14, bind 5625 is absent from
+  frames 2610 and 2640, while the later binds 5627 and 5629 do appear in frame 2610. Passes are
+  sampled one frame in 30.
+- So the suspect runs rarely, or only in the final frames. The timing alone does not convict it.
+- Its `shape` record says `split:false, wave64:false, group_threads:32`: a native 32-lane
+  program, not the split form. Its `seen` record says `split:true`, which contradicts this.
+- The longest sampled single dispatches in run 14 are 54-70 ms (pass events, bind 4440, frames
+  2460-2640) and grow over time. That program has 0 loops.
+
+### 4. Readings (a)-(c), ranked
+
+| Rank | Reading | Evidence |
+|---|---|---|
+| 1 | **(b) wrong inputs make loops run to the guard.** Concrete mechanisms: (b1) the BVH emulation reads unmapped or zero memory, and zero nodes look like a box whose child is node 0, so the traversal never ends (upstream #2542 states this); (b2) the builder's barrier and upload calls on the newer layout land on the wrong handlers (#146/#148 are not remapped); (b3) wave32 cross-lane errors in trace or consumer code; (b4) unknown list #142 (33,515 calls) | Run 16: the loss comes faster the more passes run. The upstream 4060 Ti tester's culprit was a screen-probe filter downstream of a BVH trace pass, with loop bounds read from memory. Today's guard allows 65,536 passes per lane, which is about 10^11 lane-passes for a full-screen dispatch: seconds of GPU time |
+| 2 | (c) correct data, but legitimately long as emulated (software traversal per lane; split programs) | Single dispatches of 54-70 ms with no loops (run 14). Twice the dispatch rate in run 16. Cannot be told apart from (b) without trip counts |
+| 3 | (a) a left-out producer | Run 16 left nothing out and still lost the device. It may still add hangs in runs 13-15 (run 15: `dispatch_skip_image_only` 28, `ei_after_skipped_dispatch` 216 in its last `frame` event) |
+
+**What run 16 means:** (a) is not needed to explain the loss, and (b)/(c) remain. Telling (b)
+from (c) needs per-dispatch loop trips (E). A trip under a budget that a correct program never
+reaches means (b). A dispatch that is long with no trips means (c).
+
+### 5. Decisions
+
+#### G. The ray-tracing toggle
+
+**Switch.** Extend the existing setting rather than add a new one. Users ask for one ray-tracing
+switch, and reporting tier 0 when the chain is off is consistent with it.
+
+| Value | Tier reported | Chain |
+|---|---|---|
+| `off` / `none` / `0` | 0 (as today) | left out |
+| `on` (new) | host tier | runs, behind the gate (G3) |
+| `tier1_0` / `tier1_1` | as today | runs, behind the gate |
+| `auto` (default) | host tier (as today) | left out until `rt_proven()` is true. In this release `rt_proven()` is a constant `false`; U8's follow-up changes it after acceptance run R4 |
+
+`XCL_RAYTRACING` overrides `xcl.toml` as today. The new pure function is
+`config::parse_raytracing_chain(mode) -> ChainMode { Off, On }` (`auto` maps to `Off` while
+`rt_proven()` is false). The log line, once:
+`ray tracing: chain off (raytracing=auto); set raytracing=on to run it`.
+
+**Recognising each part (no title data in the repository).**
+
+| Part | Rule | Why |
+|---|---|---|
+| Builder | a compute pipeline made by a call whose first return address in a mapped image (the `hle/waits.rs:86-92` pattern) lies in the module that exports the console BVH builder constructor (the symbol already used by `tests/console_dlls_e2e.rs:629`, an SDK library name, not title data) | Exact, and cheap (pipeline creation is not hot) |
+| Trace | `Effects.traces`: the program has `IMAGE_BVH_INTERSECT_RAY` or `IMAGE_BVH64_INTERSECT_RAY` | The translator knows this. HANDOFF.md:208 counts 8 such programs for this title |
+| Producer / consumer | a list on the user's machine: `raytracing_chain` in `xcl.toml` and/or the env `XCL_RT_CHAIN`, `@file` allowed; lines `<16-hex record> [producer\|consumer]` or `name:<glob> [role]` (default role consumer) | No program property marks a resolve or activation program: resolve programs are only "image-only and big" (`effects.rs:102`), and the suspect is neither |
+| Acceleration-structure views | counted only (`as_srv` counter at `real.rs:2251`) | The title may write BVH descriptors itself, and runs 13-15 show no SRV warning; not reliable as a rule |
+
+Resource-dependency discovery was rejected: the title is bindless, and XCL does not know a
+dispatch's writes without walking its descriptors (cf. `trace_fullscreen`, `bind.rs:938`).
+
+The list file is produced locally by a new pack-tool option (U4):
+`xcl shaders <pack> --list-records <glob> [--role consumer] > %LOCALAPPDATA%\XCL\<title>\rt-chain.txt`.
+It reads the pack index names (`shaders.rs:721`) and writes record keys. Name rules at run time
+need the name inside the container. U4 adds `xbox::debug_name(blob)`, which reads an `ILDN` part
+when one is present. If the title's containers have none, `name:` rules match nothing, and a
+warning is logged once. Record-key rules always work.
+
+**OFF.** Builder, trace and producer/consumer pipelines are flagged left out when they are made:
+- they are never built (no compile time, which spares about a thousand large resolve builds);
+- their dispatches skip through the existing path and count as `dispatch_skip_rt_off`.
+
+What the picture loses: ray-traced shadows, reflections and screen-probe lighting from traced
+rays. Consumers' output images keep stale or undefined contents (possible artifacts, never a
+hang).
+
+No clearing in v1, for two reasons. XCL does not know a left-out dispatch's output resources.
+And the neutral value differs per pass (lit vs. unlit, no reflection), so a wrong guess is as bad
+as stale data.
+
+A pass that reads the chain's outputs but is not on the list still runs. B bounds it, and the
+D procedure finds it (then it goes on the list).
+
+**ON (G3, after B).** "Complete" for a frame means:
+1. every builder, trace and producer pipeline seen so far has its real pipeline (`why_unbuilt`
+   is None); **and**
+2. no dispatch of those roles has been left out yet in this frame (for any reason: building,
+   late, image-only, quarantined).
+
+The rules:
+- Builder pipelines are **must-run** under ON. They never get `spared`/late treatment, and binds
+  wait as for any non-spared compute today. They are few and small, and leaving a build out
+  corrupts every later frame.
+- Trace and producer pipelines: a skip of one sets the frame's `CHAIN_BROKEN` flag. From then on,
+  every consumer dispatch in that frame is left out (`dispatch_skip_rt_incomplete`).
+- At each `PresentX` the flag clears. Condition 1 is checked when a consumer dispatches.
+- Waiting for producers as must-run was rejected: the large ray-tracing programs take 53-374 s
+  each in the driver.
+
+`XCL_PSO_IMAGE_SKIP` stays on. It leaves out only big image-only programs (consumers). Under ON
+their absence cannot corrupt another chain pass, and turning it off brings back the start-up
+stall it was made for (`pso_async.rs:2901-2906`).
+
+**Hits right on a 32-lane GPU (G4), checked in one run with `XCL_RT_VERIFY=1`:**
+1. *Builder*: per-module slot counts. Each console list or device slot called from the builder
+   module is logged once, with its handler name, which shows whether #146/#148 or shifted slots
+   are used. Plus a structural walk of each acceleration structure whose VA XCL learns (in-UMA
+   SRVs, `real.rs:2257`): `gpu::bvh::validate(bytes, root)` checks that child ids are inside the
+   buffer, that box min <= max, that values are finite, that node types are known, and that
+   there are no cycles (bounded visit count).
+2. *Trace*: the existing GPU tests on the PC (they run, not SKIPPED). Plus G2's unmapped-memory
+   miss, which removes (b1).
+3. *Consumers*: loop trips per program from E.
+4. *Unmodelled methods*: #126, #9, #101 and #75 are not ray-tracing methods. #142 and queue #31
+   are unknown. One run with `XCL_D3D12_TRACE=1` limited to the scene names their arguments. If
+   #142's arguments match the #146 barrier record, it is a barrier on the newer layout and goes
+   into `NEWER_LIST_SLOTS`.
+5. *Tests*: run `cargo test -p xcl --lib bvh` and the e2e test with its variables on the PC, and
+   report the SKIPPED lines.
+
+**Telemetry per frame** (on `frame` events; U3): `rt_build_dispatches`, `rt_trace_dispatches`,
+`rt_consumer_dispatches` (run), `dispatch_skip_rt_off`, `dispatch_skip_rt_incomplete`,
+`dispatch_skip_left_out`, plus `as_srv` (total). Loop-guard trips of chain programs come from E's
+`loop_guard` events, joined by record.
+
+#### A. Diagnostic leave-out switch
+
+- **Source:** `XCL_LEAVE_OUT` (env) and `leave_out` (`xcl.toml`), merged. Comma-, space- or
+  line-separated, with `@path` for a file (relative paths resolve against the title's data
+  folder) and `#` comments.
+- **Tokens:**
+  - a 16-hex record key;
+  - `name:<glob>`;
+  - `class:trace`, `class:build`, `class:consumer` (the chain list's entries), `class:loops` (a
+    program with a backward branch, from `Effects.loops`);
+  - `!<token>` to exclude, for bisecting.
+- Read once, at the first pipeline creation.
+- **Effect:** the pipeline is flagged when made (never built; dispatches skip with
+  `left_out`). Built-in classes cost nothing to evaluate: `effects::of` already decodes the
+  program.
+- It does not use the quarantine set. Quarantine is keyed by `shaders_key` and marks a build as
+  done-with-nothing, which reports `quarantined` and hides the cause. A separate reason keeps the
+  counters honest.
+- **No shader change:** cache identity is untouched, so runs stay warm.
+- **Telemetry:**
+  - one `left_out` event per pipeline: `record`, `rule` (the token that matched), `stage`;
+  - the per-frame `dispatch_skip_left_out`;
+  - the existing `ei_after_skipped_dispatch`;
+  - at run end a log line: `left out: N pipelines, M dispatches`.
+
+#### B. Loop-work bound per dispatch
+
+| Option | Correct programs | Cache | Paths | Verdict |
+|---|---|---|---|---|
+| Lower fixed per-lane budget (`XCL_LOOP_BUDGET`) | cuts legitimate loops in small dispatches too | **not cached at all** (`pso.rs:923`): every run is cold, hours on this title | both | diagnostic only |
+| **Per-dispatch budget in an io word**: per-lane budget = clamp(2^28 / lanes, 1024, 65536), lanes = groups x threads per group | loops in small dispatches are untouched (up to 4,096 lanes nothing changes); large dispatches get >= 1,024 passes per lane | one cold rebuild (prelude text changes), then the value changes at run time with no rebuild | HLSL + direct DXIL, compute; EI and graphics write 0, which means 65,536 | **chosen** |
+| Per-loop-entry share (#2291) | nested loops keep their own share | one rebuild | HLSL only in #2291 | a runaway nested loop still gets 65,536 per lane (its "Not tested"); more text per loop |
+| Budget from program shape | needs a model of legitimate trip counts that does not exist | rebuild | — | rejected |
+| Time-based stop | DXIL has no portable shader clock | — | — | rejected |
+
+**Cap derivation.** Upstream #2291 measured 0.47 ms per pass at 262,144 lanes on an RTX 3060 Ti,
+which is about 5.6x10^8 lane-passes/s. An RTX 5080 is about 2-2.5x that: about 1.3x10^9/s. 2^28
+lane-passes (2.7x10^8) then take about 0.2 s on the 5080 and about 0.48 s on a 3060 Ti. That keeps
+one dispatch under about 0.5 s. Heavier loop bodies scale linearly, so U5 adds a GPU measurement
+test that prints ms per pass on the adapter.
+
+**The floor of 1,024 breaks the cap above 262,144 lanes.** A 1080p full-screen dispatch (about
+2.07 M lanes) may still run 2.1x10^9 lane-passes, about 1.5 s on the 5080. Today it may run
+1.4x10^11. The floor exists so that legitimate loops (sample loops, traversals of hundreds of
+steps) are not cut. A legitimate trip shows as a `loop_guard` trip on a program whose output
+looks right with `XCL_LOOP_FLOOR` raised. That switch (default 1024) reads at run time, so it
+costs no rebuild.
+
+**Still unbounded:**
+- ExecuteIndirect dispatches (their size is known only on the GPU; they keep 65,536 unless
+  `XCL_EI_LOOP_BUDGET` is set);
+- graphics shaders;
+- the sum over a frame's ~4,000 dispatches (TDR acts on a single non-preemptible stretch, so
+  dispatch boundaries help).
+
+**Split form:** lanes count hardware threads per console group (the group size from the
+pipeline's thread-group facts). Both halves of a split wave read the same io word.
+
+**Cost, stated plainly:** U5-U7 change the prelude of every translated program. Every cached
+translation, DXIL and driver blob is rebuilt once. On this title that took the hours of the
+offline precompile. That is why B, E and G2 ship as one release (section 8).
+
+**ON depends on B.** With B, a runaway chain dispatch at 1080p ends in about 1.5 s or less instead
+of minutes. Shadows and reflections from cut traversals are wrong (rays that stop early count as
+misses), but the device survives, and the trips show which programs to fix.
+
+#### C. Ray-tracing passes as a class
+
+C is replaced by G's OFF. The class is the chain (builder + trace + listed consumers). Its
+default is `auto` = off until proven. Compile queue: chain pipelines are never built under OFF.
+
+The size/image-only rule is not extended:
+- the suspect (about 14.6 KiB, which is under `BIG_CODE`) shows that size does not mark the
+  class;
+- leaving out a non-image program by size alone is the ExecuteIndirect hazard
+  (`effects.rs:3-8`).
+
+"The title built no acceleration structure through XCL" cannot gate anything: the builder runs
+inside the title's own DLL, and XCL sees only its pipelines and dispatches. That is why the
+builder role is the module rule.
+
+#### D. Order of experiments (one run each, warm cache, 600 s of scene)
+
+1. **R1 `raytracing=off`** with the chain list containing the resolve and probe families. A
+   picture and no loss means the chain is the cause, and OFF is the shipping workaround.
+2. If R1 still loses the device, the cause is outside the listed chain. Bisect with `A`:
+   1. `XCL_LEAVE_OUT=class:loops`. No loss means the cause is a looping program.
+   2. Then halve: `class:loops,!name:...` or key lists in a file, halving each run (about 10 runs
+      for about 1,000 programs).
+3. If R1 is clean, find the programs inside the chain (`raytracing=on` plus a leave-out):
+   1. `class:trace` left out. No loss: a trace program hangs. Then halve the 8.
+   2. Otherwise leave out the consumer list. Then halve it.
+   3. Otherwise `class:build`.
+4. **If leaving one program out only moves the hang to the next:**
+   - the hang is a class (b1/b3) rather than one program;
+   - stop bisecting and go to U5-U7 (bound, BVH miss fix, trip counter);
+   - rerun with the chain on; the `loop_guard` events then name every tripping program in one run.
+
+**What telemetry must show:**
+- `dispatch_skip_rt_off` or `dispatch_skip_left_out` > 0 every frame;
+- `left_out` events for the intended records;
+- no `device_removed` event;
+- R1 also needs a screenshot at 300 s; the user labels what is missing.
+
+#### E. Telemetry
+
+- **Left out by rule:** `left_out` events and the per-frame counters (U3).
+- **Trips without a rebuild:**
+  - the trip call is always compiled in;
+  - `xcl_lc_trip()` returns at once when the io word `IO_LOOP_COUNTER` is 0, so the cost is one
+    branch on the trip path only;
+  - `XCL_LOOP_COUNTERS=1` then fills the word at run time;
+  - cache identity no longer depends on `loop_counters()` (`emit.rs:4827`).
+
+  This ships inside the U5-U7 rebuild.
+- **Last dispatches before a removal (CPU side):**
+  - a ring of the last 256 dispatches per queue: record, groups, list, frame, rule state. It is
+    filled where `telemetry_dispatch` is called;
+  - in `telemetry_device_removed` (`telemetry_run.rs:203`), dump the ring as `last_dispatch`
+    events, and call a new `culprit::on_device_removed()`. That function reads the
+    still-mapped readback markers (`culprit.rs:180`), as the watchdog path does (`:269-300`), so
+    "started and not done" is reported even when the reset comes first.
+  - The ring is on by default at tier `frame`: a write of a few words per dispatch.
+
+#### F. The user's document (sections 7.6, 8.3, 9.3)
+
+| Section of the document | This design |
+|---|---|
+| 8.2 "every skip is counted by reason, key and kind" | Kept: new reasons `rt_off`, `rt_incomplete`, `left_out`, plus `left_out` events |
+| 8.3 compute dispatch, may-skip: skip and count; must-draw: blocking wait; "dependent passes treated as must-draw" | Departs. The chain is all-or-nothing per frame instead: dependants are left out, not waited for (the producers take minutes to build). Builder pipelines are must-run under ON |
+| 7.6 quarantine of keys after hard timeouts, "feeds the section 9 controls (skip)" | Departs. Leave-out uses its own reason, not the quarantine set, so a run tells a deliberate omission from a timeout |
+| 9.3(2) skip threshold by size, "a stability lever, not a fix" | Not used for this class: size does not mark it. The leave-out switch is the lever and is diagnostic, except OFF, which is a supported mode |
+| 9.3 (all) concern compile cost; loop work at run time is not covered | B is new; it is not in the document |
+
+### 6. Architecture and data flow after the change
+
+```
+pipeline creation (real.rs create_compute_pso / dev_create_compute_pso_x)
+  -> rt_chain::classify(cs_bytes, caller_module) -> Role {None, Build, Trace, Producer, Consumer}
+     + leave_out::matches(record, name, effects) -> Option<rule>
+  -> decision = rt_chain::decide(role, rule, chain_mode)
+       LeftOut(reason): skip `attempt`, go to go_background (stand-in), pso_async::leave_out(standin, reason)
+       Gated(role): normal build; pso_async::set_role(standin, role)
+       Normal
+dispatch (bind::dispatch, execute_indirect, console_list close, deferred replay)
+  -> pso_async::resolve/resolve_wait: LeftOut -> stand-in, no wait, no enqueue
+     Gated consumer + rt_chain::chain_open()==false -> treated as LeftOut(rt_incomplete)
+  -> existing "not translated -> skip" branch -> telemetry_skip(raw) -> why name -> counter
+  -> producer/trace skip -> rt_chain::note_producer_skip() sets CHAIN_BROKEN
+  -> dispatch run -> io[IO_LOOP_BUDGET] = budget(groups, threads); io[IO_LOOP_COUNTER] = word or 0
+PresentX -> rt_chain::on_frame() clears CHAIN_BROKEN; frame event carries rt_* counters
+device removed -> dispatch ring dump + culprit::on_device_removed()
+```
+
+### 7. Dependencies
+
+- **Upstream:**
+  - #2527 (`XCL_REFUSE_CS`, open) overlaps A but refuses at the driver: compile still runs for
+    warm paths, and there are no classes or reasons. A supersedes it; do not adopt both.
+  - #2291 (open) is the per-entry alternative to B. Its 2^28 constant and measurements are
+    reused; its code is not adopted (B uses a per-lane total and covers direct DXIL).
+  - #2542 (open) is the unmapped-window BVH miss. U7 adopts its behaviour; adoption goes through
+    `scripts/dev/merge-pr.py` if taken as-is, otherwise it is reimplemented and credited.
+  - #1284 is already on dev (`loop_budget`).
+  - #2793 (per-region budget) raises the worst case; do not adopt.
+  - #1795 was not adopted.
+  - #505 is the title's watchdog issue.
+- **Order:**
+  - U1 -> U2 -> U3 (first picture). U4 can run in parallel with U2.
+  - U5 -> U6, and U7 independently, all in one release.
+  - U8 after U5 + U2. U9 after U2.
+
+### 8. Constraints and considerations
+
+- **Cache invalidation:**
+  - U1-U4, U8 and U9 touch no translator source listed in `build.rs:8-21`. Exception: U1's edit
+    to `gpu/effects.rs`, which is not in that list; `gpu/xbox.rs` (U4) **is** in it.
+  - A change to a listed file re-translates, but keeps DXIL and driver blobs while the emitted
+    text is unchanged (DXIL keyed by HLSL, `emit.rs:4861`).
+  - U4 adds a function to `xbox.rs` and emits nothing new, so it costs a re-translation, not
+    recompiles.
+  - U5-U7 change emitted text: a full cold rebuild, once. Merge them in one batch; run the
+    offline precompile right after.
+- **Legitimate loops:** the floor 1,024 and `XCL_LOOP_FLOOR` cover them. Trips are visible
+  through E.
+- **Title-data rule:**
+  - lists, names and keys live only in `xcl.toml`, env and the data folder;
+  - tests use made-up keys (`0123456789abcdef`) and names (`CS_TestResolve`);
+  - the builder rule uses an SDK library symbol already in the tests.
+- **Dispatch-path cost:**
+  - one atomic load (`any_rules`) when no rule and the chain is off;
+  - role and left-out state live on the existing `Pending` entry, which `resolve` already looks
+    up: no new map on the hot path;
+  - the ring is 4 words per dispatch.
+- **Failure modes:**
+  - a wrong chain list leaves out non-chain passes (visible as `left_out` events);
+  - a missing consumer on the list runs on garbage under OFF (bounded only after B);
+  - a module rule that matches nothing means builder dispatches run under OFF (U3 logs
+    `rt_build_dispatches`; it should be 0 under OFF).
+- **Open risks:**
+  - ILDN names may be absent;
+  - the floor may be too low for traversals;
+  - TDR may still fire on 1080p dispatches at the floor (about 1.5 s);
+  - the suspect's split flag contradiction.
+
+### 9. Work breakdown
+
+Each unit has its own PR, under 400 changed lines, and runs `cargo test --workspace` on the PC.
+Runtime units need the smoke runs from `CONTRIBUTING.md`.
+
+#### U1. Program facts and rule parsing (pure; about 220 lines)
+- **Files:** `gpu/effects.rs`, `config.rs`, new `hle/d3d12x/leave_out.rs` (parsing only),
+  `hle/d3d12x/mod.rs` (mod line).
+- **Changes:**
+  - `Effects` gets `traces: bool` (instruction name `IMAGE_BVH_INTERSECT_RAY` or
+    `IMAGE_BVH64_INTERSECT_RAY`) and `loops: bool` (`rdna2::branch_target(d)` < `d.pc`). Set both
+    in `of` (`effects.rs:58-77`).
+  - Add `pub fn compute_facts(blob) -> Option<Effects>` (wraps `compute_code` + `of`).
+  - `config.rs`: fields `leave_out: String` and `raytracing_chain: String` (defaults ""),
+    `pub enum ChainMode { Off, On }`, `pub fn parse_raytracing_chain(mode: &str, proven: bool) -> ChainMode`
+    (off/none/0 -> Off; on/tier1_0/tier1_1/1.0/1.1/10/11 -> On; auto/"" -> On if proven else
+    Off; other -> Off), and `Config::raytracing_chain_mode()` (env `XCL_RAYTRACING` first, as
+    `raytracing_tier_override`). `parse_raytracing_tier` also accepts `on` as None (host tier).
+  - `leave_out.rs`:
+    - `pub enum Token { Record(u64), Name(String), Class(Class), Not(Box<Token>) }`,
+      `pub enum Class { Trace, Build, Consumer, Loops }`;
+    - `pub fn parse(text: &str, base: &Path) -> (Vec<Token>, Vec<String> /*warnings*/)` expands
+      `@path` once (no nesting), `#` comments, BOM;
+    - `pub struct Rules { tokens }` with
+      `pub fn matches(&self, record: u64, name: Option<&str>, fx: Option<&Effects>, role: Role) -> Option<String>`
+      (the matching token's text; a `!` token that matches wins);
+    - `pub fn parse_chain(text, base) -> Vec<(Token, Role)>` for chain lines `<token> [producer|consumer]`;
+    - `pub enum Role { None, Build, Trace, Producer, Consumer }`.
+- **Tests:**
+  - `effects_flag_bvh_programs_as_traces` (a made-up code buffer with one IMAGE_BVH instruction
+    has `traces`; one without does not);
+  - `effects_flag_backward_branches_as_loops`;
+  - `raytracing_chain_parsing` (every value above, auto with proven true and false);
+  - `tier_parsing_accepts_on_as_host_tier`;
+  - `leave_out_parses_keys_names_classes_and_negation`;
+  - `leave_out_reads_at_files_relative_to_base_with_comments_and_bom`;
+  - `leave_out_negation_wins`;
+  - `chain_lines_default_to_consumer`;
+  - `bad_tokens_warn_and_are_dropped`.
+- **Acceptance:** the tests pass; nothing is wired in yet (no behaviour change).
+
+#### U2. Leaving out at creation and dispatch: G-OFF and A (about 330 lines)
+- **Files:** new `hle/d3d12x/rt_chain.rs`, `hle/d3d12x/real.rs`, `hle/d3d12x/pso_async.rs`,
+  `telemetry_gpu.rs`.
+- **Changes:**
+  - `rt_chain.rs`:
+    - `static RULES: OnceLock<(Rules, Vec<(Token, Role)>, ChainMode)>` loaded from config + env at
+      first use;
+    - `pub fn builder_module() -> Option<(usize, usize)>`: the base and size of the mapped module
+      exporting `??0XboxBvhBuilder@@QEAA@PEAUID3D12Device11@@_N@Z`, found with
+      `modules::find_export` style lookups, cached;
+    - `fn caller_in_image() -> usize` (copy of the `hle/waits.rs:86-92` pattern);
+    - `pub fn classify(cs: &[u8]) -> (Role, Option<String>)`: role Build if the caller is in the
+      builder module, else Trace if `fx.traces`, else the chain list by record (`gpu::shader::fnv64(cs)`)
+      or name (U4 later), else None; then
+      `left_out = RULES.rules.matches(...)`, else `Some("rt_off")` if role != None and mode == Off;
+    - log one line per left-out pipeline, the first 64, then powers of two.
+  - `real.rs`, in `create_compute_pso` (`:6355`): before `attempt`, read the CS bytes of
+    `desc`. If `classify` gives a left-out reason and `pso_async::enabled()`:
+    - call `own_compute(desc).and_then(|o| go_background(...))` directly;
+    - then `pso_async::leave_out(*ppv, reason)`;
+    - else `pso_async::set_role(*ppv, role)` after the normal path, when a `Pending` entry
+      exists.
+
+    `dev_create_compute_pso_x` (`:2851`) goes through `dev_create_compute_pso`, so it is covered.
+  - `pso_async.rs`:
+    - `Pending` gains `left_out: AtomicU8` (0 none, 1 left_out, 2 rt_off) and `role: AtomicU8`;
+    - `pub fn leave_out(standin, reason: &str)` sets the reason and `spared`, and marks the job
+      never to be sent (in `enqueue`/`resolve`, return early when `left_out != 0`);
+    - `why_of` checks `left_out` first and returns new variants `Unbuilt::LeftOut`
+      (`"left_out"`) and `Unbuilt::RtOff` (`"rt_off"`);
+    - `put_off_to_submit` already respects `is_spared`.
+  - `telemetry_gpu.rs`:
+    - `COUNT_NAMES` grows to 36 (new: `dispatch_skip_left_out`, `dispatch_skip_rt_off`,
+      `dispatch_skip_rt_incomplete`; replace `reserved_0` with `ei_draw_skip_left_out`);
+    - update `skip_index` for the names;
+    - add `pub fn telemetry_left_out(record: u64, rule: &str, stage: &str)`, a `left_out` event
+      at tier `frame`.
+- **Tests (no GPU):**
+  - `rt_chain_classifies_builder_by_caller_module` (a seam for the module range);
+  - `rt_chain_classifies_trace_by_effects`;
+  - `rt_chain_list_marks_consumer_by_record`;
+  - `rt_off_leaves_out_every_role_and_keeps_none`;
+  - `leave_out_rule_wins_over_chain_on`;
+  - `left_out_pipeline_is_never_enqueued` (pso_async: `submit_lazy` + `leave_out` + `resolve`
+    returns the stand-in and `job` never runs);
+  - `why_unbuilt_names_left_out_and_rt_off`;
+  - `skip_index_maps_new_reasons`;
+  - extend `execute_indirect_with_a_pipeline_still_building_is_skipped` into
+    `execute_indirect_with_a_left_out_pipeline_is_skipped`.
+- **Acceptance:** the tests pass. Run R1 (section 10) shows `dispatch_skip_rt_off` > 0 per frame
+  and no `pipeline` events for left-out records.
+
+#### U3. Telemetry: chain counters, dispatch ring, culprit on removal (about 250 lines)
+- **Files:** `telemetry_gpu.rs`, `telemetry_run.rs`, `hle/d3d12x/culprit.rs`,
+  `hle/d3d12x/bind.rs` (one call), `hle/d3d12x/console_list.rs` (one call).
+- **Changes:**
+  - Per-frame counters `rt_build_dispatches`, `rt_trace_dispatches`, `rt_consumer_dispatches`:
+    `telemetry_dispatch` gets `role: u8` from `pso_async::role_of(raw)` at the two call sites.
+  - Total `as_srv`, bumped at `real.rs:2255`.
+  - `DispatchRing`: 256 entries per queue of `(record, [x,y,z], list, frame, role, left_out)`,
+    written in `telemetry_dispatch` when tier >= frame.
+  - In `telemetry_device_removed`: emit `last_dispatch` events (newest first, at most 64 per
+    queue), then `culprit::on_device_removed()`.
+  - `culprit::on_device_removed()` is the body of `on_watchdog_release` without the burst limit,
+    run once.
+- **Tests:**
+  - `frame_event_carries_rt_counters`;
+  - `dispatch_ring_keeps_the_newest_256_per_queue`;
+  - `device_removed_dumps_the_ring_once`;
+  - `culprit_on_device_removed_reports_open_lists` (a seam over `open_lists`).
+- **Acceptance:** the tests pass. In a run that loses the device, `last_dispatch` events precede
+  `end`.
+
+#### U4. Names and a local list generator (about 180 lines)
+- **Files:** `gpu/xbox.rs`, `shaders.rs`, `hle/d3d12x/rt_chain.rs` (use the name).
+- **Changes:**
+  - `pub fn debug_name(blob: &[u8]) -> Option<String>`: the `ILDN` part via `container_parts`
+    (u16 flags, u16 length, then bytes), ASCII only, at most 260 bytes.
+  - `rt_chain::classify` passes the name to `matches`.
+  - Warn once if no compute container had a name.
+  - `xcl shaders <pack> --list-records <glob> [--role producer|consumer]` prints
+    `<16-hex record> <role>  # <name>` for matching pack records (`records[i].name`). Output goes
+    only to stdout.
+- **Tests:**
+  - `debug_name_reads_ildn` (a made-up container with `ILDN` "CS_TestResolve");
+  - `debug_name_none_without_ildn`;
+  - `list_records_matches_glob_and_prints_roles` (a made-up pack).
+- **Acceptance:** the tests pass; README documents `--list-records` and the toggle values.
+
+#### U5. Per-dispatch loop budget, HLSL path (about 260 lines; one cold rebuild)
+- **Files:** `gpu/recomp/mod.rs`, `gpu/recomp/emit.rs`, `hle/d3d12x/bind.rs`,
+  `hle/d3d12x/console_list.rs`, `gpu/recomp/tests.rs`.
+- **Changes:**
+  - `mod.rs`: `pub const IO_LOOP_BUDGET: usize = 113;`, `pub const DISPATCH_LOOP_PASSES: u64 = 1 << 28;`
+    and
+    `pub fn dispatch_loop_budget(groups: [u32; 3], threads: u32, floor: u32, max: u32) -> u32`
+    = clamp(2^28 / max(1, groups product x threads), floor, max). Also `loop_floor()` (env
+    `XCL_LOOP_FLOOR`, default 1024, min 1, read at run time, **not** in `cache_allowed`).
+  - `emit.rs`: in compute programs, the prelude line becomes
+    `static uint xcl_budget = 1u << 16;` plus, at the entry point, after `io` is readable,
+    `{ uint b = io.Load(IO_LOOP_BUDGET*4); if (b != 0u) xcl_budget = b; }` (the default branch
+    of `emit.rs:4862-4865`; keep the `XCL_LOOP_BUDGET` replacement as is).
+  - `bind.rs` `bind_abi` (`:1088`) and `console_list.rs:902`: for compute,
+    `io[IO_LOOP_BUDGET] = dispatch_loop_budget([x,y,z], pso_group_threads(real), loop_floor(), loop_budget())`.
+    `bind_abi` gets the groups as a new parameter `groups: Option<[u32; 3]>`: `None` from the
+    ExecuteIndirect and graphics paths writes 0. `XCL_EI_LOOP_BUDGET`, when set, writes that
+    value for ExecuteIndirect.
+- **Tests:**
+  - `dispatch_loop_budget_clamps_to_floor_and_max`;
+  - `small_dispatches_keep_the_full_budget` (4,096 lanes -> 65,536);
+  - `compute_prelude_reads_the_io_budget`;
+  - `gpu_compute_loop_stops_at_the_dispatch_budget` (a made-up endless loop, wave32 and split
+    forms: io 5000 -> 5000 passes; io 0 -> 65,536);
+  - `gpu_measure_ms_per_loop_pass` (prints only, no assert: the calibration for section 5.B).
+- **Acceptance:** the tests pass on the PC, with SKIPPED lines reported.
+
+#### U6. Same budget on the direct DXIL path, and the always-compiled trip counter (about 220 lines; same release)
+- **Files:** `gpu/dxil/compact.rs`, `gpu/dxil/lower.rs`, `gpu/dxil/lower_window.rs`,
+  `gpu/recomp/emit.rs`, `gpu/dxil/compact_tests.rs`.
+- **Changes:**
+  - The direct path initialises its budget variable (`compact.rs:240`, `VAR_BUDGET`) from the io
+    word 113 when non-zero, like `loop_counter_word` (`lower_window.rs:55-60`).
+  - Emit `LOOP_GUARD_COUNTED` always (`emit.rs:4827`). `xcl_lc_trip()` returns when
+    `xcl_lc == 0`.
+  - The cache identity no longer includes the counters flag.
+- **Tests:**
+  - `gpu_direct_loop_stops_at_the_dispatch_budget`;
+  - `uncounted_dispatch_writes_no_trips` (io word 0: the slot stays 0 after an endless loop);
+  - `counted_dispatch_counts_trips_once_per_lane`;
+  - update `gpu_direct_loop_budget_follows_the_variable`.
+- **Acceptance:** the tests pass. In a run with `XCL_LOOP_COUNTERS=1`, warm from a run without
+  it, the `pipeline` events report `source: "cache"`.
+
+#### U7. BVH prelude split and the unmapped-memory miss (about 150 lines; same release)
+- **Files:** `gpu/recomp/emit.rs`, `gpu/dxil/lower_image.rs`, `gpu/recomp/tests.rs`.
+- **Changes:**
+  - Move `bvh_intersect` out of `PRELUDE_MEM` into `PRELUDE_BVH`, emitted only when the program
+    uses `image_bvh*` (a flag set at `emit.rs:2520`). Later BVH fixes then rebuild only the trace
+    programs.
+  - Before reading a node, return the miss value when the node address is outside every mapped
+    UMA window (the behaviour of #2542), on both paths.
+- **Tests:**
+  - `bvh_prelude_only_in_programs_that_trace`;
+  - `gpu_bvh_unmapped_node_is_a_miss` (box and triangle lanes);
+  - the existing three BVH GPU tests still pass.
+- **Acceptance:** the tests pass; on the PC, `pass` events show trace dispatches under 50 ms in
+  R4.
+
+#### U8. Ray tracing ON with the chain gate (about 200 lines; after U2 and U5)
+- **Files:** `hle/d3d12x/rt_chain.rs`, `hle/d3d12x/pso_async.rs`, `hle/d3d12x/present.rs` (one
+  call), `telemetry_gpu.rs`.
+- **Changes:**
+  - `static CHAIN_BROKEN: AtomicBool`, `pub fn on_frame()` (clears it; called where PresentX
+    counts a frame), `pub fn note_producer_skip()`, and
+    `pub fn chain_open() -> bool = !CHAIN_BROKEN && PRODUCERS_UNBUILT.load()==0`.
+    `PRODUCERS_UNBUILT` is incremented by `set_role` for Build/Trace/Producer and decremented when
+    their real pipeline lands in `complete`.
+  - `pso_async::why_of`: for role Consumer and mode On, when `!chain_open()`, return
+    `Unbuilt::RtIncomplete` (`"rt_incomplete"`).
+  - For a role Build pipeline: never `spared`, never `late` (skip `mark_late` for it).
+  - The skip path calls `note_producer_skip()` when the skipped pipeline's role is
+    Build/Trace/Producer.
+- **Tests:**
+  - `consumer_left_out_after_producer_skip_in_frame`;
+  - `gate_reopens_at_next_frame`;
+  - `gate_closed_while_a_producer_builds`;
+  - `builder_pipeline_is_never_late`.
+- **Acceptance:** run R4 (section 10).
+
+#### U9. Verification aids (about 220 lines; after U2)
+- **Files:** `gpu/bvh.rs`, `hle/d3d12x/rt_chain.rs`, `hle/d3d12x/real.rs` (an `XCL_RT_VERIFY`
+  hook at `:2257`), `hle/d3d12x/guard.rs` (per-module slot log).
+- **Changes:**
+  - `pub fn validate(data: &[u8], root: u32) -> Result<ValidateStats, String>`: an iterative
+    walk with a visit cap of `data.len()/64`, checking id bounds, node types, finite boxes with
+    min <= max, and cycles.
+  - With `XCL_RT_VERIFY=1`:
+    - on each in-UMA acceleration-structure SRV, at the next present, validate and log
+      `rt verify: as at VA ok/fault ...`;
+    - log once per (module = builder, interface, slot) the handler a builder call reached.
+- **Tests:**
+  - `validate_accepts_built_bvh` (`bvh::build` of random triangles);
+  - `validate_rejects_child_out_of_range`;
+  - `validate_rejects_cycle`;
+  - `validate_rejects_nan_box`.
+- **Acceptance:** the tests pass. A run with `XCL_RT_VERIFY=1` logs at least one verdict, or
+  `as_srv` is 0, which the report must state.
+
+### 10. Concurrency plan
+
+- **Wave 1:** U1 alone. It is the base for U2 and U4.
+- **Wave 2:** U2 and U4 in parallel. U4 touches `rt_chain.rs` only after U2 lands: U4 does its
+  `xbox.rs` and `shaders.rs` parts first and adds the one-line `classify` change as a rebase.
+- **Wave 3:**
+  - U3 (telemetry files, culprit);
+  - U5 (recomp mod/emit, bind, console_list);
+  - U7 (emit.rs PRELUDE_MEM section, lower_image.rs).
+
+  U5 and U7 both edit `emit.rs` in different functions, so one worker does U5 then U7, or they
+  are merged in that order.
+- **Wave 4:** U6 (dxil files, emit.rs guard) after U5. U9 (bvh.rs, guard.rs) in parallel.
+- **Wave 5:** U8.
+- U5, U6 and U7 are released together.
+
+### 11. Acceptance runs on the retail title (RTX 5080, warm cache unless stated)
+
+Each run is 600 s of scene, with `XCL_TELEMETRY=frame` and `XCL_GPU_CULPRIT=1`.
+
+| Run | Switches | Success |
+|---|---|---|
+| R1 (after U2) | `raytracing=off`, chain list on the data folder | no `device_removed` for 600 s of scene; `dispatch_skip_rt_off` > 0 in every scene `frame` event; 0 `pipeline` events for chain records; `rt_build_dispatches` = 0; user-labelled screenshot at 300 s |
+| R2 (D bisect) | `raytracing=on` + `XCL_LEAVE_OUT=class:trace` (then the consumer list, then `class:build`) | the first leave-out that gives 600 s with no loss names the family |
+| R3 (after U5-U7, cold rebuild then warm) | `raytracing=off`, `XCL_LOOP_COUNTERS=1`, `XCL_TELEMETRY=all` | as R1, and `pipeline` events from the cache in a second warm run with counters toggled |
+| R4 (after U8) | `raytracing=on`, `XCL_LOOP_COUNTERS=1`, `XCL_RT_VERIFY=1` | no `device_removed` for 600 s of scene; no pass event over 500 ms; `rt_trace_dispatches` > 0 per frame; trips listed per chain record; zero or explained `dispatch_skip_rt_incomplete` after warm-up; verify lines ok |
+| R5 (regression) | defaults (`auto`) | same as R1, and a smoke block from `scripts/smoke.ps1` on main and head |
+
+If R4 fails, `auto` stays off, and the trips plus the verify lines say which of b1-b4 to fix next.
+
+### 12. Deviations from the user's document
+
+1. The chain is all-or-nothing per frame. Its dependants are left out, not waited for as
+   must-draw (document 8.3).
+2. Leave-out is a reason of its own, not the quarantine set (document 7.6).
+3. Size is not used to recognise ray-tracing passes (document 9.3(2)).
+4. A loop-work bound per dispatch is added. The document has no runtime-work control.
+5. The default for the ray-tracing chain is off until proven. The document has no ray-tracing
+   policy.
