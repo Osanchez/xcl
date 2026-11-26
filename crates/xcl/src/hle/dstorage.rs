@@ -1078,6 +1078,7 @@ struct QueueInner {
 impl QueueInner {
     fn fail(&self, hr: HRESULT, request: Request, file: Option<&FileInner>) {
         FAILED.fetch_add(1, Ordering::Relaxed);
+        crate::report::telemetry_io_failed(hr, request.destination_size as u64, file.map(|f| f.path.as_slice()));
         let mut e = self.errors.lock().unwrap();
         e.0 += 1;
         if e.1.is_none() {

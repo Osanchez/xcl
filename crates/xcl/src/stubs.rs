@@ -53,6 +53,7 @@ pub fn record_call(info: &StubInfo, caller: usize) {
             info.ret
         );
     }
+    crate::report::telemetry_stub(info, n + 1, caller);
     let h = info.hook.load(Ordering::Acquire);
     if h != 0 {
         let f: StubHook = unsafe { std::mem::transmute(h) };

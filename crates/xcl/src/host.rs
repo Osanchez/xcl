@@ -36,6 +36,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+    crate::report::telemetry_start(&boot);
     let _ = std::thread::Builder::new().name("xcl-split-counts".into()).spawn(|| loop {
         std::thread::sleep(std::time::Duration::from_secs(10));
         crate::hle::d3d12x::real::log_dispatch_chain_counts();
@@ -163,6 +164,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     continue;
                 }
                 crate::xlog_warn!("XCL_STALL_DUMP: no frame presented for {secs} s after frame {last} – where every thread is, then the end");
+                crate::hle::d3d12x::list_x::log_sync_state("the stall");
+                crate::report::telemetry_stall(last, since.elapsed().as_secs_f64(), secs);
                 crate::eh::dump_threads();
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 crate::eh::dump_threads();

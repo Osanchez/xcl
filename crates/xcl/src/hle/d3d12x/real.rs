@@ -557,6 +557,7 @@ pub fn init() -> Result<String, String> {
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
         *ADAPTER.lock().unwrap() = name.clone();
+        crate::report::telemetry_device(&name);
         Ok(name)
     }
 }
@@ -3755,6 +3756,7 @@ fn bytecode(b: &[u8]) -> D3D12_SHADER_BYTECODE {
 
 fn note_fallback(what: &str, hr: HRESULT, ok: bool) {
     let n = if ok { FALLBACK_PSO.fetch_add(1, Ordering::Relaxed) } else { FAILED_PSO.fetch_add(1, Ordering::Relaxed) };
+    crate::report::telemetry_pipeline_refused(what, hr, ok);
     if n < 5 || n % 1000 == 0 {
         if ok {
             crate::xlog_warn!("D3D12.X: {what} rejected by the driver ({hr:#x}) – fallback shaders used (#{})", n + 1);
@@ -3864,6 +3866,7 @@ fn note_translation_error(e: String) {
         ATTEMPT_NOTES.with(|n| n.borrow_mut().push(e));
         return;
     }
+    crate::report::telemetry_shader_refused(&e);
     // each different reason once (the first five only hid a retail game's "mesh pipeline with
     // AS" behind five earlier ones)
     let mut g = TRANSLATE_ERRORS.lock().unwrap();
