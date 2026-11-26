@@ -38,7 +38,34 @@ struct Pending {
     /// its dispatches may be left out while it is built (`image_only`): binds do not wait for it
     spared: std::sync::atomic::AtomicBool,
     demand: Mutex<Demand>,
+    facts: Facts,
 }
+
+/// What a build and the binds that left it out leave behind, for telemetry (`record`, `skipped`).
+#[derive(Default)]
+struct Facts {
+    /// binds left out for it (`skipped`)
+    skips: std::sync::atomic::AtomicU32,
+    /// µs title threads waited for it, all binds together
+    waited_us: AtomicU64,
+    /// the largest DXIL its build translated or compiled (0: not known yet)
+    dxil_bytes: AtomicUsize,
+    /// µs its driver compiles waited at the gate
+    gate_us: AtomicU64,
+    /// first sent to the workers or needed (`enqueue`, `need_now`)
+    queued_at: Mutex<Option<std::time::Instant>>,
+    /// a worker took it (`build`)
+    picked_at: Mutex<Option<std::time::Instant>>,
+    /// how it ended (`OUTCOME_*`), set before `complete`
+    outcome: std::sync::atomic::AtomicU8,
+    /// must-draw (set by a later unit; read by `skipped` and the record)
+    must_draw: std::sync::atomic::AtomicBool,
+    /// its driver compile ran past its hard limit (set by a later unit)
+    abandoned: std::sync::atomic::AtomicBool,
+}
+
+const OUTCOME_BUILT: u8 = 0;
+const OUTCOME_FAILED: u8 = 1;
 
 /// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
 #[derive(Default)]
@@ -78,6 +105,7 @@ pub fn wanted_here() -> crate::gpu::recomp::dxc::Wanted {
 fn build(p: &Arc<Pending>, job: Job, preload: bool) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
     BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
+    p.facts.picked_at.lock().unwrap().get_or_insert_with(std::time::Instant::now);
     if preload {
         let mut d = p.demand.lock().unwrap();
         d.preload_thread = unsafe { GetCurrentThreadId() };
@@ -123,6 +151,7 @@ impl Pending {
         // used, and what it records after, come after the line)
         let e = super::pso_manifest::Event::Use { key: self.key, compute: self.compute, ready: self.real.load(Ordering::Acquire) != 0 };
         if super::pso_manifest::note_first(&self.used, e) {
+            crate::report::telemetry_first_use(self.real.load(Ordering::Acquire) != 0);
             used::note(self.key);
         }
     }
@@ -134,6 +163,7 @@ static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 /// The build is done (`real`: its pipeline, 0 = failed).
 fn complete(p: &Pending, real: usize) {
     if real == 0 {
+        p.facts.outcome.store(OUTCOME_FAILED, Ordering::Release);
         FAILED.fetch_add(1, Ordering::Relaxed);
     } else {
         BUILT.fetch_add(1, Ordering::Relaxed);
@@ -148,11 +178,177 @@ fn complete(p: &Pending, real: usize) {
         p.cv.notify_all();
         orphan
     };
+    crate::report::telemetry_pipeline_ready(&record(p, real));
     // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
     if orphan {
         release(real);
     }
 }
+
+/// Why a pipeline's draw or dispatch is left out now (`why_unbuilt`).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unbuilt {
+    /// being built, or waiting for a worker
+    Building,
+    /// a bind's wait for it ran out (`late`)
+    Late,
+    /// its binds do not wait for it (`image_only`)
+    ImageOnly,
+    /// its build ended with no pipeline
+    Failed,
+}
+
+#[allow(dead_code)]
+impl Unbuilt {
+    pub fn name(self) -> &'static str {
+        match self {
+            Unbuilt::Building => "building",
+            Unbuilt::Late => "late",
+            Unbuilt::ImageOnly => "image_only",
+            Unbuilt::Failed => "failed",
+        }
+    }
+}
+
+/// What `skipped` tells about a pipeline whose call is left out: `why` is `None` for a pipeline
+/// that has no entry (a console one with no translation) or is built.
+#[allow(dead_code)]
+pub struct Skipped {
+    pub why: Option<Unbuilt>,
+    pub must_draw: bool,
+}
+
+/// Why `p`'s real pipeline is not there: `None` when it is. Reads flags only (and `done`).
+fn why_of(p: &Pending) -> Option<Unbuilt> {
+    if p.real.load(Ordering::Acquire) != 0 {
+        None
+    } else if *p.done.lock().unwrap() {
+        Some(Unbuilt::Failed)
+    } else if p.spared.load(Ordering::Acquire) {
+        Some(Unbuilt::ImageOnly)
+    } else if p.late.load(Ordering::Acquire) {
+        Some(Unbuilt::Late)
+    } else {
+        Some(Unbuilt::Building)
+    }
+}
+
+/// Why the call of stand-in `pso` is left out now: `None` when it is built, or no stand-in.
+#[allow(dead_code)]
+pub fn why_unbuilt(pso: usize) -> Option<Unbuilt> {
+    let p = entry(pso)?;
+    why_of(&p)
+}
+
+/// A call of stand-in `pso` is left out: counted for it, and why. Locks `PENDING` once, then `done`.
+#[allow(dead_code)]
+pub fn skipped(pso: usize) -> Skipped {
+    let Some(p) = entry(pso) else { return Skipped { why: None, must_draw: false } };
+    p.facts.skips.fetch_add(1, Ordering::Relaxed);
+    Skipped { why: why_of(&p), must_draw: p.facts.must_draw.load(Ordering::Relaxed) }
+}
+
+/// The DXIL this thread's build translated: kept for its record (the largest, if several).
+pub(super) fn note_size(bytes: usize) {
+    BUILDING.with(|b| {
+        if let Some(p) = b.borrow().as_ref() {
+            p.facts.dxil_bytes.fetch_max(bytes, Ordering::Relaxed);
+        }
+    });
+}
+
+/// A driver compile of `bytes` of DXIL that waited `gate_wait` at the gate, on this thread's build.
+pub(super) fn note_driver_compile(bytes: usize, gate_wait: std::time::Duration) {
+    BUILDING.with(|b| {
+        if let Some(p) = b.borrow().as_ref() {
+            p.facts.dxil_bytes.fetch_max(bytes, Ordering::Relaxed);
+            p.facts.gate_us.fetch_add(gate_wait.as_micros() as u64, Ordering::Relaxed);
+        }
+    });
+}
+
+/// How long the build this thread runs waited from first being sent or needed until a worker took it.
+#[allow(dead_code)]
+pub fn queued_here() -> Option<std::time::Duration> {
+    BUILDING.with(|b| {
+        let b = b.borrow();
+        let p = b.as_ref()?;
+        let (queued, picked) = (*p.facts.queued_at.lock().unwrap(), *p.facts.picked_at.lock().unwrap());
+        Some(picked?.saturating_duration_since(queued?))
+    })
+}
+
+/// The build this thread runs is must-draw.
+#[allow(dead_code)]
+pub fn must_draw_here() -> bool {
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.facts.must_draw.load(Ordering::Relaxed)))
+}
+
+/// What one pipeline's build and binds came to (`record`).
+#[allow(dead_code)]
+pub struct BuildRecord {
+    pub compute: bool,
+    pub key: u64,
+    /// first need → now
+    pub need: Option<std::time::Duration>,
+    /// first send or need → a worker took it
+    pub queued: Option<std::time::Duration>,
+    /// a worker took it → now
+    pub held: Option<std::time::Duration>,
+    pub waited: std::time::Duration,
+    pub gate: std::time::Duration,
+    pub dxil_bytes: usize,
+    pub skips: u32,
+    pub late: bool,
+    pub must_draw: bool,
+    pub abandoned: bool,
+    /// "built", "failed", later "size_gate", "quarantined"; "pending" when not finished
+    pub outcome: &'static str,
+}
+
+/// `p`'s facts now; `real` is its pipeline (0: none).
+fn record(p: &Pending, real: usize) -> BuildRecord {
+    let f = &p.facts;
+    let (queued, picked) = (*f.queued_at.lock().unwrap(), *f.picked_at.lock().unwrap());
+    let outcome = match (real, f.outcome.load(Ordering::Acquire)) {
+        (0, OUTCOME_FAILED) => "failed",
+        (0, OUTCOME_BUILT) => "pending",
+        _ => "built",
+    };
+    BuildRecord {
+        compute: p.compute,
+        key: p.key,
+        need: p.demand.lock().unwrap().needed_at.map(|at| at.elapsed()),
+        queued: picked.zip(queued).map(|(picked, queued)| picked.saturating_duration_since(queued)),
+        held: picked.map(|at| at.elapsed()),
+        waited: std::time::Duration::from_micros(f.waited_us.load(Ordering::Relaxed)),
+        gate: std::time::Duration::from_micros(f.gate_us.load(Ordering::Relaxed)),
+        dxil_bytes: f.dxil_bytes.load(Ordering::Relaxed),
+        skips: f.skips.load(Ordering::Relaxed),
+        late: p.late.load(Ordering::Acquire),
+        must_draw: f.must_draw.load(Ordering::Relaxed),
+        abandoned: f.abandoned.load(Ordering::Relaxed),
+        outcome,
+    }
+}
+
+/// The pipelines not built that were needed or left out, most skipped first (at most `limit`).
+#[allow(dead_code)]
+pub fn unbuilt_records(limit: usize) -> Vec<BuildRecord> {
+    // (the `Arc`s are cloned under `PENDING`; each pipeline's locks are taken after it is released)
+    let all: Vec<Arc<Pending>> = PENDING.lock().unwrap().as_ref().map_or_else(Vec::new, |m| m.values().cloned().collect());
+    let mut out: Vec<BuildRecord> = all
+        .iter()
+        .filter(|p| !*p.done.lock().unwrap())
+        .map(|p| record(p, 0))
+        .filter(|r| r.skips > 0 || r.need.is_some())
+        .collect();
+    out.sort_by(|a, b| b.skips.cmp(&a.skips));
+    out.truncate(limit);
+    out
+}
+
 static BUILT: AtomicUsize = AtomicUsize::new(0);
 static FAILED: AtomicUsize = AtomicUsize::new(0);
 /// binds waiting right now for a pipeline still being built (`title_held`)
@@ -330,6 +526,8 @@ static POOL: OnceLock<Pool> = OnceLock::new();
 /// Reserved graphics workers started, and those running a build now.
 static RESERVED: AtomicUsize = AtomicUsize::new(0);
 static RESERVED_BUSY: AtomicUsize = AtomicUsize::new(0);
+/// General workers running an item now.
+static GENERAL_BUSY: AtomicUsize = AtomicUsize::new(0);
 /// Worker threads started (the initial pool and the extra ones).
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 /// Workers now waiting at the big-compile gate.
@@ -447,6 +645,8 @@ fn worker_loop(reserved: bool) {
         let _spared = (lane == SPARED).then(|| SparedGuard); // (lazily: a guard made and dropped would count down)
         if reserved {
             RESERVED_BUSY.fetch_add(1, Ordering::SeqCst);
+        } else {
+            GENERAL_BUSY.fetch_add(1, Ordering::SeqCst);
         }
         match item {
             Item::Build(p) => build_queued(&p),
@@ -454,6 +654,8 @@ fn worker_loop(reserved: bool) {
         }
         if reserved {
             RESERVED_BUSY.fetch_sub(1, Ordering::SeqCst);
+        } else {
+            GENERAL_BUSY.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -511,6 +713,7 @@ pub fn workers() -> (usize, usize) {
 }
 
 fn enqueue(p: Arc<Pending>) {
+    p.facts.queued_at.lock().unwrap().get_or_insert_with(std::time::Instant::now);
     let spared = p.spared.load(Ordering::Acquire);
     push(lane_for(p.compute, false, spared), Item::Build(p));
 }
@@ -524,6 +727,8 @@ pub struct QueueGauges {
     pub reserved: usize,
     pub reserved_busy: usize,
     pub spared_in_flight: usize,
+    /// general workers running an item now
+    pub busy: usize,
     /// per gate (compute, graphics, giant): slots held and wanted builds waiting
     pub gate_held: [usize; 3],
     pub gate_wanted_waiting: [usize; 3],
@@ -548,6 +753,7 @@ pub fn queue_gauges() -> QueueGauges {
         reserved: RESERVED.load(Ordering::SeqCst),
         reserved_busy: RESERVED_BUSY.load(Ordering::SeqCst),
         spared_in_flight: SPARED_IN_FLIGHT.load(Ordering::SeqCst),
+        busy: GENERAL_BUSY.load(Ordering::SeqCst),
         gate_held,
         gate_wanted_waiting,
     }
@@ -636,6 +842,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         late: Default::default(),
         spared: Default::default(),
         demand: Default::default(),
+        facts: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1847,6 +2054,134 @@ mod used_tests {
         assert!(!image_skip_from(Some("0")));
         assert!(!image_skip_from(Some(" 0 ")));
     }
+
+    /// A left-out call names why its pipeline is not there, from the flags: building, late,
+    /// image-only, failed; a built pipeline and an unknown one have no reason.
+    #[test]
+    fn a_skip_names_why_the_pipeline_is_not_there() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (first, spared, failed, built) = (0x7E57_C1A1usize, 0x7E57_C1A2usize, 0x7E57_C1A3usize, 0x7E57_C1A4usize);
+        let (go, finish) = mpsc::channel::<()>();
+        // (a job that returns 0: nothing for `release`, however the stand-in is let go)
+        submit_lazy(first, true, Box::new(move || {
+            let _ = finish.recv_timeout(std::time::Duration::from_secs(10));
+            0
+        }), 0);
+        resolve(first);
+        assert_eq!(why_unbuilt(first), Some(Unbuilt::Building));
+        entry(first).unwrap().late.store(true, Ordering::Release);
+        assert_eq!(why_unbuilt(first), Some(Unbuilt::Late));
+        submit_lazy(spared, true, Box::new(|| 0), 0);
+        image_only(spared);
+        assert_eq!(why_unbuilt(spared), Some(Unbuilt::ImageOnly));
+        submit_lazy(failed, true, Box::new(|| 0), 0);
+        resolve(failed);
+        wait_built(failed);
+        assert_eq!(why_unbuilt(failed), Some(Unbuilt::Failed));
+        submit_lazy(built, true, Box::new(|| 0x6C1A), 0);
+        resolve(built);
+        wait_built(built);
+        assert_eq!(why_unbuilt(built), None);
+        assert_eq!(why_unbuilt(0x7E57_C1FF), None, "no entry");
+        let s = skipped(0x7E57_C1FF);
+        assert!(s.why.is_none() && !s.must_draw, "no entry");
+        for _ in 0..4 {
+            assert_eq!(skipped(first).why, Some(Unbuilt::Late));
+        }
+        assert_eq!(entry(first).unwrap().facts.skips.load(Ordering::Relaxed), 4);
+        assert_eq!(skipped(built).why, None);
+        assert_eq!(
+            [Unbuilt::Building, Unbuilt::Late, Unbuilt::ImageOnly, Unbuilt::Failed].map(Unbuilt::name),
+            ["building", "late", "image_only", "failed"]
+        );
+        let _ = go.send(());
+        wait_built(first);
+        for s in [first, spared, failed, built] {
+            let _ = released(s);
+        }
+    }
+
+    /// A build's record has its times: sent to the workers, taken, and held for as long as the job ran.
+    #[test]
+    fn a_build_record_carries_its_times() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let standin = 0x7E57_C1B1usize;
+        submit_lazy(standin, false, Box::new(|| {
+            std::thread::sleep(ms(50));
+            0x6C1B
+        }), 0);
+        resolve(standin);
+        wait_built(standin);
+        let p = entry(standin).unwrap();
+        let r = record(&p, p.real.load(Ordering::Acquire));
+        assert!(r.queued.is_some(), "sent and taken, but no queue time");
+        assert!(r.held.is_some_and(|h| h >= ms(50)), "held {:?}", r.held);
+        assert_eq!(r.outcome, "built");
+        assert_eq!(r.skips, 0);
+        assert!(!r.compute && !r.late && !r.must_draw && !r.abandoned);
+        // (0x6C1B is no pipeline: taken, not released)
+        let _ = released(standin);
+    }
+
+    /// `note_size` and `note_driver_compile` go to the build the calling worker runs: the largest
+    /// size is kept, the gate waits add up; on a thread that builds nothing they do nothing.
+    #[test]
+    fn driver_compile_facts_go_to_the_build_on_this_worker() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let standin = 0x7E57_C1C1usize;
+        note_size(1 << 30);
+        note_driver_compile(1 << 30, ms(5));
+        submit_lazy(standin, false, Box::new(|| {
+            note_driver_compile(300 << 10, ms(5));
+            note_driver_compile(200 << 10, ms(5));
+            note_size(250 << 10);
+            0x6C1C
+        }), 0);
+        resolve(standin);
+        wait_built(standin);
+        let p = entry(standin).unwrap();
+        let r = record(&p, p.real.load(Ordering::Acquire));
+        assert_eq!(r.dxil_bytes, 307_200);
+        assert_eq!(r.gate, ms(10));
+        let _ = released(standin);
+    }
+
+    /// The pipelines not built that a title needed or had a call left out come first by skips; one
+    /// that was only sent to the workers is not in the list.
+    #[test]
+    fn unbuilt_records_list_needed_pipelines_by_skips() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (needed, quiet) = (0x7E57_C1D1usize, 0x7E57_C1D2usize);
+        let (needed_key, quiet_key) = (0xC1C1_0001u64, 0xC1C1_0002u64);
+        let (go_a, finish_a) = mpsc::channel::<()>();
+        let (go_b, finish_b) = mpsc::channel::<()>();
+        submit_lazy(needed, true, Box::new(move || {
+            let _ = finish_a.recv_timeout(std::time::Duration::from_secs(10));
+            0
+        }), needed_key);
+        submit_lazy(quiet, true, Box::new(move || {
+            let _ = finish_b.recv_timeout(std::time::Duration::from_secs(10));
+            0
+        }), quiet_key);
+        need_by_submit(needed);
+        resolve(quiet);
+        for _ in 0..3 {
+            skipped(needed);
+        }
+        // (other tests' pipelines may be in the list: ours are picked out by key)
+        let list = unbuilt_records(usize::MAX);
+        let a = list.iter().find(|r| r.key == needed_key).expect("the needed pipeline is listed");
+        assert_eq!(a.skips, 3);
+        assert!(a.need.is_some());
+        assert_eq!(a.outcome, "pending");
+        assert!(list.iter().all(|r| r.key != quiet_key), "a pipeline nobody needed or skipped is listed");
+        assert!(list.windows(2).all(|w| w[0].skips >= w[1].skips), "not by skips, most first");
+        assert!(unbuilt_records(0).is_empty());
+        let _ = (go_a.send(()), go_b.send(()));
+        wait_built(needed);
+        wait_built(quiet);
+        let _ = (released(needed), released(quiet));
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -1939,6 +2274,7 @@ fn resolve_wait_inner(pso: usize, budget: Option<std::time::Duration>, mode: Com
         let r = resolve_within(&p, pso, budget);
         if !already && !late {
             note_blocked(p.compute, false, started.elapsed());
+            p.facts.waited_us.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         return r;
     }
@@ -1973,6 +2309,7 @@ fn resolve_wait_inner(pso: usize, budget: Option<std::time::Duration>, mode: Com
     drop(done);
     if !already {
         note_blocked(p.compute, false, started.elapsed());
+        p.facts.waited_us.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
     if expired {
         if let Some(limit) = limit {
@@ -2070,6 +2407,7 @@ fn need_now(p: &Arc<Pending>) {
         !std::mem::replace(&mut d.by_submit, true)
     };
     if first {
+        p.facts.queued_at.lock().unwrap().get_or_insert_with(std::time::Instant::now);
         push(lane_for(p.compute, true, false), Item::Build(p.clone()));
     }
     p.sent.store(true, Ordering::Release);
@@ -2118,6 +2456,7 @@ fn wait_in_frame(p: &Arc<Pending>, pso: usize, frame: u64, budget: std::time::Du
     let took = started.elapsed();
     frame_spend(counter, frame, took);
     note_blocked(p.compute, false, took);
+    p.facts.waited_us.fetch_add(took.as_micros() as u64, Ordering::Relaxed);
     if !done {
         p.late.store(true, Ordering::Release);
     }

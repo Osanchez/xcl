@@ -4226,6 +4226,7 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
     let waited = std::time::Instant::now();
     let _slot = huge.then(|| big_compile_turn(compile_slots(bytes, !kind.contains("compute")), big_compile_headroom(bytes), big_compile_commit_free, super::pso_async::build_is_wanted, is_preload_thread()));
     let waited = waited.elapsed();
+    super::pso_async::note_driver_compile(bytes, waited);
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     let log = pso_trace() || bytes >= huge_pso_bytes();
@@ -4726,6 +4727,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         }
     };
     let dxil = compiled.dxil;
+    super::pso_async::note_size(dxil.len());
     // a big program: the driver's compile takes it seconds to a minute (a retail game's 1 MB
     // ray-tracing resolve programs ~30 s each, ~600 of them): built in the background like one
     // whose DXIL is missing – the title's loading does not wait for it, its first bind does
