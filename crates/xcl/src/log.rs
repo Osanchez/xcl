@@ -734,6 +734,8 @@ pub struct FrameFacts {
     pub dispatches: u64,
     pub barriers: Option<u64>,
     pub pso_wait_ms: f64,
+    pub pso_wait_draw_ms: f64,
+    pub pso_wait_dispatch_ms: f64,
     pub look_ms: f64,
     pub sampled: bool,
     pub why: Option<&'static str>,
@@ -803,6 +805,10 @@ pub struct PipelineFacts {
     pub waited_ms: f64,
     pub source: Option<&'static str>,
     pub blob: bool,
+    /// who built it: preload, extra, worker, xcl or title
+    pub by: &'static str,
+    /// whether one of the title's threads waited for it
+    pub wanted: bool,
 }
 
 /// Facts for the `resource` creation event.
@@ -842,6 +848,8 @@ pub fn frame_fields(f: &FrameFacts) -> Fields {
         ("dispatches", Value::from(f.dispatches)),
         ("barriers", num_opt(f.barriers)),
         ("pso_wait_ms", ms_val(f.pso_wait_ms)),
+        ("pso_wait_draw_ms", ms_val(f.pso_wait_draw_ms)),
+        ("pso_wait_dispatch_ms", ms_val(f.pso_wait_dispatch_ms)),
         ("look_ms", ms_val(f.look_ms)),
         ("sampled", Value::from(f.sampled)),
     ];
@@ -949,6 +957,8 @@ pub fn pipeline_fields_built(p: &PipelineFacts) -> Fields {
         ("waited_ms", ms_val(p.waited_ms)),
         ("source", str_opt(p.source)),
         ("blob", Value::from(p.blob)),
+        ("by", Value::from(p.by)),
+        ("wanted", Value::from(p.wanted)),
     ]
 }
 
@@ -1077,6 +1087,8 @@ mod timing_tests {
             dispatches: 2,
             barriers: None,
             pso_wait_ms: 0.0,
+            pso_wait_draw_ms: 0.0,
+            pso_wait_dispatch_ms: 0.0,
             look_ms: 0.25,
             sampled: true,
             why: None,
@@ -1093,6 +1105,8 @@ mod timing_tests {
         assert!(o["barriers"].is_null());
         assert_eq!(o["sampled"], true);
         assert!(!o.contains_key("why"));
+        assert_eq!(o["pso_wait_draw_ms"], 0.0);
+        assert_eq!(o["pso_wait_dispatch_ms"], 0.0);
         let keys: Vec<&str> = o.keys().map(|k| k.as_str()).collect();
         assert!(keys.contains(&"wait_calls") && keys.contains(&"look_ms"));
         let mut f = frame();
@@ -1107,6 +1121,19 @@ mod timing_tests {
         assert!(o["wait_ms"].is_null());
         assert_eq!(o["barriers"], 9);
         assert_eq!(o["why"], "late");
+        // the two PSO waits are flat keys, null-safe, and pso_wait_ms is their sum
+        let mut f = frame();
+        f.pso_wait_draw_ms = 1.25;
+        f.pso_wait_dispatch_ms = 0.5;
+        f.pso_wait_ms = f.pso_wait_draw_ms + f.pso_wait_dispatch_ms;
+        let o = line("frame", &frame_fields(&f));
+        assert_eq!(o["pso_wait_draw_ms"], 1.25);
+        assert_eq!(o["pso_wait_dispatch_ms"], 0.5);
+        assert_eq!(o["pso_wait_ms"].as_f64().unwrap(), o["pso_wait_draw_ms"].as_f64().unwrap() + o["pso_wait_dispatch_ms"].as_f64().unwrap());
+        f.pso_wait_draw_ms = f64::NAN;
+        f.pso_wait_dispatch_ms = f64::INFINITY;
+        let o = line("frame", &frame_fields(&f));
+        assert!(o["pso_wait_draw_ms"].is_null() && o["pso_wait_dispatch_ms"].is_null());
     }
 
     #[test]
@@ -1223,12 +1250,19 @@ mod timing_tests {
 
     #[test]
     fn pipeline_fields_hex_the_record_hash() {
-        let mut p = PipelineFacts { id: 3, stage: "graphics", record: Some(0xabc), dxil_bytes: 100, compile_ms: 1.23456, waited_ms: 0.0, source: Some("dxc"), blob: true };
+        let mut p = PipelineFacts { id: 3, stage: "graphics", record: Some(0xabc), dxil_bytes: 100, compile_ms: 1.23456, waited_ms: 0.0, source: Some("dxc"), blob: true, by: "worker", wanted: true };
         let o = line("pipeline", &pipeline_fields_built(&p));
         assert_eq!(o["records"], serde_json::json!(["0000000000000abc"]));
         assert_eq!(o["compile_ms"], 1.235);
         assert_eq!(o["source"], "dxc");
         assert_eq!(o["blob"], true);
+        assert_eq!(o["by"], "worker");
+        assert_eq!(o["wanted"], true);
+        p.by = "title";
+        p.wanted = false;
+        let o = line("pipeline", &pipeline_fields_built(&p));
+        assert_eq!(o["by"], "title");
+        assert_eq!(o["wanted"], false);
         p.record = None;
         p.source = None;
         let o = line("pipeline", &pipeline_fields_built(&p));

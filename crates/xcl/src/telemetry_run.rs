@@ -319,7 +319,26 @@ pub fn telemetry_activity(presents_2s: u64, committed_mb: u64) {
     if !crate::log::telemetry_on(crate::log::Tier::Frame) {
         return;
     }
-    crate::log::event(crate::log::Tier::Frame, "activity", &[("presents_2s", presents_2s.into()), ("committed_mb", committed_mb.into())]);
+    let b = crate::hle::d3d12x::pso_async::blocked();
+    let (pso_us, builds) = (b[0][1] + b[1][1], super::pipeline_builds_title());
+    let pso_us_prev = ACTIVITY_PSO_US.swap(pso_us, Ordering::Relaxed);
+    let builds_prev = ACTIVITY_BUILDS_TITLE.swap(builds, Ordering::Relaxed);
+    let mut f = vec![("presents_2s", presents_2s.into()), ("committed_mb", committed_mb.into())];
+    f.extend(activity_pso_fields(pso_us, pso_us_prev, builds, builds_prev));
+    crate::log::event(crate::log::Tier::Frame, "activity", &f);
+}
+
+/// The PSO microseconds waited and the title's pipeline builds at the previous `activity` event.
+static ACTIVITY_PSO_US: AtomicU64 = AtomicU64::new(0);
+static ACTIVITY_BUILDS_TITLE: AtomicU64 = AtomicU64::new(0);
+
+/// pure: `pso_wait_ms` (the waited microseconds since the previous event, in ms, 3 decimals) and
+/// `builds_title` (the title's pipeline builds since then).
+fn activity_pso_fields(pso_us: u64, pso_us_prev: u64, builds: u64, builds_prev: u64) -> [(&'static str, serde_json::Value); 2] {
+    [
+        ("pso_wait_ms", (pso_us.saturating_sub(pso_us_prev) as f64 / 1000.0).into()),
+        ("builds_title", builds.saturating_sub(builds_prev).into()),
+    ]
 }
 
 /// pure: the switches of `vars` (the manifest's `XCL_*` map) that change generated code or
@@ -1207,6 +1226,18 @@ mod telemetry_p5e_tests {
         assert!(!on && warning.is_some());
         let (on, warning) = loop_counters_wanted(Some("1"), Some("pass"));
         assert!(!on && warning.is_some());
+    }
+
+    #[test]
+    fn activity_pso_fields_are_deltas() {
+        let f = activity_pso_fields(7500, 2000, 9, 4);
+        assert_eq!(f[0], ("pso_wait_ms", serde_json::json!(5.5)));
+        assert_eq!(f[1], ("builds_title", serde_json::json!(5)));
+        let f = activity_pso_fields(0, 0, 0, 0);
+        assert_eq!((f[0].1.as_f64(), f[1].1.as_u64()), (Some(0.0), Some(0)));
+        // a counter that went back never wraps
+        let f = activity_pso_fields(10, 20, 1, 3);
+        assert_eq!((f[0].1.as_f64(), f[1].1.as_u64()), (Some(0.0), Some(0)));
     }
 
     #[test]

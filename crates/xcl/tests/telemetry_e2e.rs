@@ -233,6 +233,7 @@ fn telemetry_frame_events_match_the_run() {
     assert!(presents >= FRAMES, "the scenario presents {FRAMES} frames, the report counts {presents}");
     for (k, (_, f)) in frames.iter().enumerate() {
         assert_eq!(f["i"].as_u64(), Some(k as u64 + 1), "frame events must run 1..N without gaps: {f}");
+        assert!(f["pso_wait_draw_ms"].is_number() && f["pso_wait_dispatch_ms"].is_number(), "frame {}: missing pso_wait_draw_ms / pso_wait_dispatch_ms: {f}", k + 1);
     }
 
     // `memory` events only move forward

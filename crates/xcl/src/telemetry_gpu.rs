@@ -2400,12 +2400,38 @@ pub fn telemetry_pipeline_label(pso: usize, shaders: &[(&str, Option<&[u8]>)]) {
     pass_sink("pipeline_bind", pipeline_bind_fields(id, shaders));
 }
 
+/// `pipeline` builds made by the title's own threads (`by` == "title"), since the run began.
+static BUILDS_TITLE: AtomicU64 = AtomicU64::new(0);
+
+/// How many `pipeline` events the title's own threads caused so far (the `activity` event takes
+/// the delta).
+pub fn pipeline_builds_title() -> u64 {
+    BUILDS_TITLE.load(Ordering::Relaxed)
+}
+
+/// pure: who builds on a thread named `name`: `xcl-pso-pre*` preload workers, `xcl-pso-x*` extra
+/// workers, other `xcl-pso*` workers, other `xcl-*` threads of XCL, anything else the title.
+fn built_by(name: Option<&str>) -> &'static str {
+    match name {
+        Some(n) if n.starts_with("xcl-pso-pre") => "preload",
+        Some(n) if n.starts_with("xcl-pso-x") => "extra",
+        Some(n) if n.starts_with("xcl-pso") => "worker",
+        Some(n) if n.starts_with("xcl-") => "xcl",
+        _ => "title",
+    }
+}
+
 /// A pipeline was built by the driver: writes its `pipeline` event. `kind` is the build's label
 /// (`compute` anywhere in it makes the stage compute); `record` is the console record hash and
 /// whether a driver blob was supplied.
 pub fn telemetry_pipeline_built(kind: &str, dxil_bytes: usize, record: Option<(u64, bool)>, driver: Duration, waited: Duration) {
     if !xlog::telemetry_on(Tier::Pass) {
         return;
+    }
+    let wanted = crate::hle::d3d12x::pso_async::wanted_here()();
+    let by = built_by(std::thread::current().name());
+    if by == "title" {
+        BUILDS_TITLE.fetch_add(1, Ordering::Relaxed);
     }
     let source = SOURCE.with(|c| c.take());
     let facts = xlog::PipelineFacts {
@@ -2417,6 +2443,8 @@ pub fn telemetry_pipeline_built(kind: &str, dxil_bytes: usize, record: Option<(u
         waited_ms: waited.as_secs_f64() * 1000.0,
         source,
         blob: record.is_some_and(|r| r.1),
+        by,
+        wanted,
     };
     pass_sink("pipeline", xlog::pipeline_fields_built(&facts));
 }
@@ -2679,7 +2707,8 @@ struct Close {
 struct Counters {
     draws: u64,
     dispatches: u64,
-    pso_us: u64,
+    pso_draw_us: u64,
+    pso_dispatch_us: u64,
     look_us: u64,
     wait_ns: u64,
     wait_calls: u64,
@@ -2695,7 +2724,8 @@ impl Counters {
         Counters {
             draws,
             dispatches,
-            pso_us: b[0][1] + b[1][1],
+            pso_draw_us: b[0][1],
+            pso_dispatch_us: b[1][1],
             look_us: crate::hle::d3d12x::sparse::look_counters()[0],
             wait_ns: WAIT_NS.load(Ordering::Relaxed),
             wait_calls: WAIT_CALLS.load(Ordering::Relaxed),
@@ -2716,6 +2746,8 @@ struct FrameRec {
     dispatches: u64,
     barriers: u64,
     pso_wait_ms: f64,
+    pso_wait_draw_ms: f64,
+    pso_wait_dispatch_ms: f64,
     look_ms: f64,
     lists: u32,
     sampled: bool,
@@ -2739,7 +2771,7 @@ impl FrameBook {
         FrameBook {
             pending: VecDeque::new(),
             waiting: Vec::new(),
-            prev: Counters { draws: 0, dispatches: 0, pso_us: 0, look_us: 0, wait_ns: 0, wait_calls: 0, barriers: 0 },
+            prev: Counters { draws: 0, dispatches: 0, pso_draw_us: 0, pso_dispatch_us: 0, look_us: 0, wait_ns: 0, wait_calls: 0, barriers: 0 },
             last_qpc: None,
             last_written: 0,
         }
@@ -2763,7 +2795,9 @@ impl FrameBook {
             draws: d(n.draws, p.draws),
             dispatches: d(n.dispatches, p.dispatches),
             barriers: d(n.barriers, p.barriers),
-            pso_wait_ms: d(n.pso_us, p.pso_us) as f64 / 1000.0,
+            pso_wait_ms: (d(n.pso_draw_us, p.pso_draw_us) + d(n.pso_dispatch_us, p.pso_dispatch_us)) as f64 / 1000.0,
+            pso_wait_draw_ms: d(n.pso_draw_us, p.pso_draw_us) as f64 / 1000.0,
+            pso_wait_dispatch_ms: d(n.pso_dispatch_us, p.pso_dispatch_us) as f64 / 1000.0,
             look_ms: d(n.look_us, p.look_us) as f64 / 1000.0,
             lists: c.lists,
             sampled: c.sampled,
@@ -2877,6 +2911,8 @@ fn frame_facts(r: &FrameRec, want: u32, forced: Option<&'static str>) -> FrameFa
         dispatches: r.dispatches,
         barriers: Some(r.barriers),
         pso_wait_ms: r.pso_wait_ms,
+        pso_wait_draw_ms: r.pso_wait_draw_ms,
+        pso_wait_dispatch_ms: r.pso_wait_dispatch_ms,
         look_ms: r.look_ms,
         sampled: r.sampled,
         why,
@@ -3254,6 +3290,32 @@ mod tests {
         assert!(!tel.started());
         tel.set_frame(1);
         assert!(tel.started());
+    }
+
+    #[test]
+    fn built_by_names_the_builder_from_the_thread_name() {
+        assert_eq!(built_by(Some("xcl-pso-pre-1")), "preload");
+        assert_eq!(built_by(Some("xcl-pso-x3")), "extra");
+        assert_eq!(built_by(Some("xcl-pso-7")), "worker");
+        assert_eq!(built_by(Some("xcl-telemetry")), "xcl");
+        assert_eq!(built_by(Some("main")), "title");
+        assert_eq!(built_by(None), "title");
+    }
+
+    #[test]
+    fn frame_pso_wait_splits_draw_and_dispatch_and_keeps_the_sum() {
+        let mut b = FrameBook::new();
+        let mut c = close_of(1, 16, 1, true);
+        c.counters = Counters { pso_draw_us: 3000, pso_dispatch_us: 1500, ..Counters::default() };
+        b.close(c);
+        let r = &b.pending[0];
+        assert_eq!((r.pso_wait_draw_ms, r.pso_wait_dispatch_ms, r.pso_wait_ms), (3.0, 1.5, 4.5));
+        // the next frame takes deltas of the previous counters
+        let mut c = close_of(2, 32, 1, true);
+        c.counters = Counters { pso_draw_us: 3500, pso_dispatch_us: 1500, ..Counters::default() };
+        b.close(c);
+        let r = &b.pending[1];
+        assert_eq!((r.pso_wait_draw_ms, r.pso_wait_dispatch_ms, r.pso_wait_ms), (0.5, 0.0, 0.5));
     }
 
     #[test]
