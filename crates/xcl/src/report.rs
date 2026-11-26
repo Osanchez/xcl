@@ -252,6 +252,9 @@ use crate::log::{self as xlog, Tier};
 #[path = "telemetry_run.rs"]
 mod run_tel;
 pub use run_tel::*;
+#[path = "telemetry_gpu.rs"]
+mod gpu_tel;
+pub use gpu_tel::*;
 
 /// `manifest.json` of a telemetry run (schema 1). Unknown values stay JSON null.
 #[derive(Serialize, Default, Clone)]
@@ -335,6 +338,7 @@ pub fn telemetry_start(boot: &crate::config::Boot) {
         *g = Some(m);
     }
     crate::xlog_info!("telemetry: {} -> {}", tier.name(), dir.display());
+    gpu_tel::telemetry_gpu_start();
 }
 
 /// The manifest of a run at its start (device and DXC fields still null).
@@ -437,6 +441,7 @@ fn telemetry_final(report_json: &str) {
     if !xlog::telemetry_on(Tier::Frame) {
         return;
     }
+    gpu_tel::telemetry_gpu_final();
     let Some(dir) = xlog::run_dir() else { return };
     let tmp = dir.join("report.json.tmp");
     if std::fs::write(&tmp, report_json).is_ok() && std::fs::rename(&tmp, dir.join("report.json")).is_err() {
