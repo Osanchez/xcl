@@ -62,6 +62,8 @@ struct Facts {
     must_draw: std::sync::atomic::AtomicBool,
     /// its driver compile ran past its hard limit (set by a later unit)
     abandoned: std::sync::atomic::AtomicBool,
+    /// its translated DXIL is class XL (`note_size`): binds do not wait for it
+    background: std::sync::atomic::AtomicBool,
 }
 
 const OUTCOME_BUILT: u8 = 0;
@@ -195,6 +197,8 @@ pub enum Unbuilt {
     Late,
     /// its binds do not wait for it (`image_only`)
     ImageOnly,
+    /// its binds do not wait for it: its DXIL is class XL (`Facts::background`)
+    Background,
     /// its build ended with no pipeline
     Failed,
 }
@@ -206,6 +210,7 @@ impl Unbuilt {
             Unbuilt::Building => "building",
             Unbuilt::Late => "late",
             Unbuilt::ImageOnly => "image_only",
+            Unbuilt::Background => "background",
             Unbuilt::Failed => "failed",
         }
     }
@@ -225,6 +230,8 @@ fn why_of(p: &Pending) -> Option<Unbuilt> {
         None
     } else if *p.done.lock().unwrap() {
         Some(Unbuilt::Failed)
+    } else if p.facts.background.load(Ordering::Acquire) {
+        Some(Unbuilt::Background)
     } else if p.spared.load(Ordering::Acquire) {
         Some(Unbuilt::ImageOnly)
     } else if p.late.load(Ordering::Acquire) {
@@ -249,11 +256,28 @@ pub fn skipped(pso: usize) -> Skipped {
     Skipped { why: why_of(&p), must_draw: p.facts.must_draw.load(Ordering::Relaxed) }
 }
 
+/// A bind's wait for `p` ends without its build: binds do not wait for a program of class XL.
+fn stop_waiting(p: &Pending) -> bool {
+    p.facts.background.load(Ordering::Acquire)
+}
+
+/// `p`'s DXIL is known to be class L or XL (a compute pipeline; 0 bytes: not known yet).
+#[allow(dead_code)]
+pub(crate) fn large_known(p: &Pending) -> bool {
+    p.compute && super::real::size_class(p.facts.dxil_bytes.load(Ordering::Relaxed)) >= super::real::SizeClass::L
+}
+
 /// The DXIL this thread's build translated: kept for its record (the largest, if several).
 pub(super) fn note_size(bytes: usize) {
     BUILDING.with(|b| {
         if let Some(p) = b.borrow().as_ref() {
             p.facts.dxil_bytes.fetch_max(bytes, Ordering::Relaxed);
+            if p.compute && super::real::size_class(bytes) == super::real::SizeClass::Xl {
+                // (set under `done`'s lock, so a waiter that checked it just before is woken)
+                let _done = p.done.lock().unwrap();
+                p.facts.background.store(true, Ordering::Release);
+                p.cv.notify_all();
+            }
         }
     });
 }
@@ -2182,6 +2206,37 @@ mod used_tests {
         wait_built(quiet);
         let _ = (released(needed), released(quiet));
     }
+
+    /// A bind waiting for a compute build is let go as soon as the build's translation turns out
+    /// to be class XL: it gets the stand-in, and the pipeline is `Background`.
+    #[test]
+    fn an_xl_program_is_not_waited_for_once_its_size_is_known() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let standin = 0x7E57_C4A1usize;
+        let (sized, sized_rx) = mpsc::channel::<()>();
+        let (finish_tx, finish) = mpsc::channel::<()>();
+        // (the job fails, 0: nothing for `release`)
+        submit_lazy(standin, true, Box::new(move || {
+            note_size(3 << 20);
+            let _ = sized.send(());
+            let _ = finish.recv_timeout(ms(2000));
+            0
+        }), 0);
+        let (got_tx, got_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _ = got_tx.send(resolve_wait(standin));
+        });
+        sized_rx.recv_timeout(ms(10_000)).expect("a worker started the build");
+        let got = got_rx.recv_timeout(ms(300)).expect("the bind kept waiting after the size was known");
+        assert_eq!(got, standin, "the stand-in");
+        assert_eq!(why_unbuilt(standin), Some(Unbuilt::Background));
+        assert!(!*entry(standin).unwrap().done.lock().unwrap(), "the build was still running");
+        assert!(large_known(&entry(standin).unwrap()));
+        let _ = finish_tx.send(());
+        waiter.join().unwrap();
+        wait_built(standin);
+        let _ = released(standin);
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -2247,7 +2302,7 @@ fn resolve_wait_limited(pso: usize, limit: Option<std::time::Duration>) -> usize
 fn resolve_wait_inner(pso: usize, budget: Option<std::time::Duration>, mode: ComputeWait, frame: u64) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
-    if p.spared.load(Ordering::Acquire) {
+    if p.spared.load(Ordering::Acquire) || p.facts.background.load(Ordering::Acquire) {
         return resolve_spared(&p, pso);
     }
     let already = *p.done.lock().unwrap();
@@ -2296,12 +2351,12 @@ fn resolve_wait_inner(pso: usize, budget: Option<std::time::Duration>, mode: Com
     match limit {
         Some(limit) => {
             let left = limit.saturating_sub(started.elapsed());
-            let (d, t) = p.cv.wait_timeout_while(done, left, |d| !*d).unwrap();
+            let (d, t) = p.cv.wait_timeout_while(done, left, |d| !*d && !stop_waiting(&p)).unwrap();
             done = d;
             expired = t.timed_out() && !*done;
         }
         None => {
-            while !*done {
+            while !*done && !stop_waiting(&p) {
                 done = p.cv.wait(done).unwrap();
             }
         }
@@ -2450,7 +2505,7 @@ fn wait_in_frame(p: &Arc<Pending>, pso: usize, frame: u64, budget: std::time::Du
     let done = {
         let _held = Held::new();
         let _open = OpenWait::new(pso, p.compute, false, started);
-        let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), allowance, |d| !*d).unwrap();
+        let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), allowance, |d| !*d && !stop_waiting(p)).unwrap();
         *done
     };
     let took = started.elapsed();
@@ -2531,7 +2586,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         return p.stand(pso);
     }
     p.want();
-    let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
+    let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d && !stop_waiting(p)).unwrap();
     if *done {
         return built(p);
     }
@@ -2582,7 +2637,7 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
             if !p.sent.swap(true, Ordering::AcqRel) {
                 enqueue(p.clone());
             }
-            if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
+            if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) && p.spared.load(Ordering::Acquire) {
                 static N: AtomicUsize = AtomicUsize::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed);
                 if n < 16 || n.is_power_of_two() {

@@ -4068,6 +4068,59 @@ fn huge_pso_bytes() -> usize {
     *V.get_or_init(|| env_count(std::env::var("XCL_HUGE_PSO_BYTES").ok().as_deref(), 256 << 10, 1, usize::MAX))
 }
 
+/// DXIL size from which a compute driver compile is "L" (default 768 KiB, `XCL_PSO_L_BYTES`, at
+/// least `huge_pso_bytes()`): L builds share the compute lane but hold at most `large_cap` of its slots.
+fn large_pso_bytes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_count(std::env::var("XCL_PSO_L_BYTES").ok().as_deref(), 768 << 10, huge_pso_bytes(), usize::MAX))
+}
+
+/// DXIL size from which a compute driver compile is "XL" (default 2 MiB, `XCL_PSO_XL_BYTES`, at
+/// least `large_pso_bytes()`): it takes the giant lane and is built in the background.
+fn xl_pso_bytes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_count(std::env::var("XCL_PSO_XL_BYTES").ok().as_deref(), 2 << 20, large_pso_bytes(), usize::MAX))
+}
+
+/// A driver compile's class by the size of its DXIL: S (below `huge`, not gated), M, L (from
+/// `large`), XL (from `xl`).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum SizeClass {
+    S,
+    M,
+    L,
+    Xl,
+}
+
+impl SizeClass {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            SizeClass::S => "S",
+            SizeClass::M => "M",
+            SizeClass::L => "L",
+            SizeClass::Xl => "XL",
+        }
+    }
+}
+
+fn size_class_for(bytes: usize, huge: usize, large: usize, xl: usize) -> SizeClass {
+    if bytes < huge {
+        SizeClass::S
+    } else if bytes < large {
+        SizeClass::M
+    } else if bytes < xl {
+        SizeClass::L
+    } else {
+        SizeClass::Xl
+    }
+}
+
+/// The class of a driver compile of `bytes` of DXIL, by `XCL_HUGE_PSO_BYTES`, `XCL_PSO_L_BYTES` and
+/// `XCL_PSO_XL_BYTES`. The only place the thresholds are applied.
+pub(crate) fn size_class(bytes: usize) -> SizeClass {
+    size_class_for(bytes, huge_pso_bytes(), large_pso_bytes(), xl_pso_bytes())
+}
+
 /// Allow one huge driver compile per four available logical CPUs, up to four by default, and
 /// no more than one per 12 GiB of physical memory (`ram_gib` 0, unknown: one).
 fn default_huge_pso_concurrency(cpus: usize, ram_gib: usize) -> usize {
@@ -4135,6 +4188,14 @@ struct Slots {
     reserved: &'static Reserved,
     preloads: AtomicUsize,
     wanted_waiting: AtomicUsize,
+    /// slots held by L builds (changed under `n`'s lock)
+    large: AtomicUsize,
+}
+
+/// The slots of a lane of `cap` that L builds may hold with `workers` pool workers: one is left
+/// for an M build, and two workers for the rest (at least one).
+fn large_cap(cap: usize, workers: usize) -> usize {
+    cap.saturating_sub(1).max(1).min(workers.saturating_sub(2).max(1))
 }
 
 impl Slots {
@@ -4147,8 +4208,8 @@ impl Slots {
     }
 }
 
-/// A slot, the commit its compile reserved, and whether a preload holds it.
-struct SlotGuard(&'static Slots, u64, bool);
+/// A slot, the commit its compile reserved, whether a preload holds it, and whether an L build does.
+struct SlotGuard(&'static Slots, u64, bool, bool);
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
@@ -4157,19 +4218,22 @@ impl Drop for SlotGuard {
         if self.2 {
             self.0.preloads.fetch_sub(1, Ordering::SeqCst);
         }
+        if self.3 {
+            self.0.large.fetch_sub(1, Ordering::SeqCst);
+        }
         *n -= 1;
         drop(n);
         self.0.cv.notify_all();
     }
 }
 
-static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 0, wanted_most: 0, reserved: &COMPILE_COMMIT_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0) };
-static GRAPHICS_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 0, wanted_most: 0, reserved: &COMPILE_COMMIT_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0) };
+static BIG_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 0, wanted_most: 0, reserved: &COMPILE_COMMIT_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0), large: AtomicUsize::new(0) };
+static GRAPHICS_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 0, wanted_most: 0, reserved: &COMPILE_COMMIT_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0), large: AtomicUsize::new(0) };
 const GIANT_DRIVER_COMPILE: usize = 4 << 20;
-static GIANT_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1, reserved: &COMPILE_COMMIT_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0) };
+static GIANT_COMPILES: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1, reserved: &COMPILE_COMMIT_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0), large: AtomicUsize::new(0) };
 
 fn compile_slots(bytes: usize, graphics: bool) -> &'static Slots {
-    if bytes >= GIANT_DRIVER_COMPILE {
+    if bytes >= GIANT_DRIVER_COMPILE || (!graphics && bytes >= xl_pso_bytes()) {
         &GIANT_COMPILES
     } else if graphics {
         &GRAPHICS_COMPILES
@@ -4205,6 +4269,40 @@ fn is_preload_thread() -> bool {
     std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso-pre"))
 }
 
+/// Worker builds of class L or XL between just before the gate and just after the driver call.
+static LARGE_HELD: AtomicUsize = AtomicUsize::new(0);
+
+/// Driver compiles running now (`build` of `driver_compile_identified`).
+static IN_DRIVER: AtomicUsize = AtomicUsize::new(0);
+
+/// One count on a gauge until it is dropped, on any path (a panic included).
+struct CountGuard(&'static AtomicUsize);
+
+impl CountGuard {
+    fn new(gauge: &'static AtomicUsize) -> CountGuard {
+        gauge.fetch_add(1, Ordering::SeqCst);
+        CountGuard(gauge)
+    }
+}
+
+impl Drop for CountGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Worker builds of class L or XL that are waiting at the gate or in the driver now.
+#[allow(dead_code)]
+pub(crate) fn large_held() -> usize {
+    LARGE_HELD.load(Ordering::SeqCst)
+}
+
+/// Driver compiles running now.
+#[allow(dead_code)]
+pub(crate) fn in_driver() -> usize {
+    IN_DRIVER.load(Ordering::SeqCst)
+}
+
 /// A driver compile of `bytes` of DXIL through `build`: a huge one on an `xcl-pso*` worker
 /// waits for its slot first (`big_compile_turn`; not a title thread's, nor one the title waits
 /// for). Logs its time, size and whether it was gated.
@@ -4222,9 +4320,24 @@ fn pso_trace() -> bool {
 /// `[SHADER]` lines and `xcl shaders --measure-pso`) and whether a driver blob was supplied.
 /// Also returns the time spent in the driver alone (not waiting for a slot).
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
-    let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let on_worker = std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let huge = gate && bytes >= huge_pso_bytes() && on_worker;
+    let class = size_class(bytes);
+    let graphics = !kind.contains("compute");
+    if graphics && class >= SizeClass::L {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: a graphics pipeline of {bytes} B DXIL (class {}): expected S or M", class.name());
+        }
+    }
+    let large = !graphics && class == SizeClass::L;
+    // (an XL compute build is never waited for: it always waits for commit headroom)
+    let xl = !graphics && class == SizeClass::Xl;
+    let wanted = move || !xl && super::pso_async::build_is_wanted();
+    let _large_held = (class >= SizeClass::L && on_worker).then(|| CountGuard::new(&LARGE_HELD));
     let waited = std::time::Instant::now();
-    let _slot = huge.then(|| big_compile_turn(compile_slots(bytes, !kind.contains("compute")), big_compile_headroom(bytes), big_compile_commit_free, super::pso_async::build_is_wanted, is_preload_thread()));
+    let _slot = huge.then(|| big_compile_turn(compile_slots(bytes, graphics), big_compile_headroom(bytes), big_compile_commit_free, wanted, is_preload_thread(), large));
     let waited = waited.elapsed();
     super::pso_async::note_driver_compile(bytes, waited);
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -4237,7 +4350,10 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
         crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}");
     }
     let started = std::time::Instant::now();
-    let r = build();
+    let r = {
+        let _in_driver = CountGuard::new(&IN_DRIVER);
+        build()
+    };
     let took = started.elapsed();
     crate::report::telemetry_pipeline_built(kind, bytes, record, took, waited);
     super::pso_manifest::note(super::pso_manifest::Event::Build { kind, bytes, record, driver_ms: took.as_millis(), waited_ms: waited.as_millis() });
@@ -4272,8 +4388,9 @@ fn gate_compute_driver_compile(has_cached_blob: bool) -> bool {
 /// `slots.wanted_most()` (default 2 for `>= 256 KB`, 1 for `>= 4 MiB` giant shaders) so a wanted
 /// build is not stuck behind 1 background build while a burst of lazy binds still cannot spike
 /// driver compiler commit into OOM. A `preload` that is not wanted gives way: it takes a slot
-/// only while no other preload holds one of this lane and no wanted build waits for a slot.
-fn big_compile_turn(slots: &'static Slots, need: u64, commit_free: impl Fn(u64) -> bool, wanted: impl Fn() -> bool, preload: bool) -> SlotGuard {
+/// only while no other preload holds one of this lane and no wanted build waits for a slot. An L
+/// build (`large`) also waits while L builds hold `large_cap` slots, so one is left for an M build.
+fn big_compile_turn(slots: &'static Slots, need: u64, commit_free: impl Fn(u64) -> bool, wanted: impl Fn() -> bool, preload: bool, large: bool) -> SlotGuard {
     const LOOK: std::time::Duration = std::time::Duration::from_millis(50);
     /// A wanted build waiting for a slot, counted until it leaves (on any path).
     struct Waiting(&'static Slots);
@@ -4290,7 +4407,7 @@ fn big_compile_turn(slots: &'static Slots, need: u64, commit_free: impl Fn(u64) 
         let is_wanted = wanted();
         let cap = if is_wanted { slots.wanted_most() } else { slots.most() };
         let gives_way = preload && !is_wanted && (slots.preloads.load(Ordering::SeqCst) > 0 || slots.wanted_waiting.load(Ordering::SeqCst) > 0);
-        if *n < cap && !gives_way {
+        if *n < cap && !gives_way && (!large || slots.large.load(Ordering::SeqCst) < large_cap(cap, crate::gpu::recomp::dxc::compile_threads())) {
             let mut reserved = slots.reserved.0.lock().unwrap();
             if is_wanted || commit_free(need + *reserved) {
                 *reserved += need;
@@ -4298,7 +4415,10 @@ fn big_compile_turn(slots: &'static Slots, need: u64, commit_free: impl Fn(u64) 
                 if preload {
                     slots.preloads.fetch_add(1, Ordering::SeqCst);
                 }
-                return SlotGuard(slots, need, preload);
+                if large {
+                    slots.large.fetch_add(1, Ordering::SeqCst);
+                }
+                return SlotGuard(slots, need, preload, large);
             }
         }
         if is_wanted {
@@ -4344,24 +4464,24 @@ mod big_compile_tests {
 
     #[test]
     fn wanted_waiting_is_summed_over_the_lanes() {
-        static A: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(1) };
-        static B: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(2) };
+        static A: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(1), large: AtomicUsize::new(0) };
+        static B: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(2), large: AtomicUsize::new(0) };
         assert_eq!(wanted_waiting_of(&[&A, &B]), 3);
         assert_eq!(wanted_waiting_of(&[]), 0);
     }
 
     #[test]
     fn wanted_builds_bypass_commit_and_unwanted_slot_but_respect_hard_cap() {
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0) };
-        let held = big_compile_turn(&S, 0, |_| true, || false, false);
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0), large: AtomicUsize::new(0) };
+        let held = big_compile_turn(&S, 0, |_| true, || false, false, false);
         assert_eq!(*S.n.lock().unwrap(), 1);
         // Unwanted slot is full, but a wanted build immediately takes the 2nd (wanted) slot and
         // bypasses the commit-free check.
-        let held_wanted = big_compile_turn(&S, 0, |_| false, || true, false);
+        let held_wanted = big_compile_turn(&S, 0, |_| false, || true, false, false);
         assert_eq!(*S.n.lock().unwrap(), 2);
         // A 3rd wanted build MUST wait while both slots are occupied (hard cap = 2).
         let t = std::thread::spawn(|| {
-            let _g = big_compile_turn(&S, 0, |_| false, || true, false);
+            let _g = big_compile_turn(&S, 0, |_| false, || true, false, false);
         });
         std::thread::sleep(Duration::from_millis(120));
         assert!(!t.is_finished(), "3rd concurrent wanted huge compile must wait for hard cap");
@@ -4374,7 +4494,7 @@ mod big_compile_tests {
         static WANTED2: AtomicBool = AtomicBool::new(false);
         let t0 = Instant::now();
         let t = std::thread::spawn(|| {
-            let _g = big_compile_turn(&S, 0, |_| false, || WANTED2.load(Ordering::Acquire), false);
+            let _g = big_compile_turn(&S, 0, |_| false, || WANTED2.load(Ordering::Acquire), false, false);
         });
         std::thread::sleep(Duration::from_millis(120));
         assert!(!t.is_finished(), "no commit free: unwanted build waits");
@@ -4390,16 +4510,16 @@ mod big_compile_tests {
         // Mirrors GIANT_COMPILES (`most == 1, wanted_most == 1`) under low commit (< 3 GiB):
         // an unwanted compile waiting on commit headroom must never hold the slot and deadlock a
         // wanted compile.
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0) };
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0), large: AtomicUsize::new(0) };
         static FREE: AtomicBool = AtomicBool::new(false);
         let bg = std::thread::spawn(|| {
-            let _g = big_compile_turn(&S, 0, |_| FREE.load(Ordering::Acquire), || false, false);
+            let _g = big_compile_turn(&S, 0, |_| FREE.load(Ordering::Acquire), || false, false, false);
         });
         std::thread::sleep(Duration::from_millis(120));
         assert!(!bg.is_finished(), "unwanted compile waits for commit");
         assert_eq!(*S.n.lock().unwrap(), 0, "unwanted compile must not hold slot while commit-blocked");
         let t0 = Instant::now();
-        let wanted = big_compile_turn(&S, 0, |_| false, || true, false);
+        let wanted = big_compile_turn(&S, 0, |_| false, || true, false, false);
         assert!(t0.elapsed() < Duration::from_secs(1), "wanted compile must acquire slot immediately");
         assert_eq!(*S.n.lock().unwrap(), 1);
         drop(wanted);
@@ -4411,13 +4531,13 @@ mod big_compile_tests {
     #[test]
     fn wanted_burst_is_hard_capped_to_wanted_most() {
         use std::sync::atomic::AtomicUsize;
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0) };
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0), large: AtomicUsize::new(0) };
         static IN: AtomicUsize = AtomicUsize::new(0);
         static PEAK: AtomicUsize = AtomicUsize::new(0);
         let t: Vec<_> = (0..12)
             .map(|_| {
                 std::thread::spawn(|| {
-                    let _g = big_compile_turn(&S, 0, |_| false, || true, false);
+                    let _g = big_compile_turn(&S, 0, |_| false, || true, false, false);
                     let now = IN.fetch_add(1, Ordering::SeqCst) + 1;
                     PEAK.fetch_max(now, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(15));
@@ -4458,16 +4578,16 @@ mod big_compile_tests {
 
     #[test]
     fn a_preload_holds_at_most_one_slot() {
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 3, wanted_most: 3, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0) };
-        let first = big_compile_turn(&S, 0, |_| true, || false, true);
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 3, wanted_most: 3, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0), large: AtomicUsize::new(0) };
+        let first = big_compile_turn(&S, 0, |_| true, || false, true, false);
         assert_eq!(S.preloads.load(Ordering::SeqCst), 1);
         // a second preload waits although 2 slots are free
-        let t = std::thread::spawn(|| drop(big_compile_turn(&S, 0, |_| true, || false, true)));
+        let t = std::thread::spawn(|| drop(big_compile_turn(&S, 0, |_| true, || false, true, false)));
         std::thread::sleep(Duration::from_millis(120));
         assert!(!t.is_finished(), "a second preload must wait");
         assert_eq!(*S.n.lock().unwrap(), 1, "and does not hold a slot meanwhile");
         // an ordinary unwanted build takes one at once
-        let ordinary = big_compile_turn(&S, 0, |_| true, || false, false);
+        let ordinary = big_compile_turn(&S, 0, |_| true, || false, false, false);
         assert_eq!(*S.n.lock().unwrap(), 2);
         assert_eq!(S.preloads.load(Ordering::SeqCst), 1, "an ordinary build is not a preload");
         drop(first);
@@ -4480,19 +4600,19 @@ mod big_compile_tests {
 
     #[test]
     fn a_preload_waits_while_a_wanted_build_waits() {
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0) };
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0), large: AtomicUsize::new(0) };
         static GOT_WANTED: AtomicBool = AtomicBool::new(false);
         static GOT_PRELOAD: AtomicBool = AtomicBool::new(false);
         static RELEASE: AtomicBool = AtomicBool::new(false);
-        let held = big_compile_turn(&S, 0, |_| true, || false, false);
+        let held = big_compile_turn(&S, 0, |_| true, || false, false, false);
         let wanted = std::thread::spawn(|| {
-            let _g = big_compile_turn(&S, 0, |_| false, || true, false);
+            let _g = big_compile_turn(&S, 0, |_| false, || true, false, false);
             GOT_WANTED.store(true, Ordering::SeqCst);
             eventually(|| RELEASE.load(Ordering::SeqCst));
         });
         assert!(eventually(|| S.wanted_waiting.load(Ordering::SeqCst) == 1), "the wanted build counts itself as waiting");
         let preload = std::thread::spawn(|| {
-            let _g = big_compile_turn(&S, 0, |_| true, || false, true);
+            let _g = big_compile_turn(&S, 0, |_| true, || false, true, false);
             GOT_PRELOAD.store(true, Ordering::SeqCst);
         });
         std::thread::sleep(Duration::from_millis(120));
@@ -4547,8 +4667,71 @@ mod big_compile_tests {
 
     #[test]
     fn giant_driver_compiles_have_their_own_lane() {
-        assert!(std::ptr::eq(compile_slots(GIANT_DRIVER_COMPILE - 1, false), &BIG_COMPILES));
+        // (a compute build from `xl_pso_bytes()` is giant too: `xl_compute_takes_the_giant_lane`)
+        assert!(std::ptr::eq(compile_slots(xl_pso_bytes() - 1, false), &BIG_COMPILES));
         assert!(std::ptr::eq(compile_slots(GIANT_DRIVER_COMPILE, false), &GIANT_COMPILES));
+    }
+
+    #[test]
+    fn size_classes_follow_the_thresholds() {
+        let class = |bytes| size_class_for(bytes, 256 << 10, 768 << 10, 2 << 20);
+        assert_eq!(class(100_000), SizeClass::S);
+        assert_eq!(class(262_144), SizeClass::M);
+        assert_eq!(class(786_431), SizeClass::M);
+        assert_eq!(class(786_432), SizeClass::L);
+        assert_eq!(class(1_603_828), SizeClass::L);
+        assert_eq!(class(2_077_556), SizeClass::L);
+        assert_eq!(class(2_097_152), SizeClass::Xl);
+        assert!(SizeClass::M < SizeClass::L && SizeClass::L < SizeClass::Xl);
+        assert_eq!([SizeClass::S, SizeClass::M, SizeClass::L, SizeClass::Xl].map(SizeClass::name), ["S", "M", "L", "XL"]);
+    }
+
+    #[test]
+    fn large_cap_keeps_a_slot_and_two_workers() {
+        assert_eq!(large_cap(4, 15), 3);
+        assert_eq!(large_cap(5, 15), 4);
+        assert_eq!(large_cap(1, 15), 1);
+        assert_eq!(large_cap(5, 3), 1);
+        assert_eq!(large_cap(64, 6), 4);
+    }
+
+    #[test]
+    fn xl_compute_takes_the_giant_lane() {
+        assert!(std::ptr::eq(compile_slots(2 << 20, false), &GIANT_COMPILES));
+        assert!(std::ptr::eq(compile_slots(2 << 20, true), &GRAPHICS_COMPILES));
+        assert!(std::ptr::eq(compile_slots((2 << 20) - 1, false), &BIG_COMPILES));
+        assert!(std::ptr::eq(compile_slots(4 << 20, true), &GIANT_COMPILES));
+    }
+
+    #[test]
+    fn large_builds_leave_a_slot_for_medium_ones() {
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 3, wanted_most: 3, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0), large: AtomicUsize::new(0) };
+        if large_cap(3, crate::gpu::recomp::dxc::compile_threads()) < 2 {
+            eprintln!("SKIPPED large_builds_leave_a_slot_for_medium_ones: fewer than 4 compile threads");
+            return;
+        }
+        let first = big_compile_turn(&S, 0, |_| true, || false, false, true);
+        let second = big_compile_turn(&S, 0, |_| true, || false, false, true);
+        assert_eq!(S.large.load(Ordering::SeqCst), 2);
+        // a third L build waits although one slot is free
+        let third = std::thread::spawn(|| big_compile_turn(&S, 0, |_| true, || false, false, true));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!third.is_finished(), "a third L build must wait");
+        assert_eq!(*S.n.lock().unwrap(), 2, "and does not hold a slot meanwhile");
+        // an M build takes the free slot at once
+        let medium = std::thread::spawn(|| big_compile_turn(&S, 0, |_| true, || false, false, false));
+        assert!(eventually(|| medium.is_finished()), "an M build must get the slot the L builds left");
+        let medium = medium.join().unwrap();
+        assert_eq!(*S.n.lock().unwrap(), 3);
+        assert_eq!(S.large.load(Ordering::SeqCst), 2, "an M build is not an L build");
+        // an L build that leaves admits the waiting one
+        drop(first);
+        assert!(eventually(|| third.is_finished()), "the waiting L build goes on when an L build leaves");
+        let third = third.join().unwrap();
+        assert_eq!(S.large.load(Ordering::SeqCst), 2);
+        drop((second, third, medium));
+        assert_eq!(*S.n.lock().unwrap(), 0);
+        assert_eq!(S.large.load(Ordering::SeqCst), 0, "the L count went back");
     }
 
     #[test]
@@ -4560,7 +4743,7 @@ mod big_compile_tests {
     #[test]
     fn the_concurrency_limit_holds_and_all_finish() {
         use std::sync::atomic::AtomicUsize;
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 2, wanted_most: 2, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0) };
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 2, wanted_most: 2, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0), large: AtomicUsize::new(0) };
         static IN: AtomicUsize = AtomicUsize::new(0);
         static PEAK: AtomicUsize = AtomicUsize::new(0);
         // the two holders of the slots meet here: both are inside at once, deterministically
@@ -4568,7 +4751,7 @@ mod big_compile_tests {
         let t: Vec<_> = (0..8)
             .map(|_| {
                 std::thread::spawn(|| {
-                    let _g = big_compile_turn(&S, 0, |_| true, || false, false);
+                    let _g = big_compile_turn(&S, 0, |_| true, || false, false, false);
                     let now = IN.fetch_add(1, Ordering::SeqCst) + 1;
                     PEAK.fetch_max(now, Ordering::SeqCst);
                     BOTH.wait();
@@ -4589,9 +4772,9 @@ mod big_compile_tests {
         // every slot taken: a small compile on a worker, and a huge one on an unnamed (title)
         // thread, both go on at once
         // (both lanes: a huge compile of any size would block on a gate it should bypass)
-        let mut held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, 0, |_| true, || false, false)).collect();
-        held.extend((0..huge_pso_concurrency()).map(|_| big_compile_turn(&GRAPHICS_COMPILES, 0, |_| true, || false, false)));
-        held.push(big_compile_turn(&GIANT_COMPILES, 0, |_| true, || false, false));
+        let mut held: Vec<_> = (0..huge_pso_concurrency()).map(|_| big_compile_turn(&BIG_COMPILES, 0, |_| true, || false, false, false)).collect();
+        held.extend((0..huge_pso_concurrency()).map(|_| big_compile_turn(&GRAPHICS_COMPILES, 0, |_| true, || false, false, false)));
+        held.push(big_compile_turn(&GIANT_COMPILES, 0, |_| true, || false, false, false));
         let small = std::thread::Builder::new()
             .name("xcl-pso-test".into())
             .spawn(|| driver_compile("test", huge_pso_bytes() - 1, true, || 7))
@@ -4618,10 +4801,10 @@ mod big_compile_tests {
 
     #[test]
     fn unwanted_builds_go_one_at_a_time_when_the_commit_is_there() {
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0) };
-        let first = big_compile_turn(&S, 0, |_| true, || false, false);
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 2, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0), large: AtomicUsize::new(0) };
+        let first = big_compile_turn(&S, 0, |_| true, || false, false, false);
         let t = std::thread::spawn(|| {
-            let _g = big_compile_turn(&S, 0, |_| true, || false, false);
+            let _g = big_compile_turn(&S, 0, |_| true, || false, false, false);
         });
         std::thread::sleep(Duration::from_millis(120));
         assert!(!t.is_finished(), "one at a time");
@@ -4634,8 +4817,8 @@ mod big_compile_tests {
         // 7 GiB of free commit that the admitted compiles' own allocations have not reached yet
         const GIB: u64 = 1 << 30;
         static POOL: Reserved = Reserved(Mutex::new(0));
-        static BIG: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 4, wanted_most: 4, reserved: &POOL, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0) };
-        static GIANT: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1, reserved: &POOL, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0) };
+        static BIG: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 4, wanted_most: 4, reserved: &POOL, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0), large: AtomicUsize::new(0) };
+        static GIANT: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1, reserved: &POOL, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0), large: AtomicUsize::new(0) };
         let free = |need: u64| need <= 7 * GIB;
         let reserved = || *POOL.0.lock().unwrap();
         let waits = |t: &std::thread::JoinHandle<()>| {
@@ -4643,10 +4826,10 @@ mod big_compile_tests {
             !t.is_finished()
         };
         // two 3 GiB compiles fit; the third would need 9 GiB, though four slots are open
-        let a = big_compile_turn(&BIG, 3 * GIB, free, || false, false);
-        let b = big_compile_turn(&BIG, 3 * GIB, free, || false, false);
+        let a = big_compile_turn(&BIG, 3 * GIB, free, || false, false, false);
+        let b = big_compile_turn(&BIG, 3 * GIB, free, || false, false, false);
         assert_eq!(reserved(), 6 * GIB);
-        let t = std::thread::spawn(move || drop(big_compile_turn(&BIG, 3 * GIB, free, || false, false)));
+        let t = std::thread::spawn(move || drop(big_compile_turn(&BIG, 3 * GIB, free, || false, false, false)));
         assert!(waits(&t), "a third compile waits for the commit the first two reserved");
         assert_eq!(*BIG.n.lock().unwrap(), 2, "and does not hold a slot meanwhile");
         drop(a);
@@ -4654,15 +4837,15 @@ mod big_compile_tests {
         drop(b);
         assert_eq!(reserved(), 0, "a finished compile gives its reservation back");
         // the giant lane's reservation counts in the ordinary lane
-        let g = big_compile_turn(&GIANT, 5 * GIB, free, || false, false);
-        let t = std::thread::spawn(move || drop(big_compile_turn(&BIG, 3 * GIB, free, || false, false)));
+        let g = big_compile_turn(&GIANT, 5 * GIB, free, || false, false, false);
+        let t = std::thread::spawn(move || drop(big_compile_turn(&BIG, 3 * GIB, free, || false, false, false)));
         assert!(waits(&t), "5 GiB reserved by a giant compile leaves no room for 3 GiB more");
         drop(g);
         t.join().unwrap();
         // a wanted compile skips the check but reserves, and a background one counts it
-        let w = big_compile_turn(&BIG, 3 * GIB, |_| false, || true, false);
+        let w = big_compile_turn(&BIG, 3 * GIB, |_| false, || true, false, false);
         assert_eq!(reserved(), 3 * GIB);
-        let t = std::thread::spawn(|| drop(big_compile_turn(&BIG, 3 * GIB, |need| need <= 5 * GIB, || false, false)));
+        let t = std::thread::spawn(|| drop(big_compile_turn(&BIG, 3 * GIB, |need| need <= 5 * GIB, || false, false, false)));
         assert!(waits(&t), "3 GiB wanted + 3 GiB more do not fit in 5 GiB");
         drop(w);
         t.join().unwrap();
@@ -4676,7 +4859,7 @@ mod big_compile_tests {
         use std::sync::atomic::AtomicUsize;
         const GIB: u64 = 1 << 30;
         static POOL: Reserved = Reserved(Mutex::new(0));
-        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 4, wanted_most: 4, reserved: &POOL, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0) };
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 4, wanted_most: 4, reserved: &POOL, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0), large: AtomicUsize::new(0) };
         static IN: AtomicUsize = AtomicUsize::new(0);
         static PEAK: AtomicUsize = AtomicUsize::new(0);
         static GO: std::sync::Barrier = std::sync::Barrier::new(8);
@@ -4684,7 +4867,7 @@ mod big_compile_tests {
             .map(|_| {
                 std::thread::spawn(|| {
                     GO.wait();
-                    let _g = big_compile_turn(&S, 3 * GIB, |need| need <= 7 * GIB, || false, false);
+                    let _g = big_compile_turn(&S, 3 * GIB, |need| need <= 7 * GIB, || false, false, false);
                     let now = IN.fetch_add(1, Ordering::SeqCst) + 1;
                     PEAK.fetch_max(now, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(20));
@@ -6395,7 +6578,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let bytes = stream.shader_bytes() + tp.cs.len();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes, true), big_compile_headroom(bytes), big_compile_commit_free, super::pso_async::build_is_wanted, is_preload_thread()));
+    let _slot = gate.then(|| big_compile_turn(compile_slots(bytes, true), big_compile_headroom(bytes), big_compile_commit_free, super::pso_async::build_is_wanted, is_preload_thread(), false));
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated, waited {} ms", waited.elapsed().as_millis());
     }
