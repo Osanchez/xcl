@@ -28,6 +28,8 @@ struct Backing {
     users: HashSet<usize>,
     /// queue → (fence, value after the last submit of one of them)
     marks: HashMap<usize, (ID3D12Fence, u64)>,
+    /// true once this backing has been PC-reset while idle and no new recording/submit has touched it
+    already_reset: bool,
 }
 
 impl Backing {
@@ -81,7 +83,24 @@ fn move_list(s: &mut State, list: usize, backing: usize) {
             }
         }
     }
-    s.backings.entry(backing).or_default().users.insert(list);
+    let b = s.backings.entry(backing).or_default();
+    b.users.insert(list);
+    b.already_reset = false;
+}
+
+/// A split segment or stand-in PC list has been retired into `title_list`'s spare pool (or
+/// superseded by a new recording on `wrapper`): it will not be submitted again until a future
+/// `Reset` binds it to a new backing. Removing it from `users` lets its old backing become
+/// reusable once its already-submitted GPU `marks` complete, while keeping `last_submit` so
+/// `in_flight(list)` still prevents premature reuse.
+pub(super) fn retire_recording(list: usize) {
+    let mut g = STATE.lock().unwrap();
+    let Some(s) = g.as_mut() else { return };
+    if let Some(backing) = s.of_list.remove(&list) {
+        if let Some(b) = s.backings.get_mut(&backing) {
+            b.users.remove(&list);
+        }
+    }
 }
 
 /// The PC list's final Release ended its recording. Submitted work still holds the backing
@@ -211,7 +230,9 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     };
     for &l in lists {
         if let Some(&b) = s.of_list.get(&(l as usize)) {
-            s.backings.entry(b).or_default().marks.insert(key, (fence.clone(), value));
+            let entry = s.backings.entry(b).or_default();
+            entry.marks.insert(key, (fence.clone(), value));
+            entry.already_reset = false;
         }
         let recording = s.recordings.get(&(l as usize)).copied().unwrap_or(0);
         s.last_submit.insert(l as usize, LastSubmit { queue: key, fence: fence.clone(), value, recording });
@@ -258,44 +279,267 @@ pub unsafe fn forget(alloc: usize) {
     }
 }
 
+/// Pop idle put-aside backings of title allocator `a` whose lists and GPU work have finished
+/// so the caller can reset them OUTSIDE `STATE` (preventing re-entrant deadlocks if resetting
+/// an allocator drops a prelude `ID3D12CommandAllocator` whose `Release` calls `forget`).
+unsafe fn take_free_aside(s: &mut State, a: usize) -> Vec<usize> {
+    let Some(v) = s.aside.get_mut(&a) else {
+        return Vec::new();
+    };
+    let mut ready = Vec::new();
+    let mut i = 0;
+    while i < v.len() {
+        let f = v[i];
+        if s.backings.get(&f).is_some_and(|b| !b.already_reset && b.free()) {
+            ready.push(v.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    ready
+}
+
+unsafe fn restore_aside(s: &mut State, a: usize, f: usize, ok: bool) -> bool {
+    if ok {
+        if let Some(b) = s.backings.get_mut(&f) {
+            b.marks.clear();
+            b.already_reset = true;
+        }
+    }
+    if s.types.contains_key(&a) {
+        s.aside.entry(a).or_default().push(f);
+        true
+    } else {
+        false
+    }
+}
+
 /// The title resets its allocator `alloc`. `None`: reset it as it is (nothing holds a
 /// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
 /// aside with its recordings and another one took its place.
+///
+/// Releases `STATE` before every `reset_pc_allocator` call so COM callbacks triggered while
+/// releasing per-allocator resources (e.g. prelude `ID3D12CommandAllocator::Release` -> `forget`)
+/// can never self-deadlock on `STATE`.
 pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
     if !enabled() {
         return None;
     }
-    let mut g = STATE.lock().unwrap();
-    let s = g.get_or_insert_with(State::default);
-    title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw))
+    let a = alloc as usize;
+    enum Action {
+        CleanPrimary { aside: Vec<usize> },
+        ResetCurrent { cur: usize, aside: Vec<usize> },
+        SwapReuse { cur: usize, spare: usize, needs_reset: bool, aside: Vec<usize> },
+        SwapNew { cur: usize, ty: i32, aside: Vec<usize> },
+    }
+    let action = {
+        let mut g = STATE.lock().unwrap();
+        let s = g.get_or_insert_with(State::default);
+        let c = s.cur.get(&a).copied().unwrap_or(a);
+        if s.backings.get(&c).is_none_or(|b| b.free()) {
+            let aside = take_free_aside(s, a);
+            if c == a {
+                if let Some(b) = s.backings.get_mut(&c) {
+                    b.marks.clear();
+                    b.already_reset = true;
+                }
+                Action::CleanPrimary { aside }
+            } else {
+                Action::ResetCurrent { cur: c, aside }
+            }
+        } else {
+            let ty = *s.types.get(&a)?;
+            let reuse_idx = s.aside.get(&a).and_then(|v| v.iter().position(|f| s.backings.get(f).is_none_or(|b| b.free())));
+            match reuse_idx {
+                Some(idx) => {
+                    let spare = s.aside.get_mut(&a).unwrap().remove(idx);
+                    let needs_reset = s.backings.get(&spare).is_none_or(|b| !b.already_reset);
+                    let aside = take_free_aside(s, a);
+                    Action::SwapReuse { cur: c, spare, needs_reset, aside }
+                }
+                None => {
+                    let aside = take_free_aside(s, a);
+                    Action::SwapNew { cur: c, ty, aside }
+                }
+            }
+        }
+    };
+
+    let finish_aside = |aside: Vec<usize>| {
+        if aside.is_empty() {
+            return;
+        }
+        let mut results = Vec::with_capacity(aside.len());
+        for f in aside {
+            let hr = super::real::reset_pc_allocator(f as *mut c_void);
+            results.push((f, hr >= 0));
+        }
+        let mut orphans = Vec::new();
+        {
+            let mut g = STATE.lock().unwrap();
+            if let Some(s) = g.as_mut() {
+                for (f, ok) in results {
+                    if !restore_aside(s, a, f, ok) && f != a {
+                        orphans.push(f);
+                    }
+                }
+            }
+        }
+        for f in orphans {
+            drop(ID3D12CommandAllocator::from_raw(f as *mut c_void));
+        }
+    };
+
+    match action {
+        Action::CleanPrimary { aside } => {
+            finish_aside(aside);
+            None
+        }
+        Action::ResetCurrent { cur, aside } => {
+            let hr = super::real::reset_pc_allocator(cur as *mut c_void);
+            if hr >= 0 {
+                let mut g = STATE.lock().unwrap();
+                if let Some(s) = g.as_mut() {
+                    if let Some(b) = s.backings.get_mut(&cur) {
+                        b.marks.clear();
+                        b.already_reset = true;
+                    }
+                }
+            }
+            finish_aside(aside);
+            Some(hr)
+        }
+        Action::SwapReuse { cur, spare, needs_reset, aside } => {
+            let hr = if needs_reset { super::real::reset_pc_allocator(spare as *mut c_void) } else { 0 };
+            let mut orphan = None;
+            {
+                let mut g = STATE.lock().unwrap();
+                if let Some(s) = g.as_mut() {
+                    if hr < 0 {
+                        if !restore_aside(s, a, spare, false) && spare != a {
+                            orphan = Some(spare);
+                        }
+                    } else {
+                        if let Some(b) = s.backings.get_mut(&spare) {
+                            b.marks.clear();
+                            b.already_reset = true;
+                        }
+                        if s.types.contains_key(&a) {
+                            s.aside.entry(a).or_default().push(cur);
+                            s.cur.insert(a, spare);
+                            s.swaps += 1;
+                            if s.swaps.is_power_of_two() {
+                                let aside_n: usize = s.aside.values().map(|v| v.len()).sum();
+                                crate::xlog_info!(
+                                    "D3D12.X: {} allocator resets so far with recordings still held or on the GPU – another PC allocator took its place ({} made, {aside_n} put aside now)",
+                                    s.swaps,
+                                    s.made
+                                );
+                            }
+                        } else if spare != a {
+                            orphan = Some(spare);
+                        }
+                    }
+                }
+            }
+            if let Some(f) = orphan {
+                drop(ID3D12CommandAllocator::from_raw(f as *mut c_void));
+            }
+            finish_aside(aside);
+            Some(hr)
+        }
+        Action::SwapNew { cur, ty, aside } => {
+            let this = ID3D12CommandAllocator::from_raw_borrowed(&alloc)?;
+            let mut dev: Option<ID3D12Device> = None;
+            this.GetDevice(&mut dev).ok()?;
+            let made: ID3D12CommandAllocator = dev?.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE(ty)).ok()?;
+            let raw = made.into_raw();
+            if !super::real::is_adopted(raw) {
+                super::real::adopt(raw, super::real::Kind::CommandAllocator);
+            }
+            let mut orphan = None;
+            {
+                let mut g = STATE.lock().unwrap();
+                if let Some(s) = g.as_mut() {
+                    if s.types.contains_key(&a) {
+                        s.made += 1;
+                        s.aside.entry(a).or_default().push(cur);
+                        s.cur.insert(a, raw as usize);
+                        s.swaps += 1;
+                        if s.swaps.is_power_of_two() {
+                            let aside_n: usize = s.aside.values().map(|v| v.len()).sum();
+                            crate::xlog_info!(
+                                "D3D12.X: {} allocator resets so far with recordings still held or on the GPU – another PC allocator took its place ({} made, {aside_n} put aside now)",
+                                s.swaps,
+                                s.made
+                            );
+                        }
+                    } else {
+                        orphan = Some(raw as usize);
+                    }
+                }
+            }
+            if let Some(f) = orphan {
+                drop(ID3D12CommandAllocator::from_raw(f as *mut c_void));
+            }
+            finish_aside(aside);
+            Some(0)
+        }
+    }
+}
+
+/// Reset idle put-aside backings of title allocator `a` whose lists and GPU work have finished
+/// (used by lock-free unit tests via `title_reset_in`).
+#[cfg(test)]
+unsafe fn reclaim_free_aside(s: &mut State, a: usize, reset: &mut impl FnMut(*mut c_void) -> HRESULT) {
+    let ready = take_free_aside(s, a);
+    for f in ready {
+        let ok = reset(f as *mut c_void) >= 0;
+        let _ = restore_aside(s, a, f, ok);
+    }
 }
 
 /// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
+#[cfg(test)]
 unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMut(*mut c_void) -> HRESULT) -> Option<HRESULT> {
     let a = alloc as usize;
     let c = s.cur.get(&a).copied().unwrap_or(a);
     if s.backings.get(&c).is_none_or(|b| b.free()) {
-        if let Some(b) = s.backings.get_mut(&c) {
-            b.marks.clear();
-        }
+        #[cfg(test)]
+        reclaim_free_aside(s, a, &mut reset);
         if c == a {
+            if let Some(b) = s.backings.get_mut(&c) {
+                b.marks.clear();
+                b.already_reset = true;
+            }
             return None;
         }
-        return Some(reset(c as *mut c_void));
+        let hr = reset(c as *mut c_void);
+        if hr >= 0 {
+            if let Some(b) = s.backings.get_mut(&c) {
+                b.marks.clear();
+                b.already_reset = true;
+            }
+        }
+        return Some(hr);
     }
     let ty = *s.types.get(&a)?;
     // one put aside earlier that nothing uses any more, or a new one
     let reuse = s.aside.get(&a).and_then(|v| v.iter().copied().find(|f| s.backings.get(f).is_none_or(|b| b.free())));
     let next = match reuse {
         Some(f) => {
-            // Keep ownership until Reset succeeds so a failure can be retried.
-            let hr = reset(f as *mut c_void);
-            if hr < 0 {
-                return Some(hr);
+            let needs = s.backings.get(&f).is_none_or(|b| !b.already_reset);
+            if needs {
+                // Keep ownership until Reset succeeds so a failure can be retried.
+                let hr = reset(f as *mut c_void);
+                if hr < 0 {
+                    return Some(hr);
+                }
             }
             s.aside.get_mut(&a).unwrap().retain(|&x| x != f);
             if let Some(b) = s.backings.get_mut(&f) {
                 b.marks.clear();
+                b.already_reset = true;
             }
             f
         }
@@ -315,6 +559,8 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
     };
     s.aside.entry(a).or_default().push(c);
     s.cur.insert(a, next);
+    #[cfg(test)]
+    reclaim_free_aside(s, a, &mut reset);
     s.swaps += 1;
     if s.swaps.is_power_of_two() {
         let aside: usize = s.aside.values().map(|v| v.len()).sum();
@@ -548,6 +794,69 @@ mod tests {
             assert_eq!(while_running, 1, "a submit while the previous one runs must be noticed");
             assert_eq!(after_done, 0, "a finished previous submit is not a resubmit");
             assert_eq!(after_forget, 0, "a forgotten list has no previous submit");
+        }
+    }
+
+    #[test]
+    fn retired_segment_releases_backing_after_gpu_completes_while_preserving_in_flight() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut ids = Box::new([0u8; 3]);
+            let alloc = ids.as_mut_ptr() as usize;
+            let seg = alloc + 1;
+            let queue = alloc + 2;
+            created_on(seg, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            {
+                let mut g = STATE.lock().unwrap();
+                let s = g.as_mut().unwrap();
+                s.backings.entry(alloc).or_default().marks.insert(queue, (fence.clone(), 1));
+                let recording = s.recordings[&seg];
+                s.last_submit.insert(seg, LastSubmit { queue, fence: fence.clone(), value: 1, recording });
+            }
+
+            // Retiring the segment into `title_list`'s spare pool detaches it from `users`
+            // while keeping GPU fence `marks` and `in_flight(seg)` intact until completion.
+            retire_recording(seg);
+            assert!(in_flight(seg), "retired segment must stay in_flight until GPU finishes");
+            {
+                let g = STATE.lock().unwrap();
+                let b = &g.as_ref().unwrap().backings[&alloc];
+                assert!(b.users.is_empty(), "retired segment must no longer pin backing.users");
+                assert!(!b.free(), "GPU mark must still hold the backing until signaled");
+            }
+
+            fence.Signal(1).unwrap();
+            assert!(!in_flight(seg));
+            {
+                let g = STATE.lock().unwrap();
+                assert!(g.as_ref().unwrap().backings[&alloc].free(), "backing must become free once GPU completes");
+            }
+            forget_list(seg);
+            forget(alloc);
+        }
+    }
+
+    #[test]
+    fn clean_title_reset_reclaims_idle_aside_backings_once() {
+        let (alloc, spare1, spare2) = (0x7E57_1000usize, 0x7E57_2000usize, 0x7E57_3000usize);
+        let mut s = State::default();
+        s.types.insert(alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        s.aside.insert(alloc, vec![spare1, spare2]);
+        s.backings.insert(spare1, Backing::default());
+        s.backings.insert(spare2, Backing::default());
+        let mut resets = Vec::new();
+
+        unsafe {
+            assert_eq!(title_reset_in(&mut s, alloc as *mut c_void, |r| { resets.push(r as usize); 0 }), None);
+            assert_eq!(resets, vec![spare1, spare2], "clean reset must reclaim all idle aside backings");
+
+            // A second clean reset must not redundantly reset already-reclaimed aside backings.
+            resets.clear();
+            assert_eq!(title_reset_in(&mut s, alloc as *mut c_void, |r| { resets.push(r as usize); 0 }), None);
+            assert!(resets.is_empty(), "already-reset aside backings should not be reset again");
         }
     }
 }
