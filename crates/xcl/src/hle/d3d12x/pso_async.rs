@@ -8,6 +8,8 @@
 //! left out until it is built; `XCL_PSO_COMPUTE_WAIT_MS` restores waiting for compute, a `Dispatch`
 //! at its submit (a skipped dispatch would corrupt what it computes).
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
+//! Workers take wanted builds before unwanted ones and graphics before compute; a few workers
+//! build only graphics, so a queue of slow compute programs never holds up the scene's draws.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -279,13 +281,6 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-/// pipelines a submit will wait for: the workers take these before their queue (`need_by_submit`)
-static NEEDED: Mutex<std::collections::VecDeque<Arc<Pending>>> = Mutex::new(std::collections::VecDeque::new());
-
-fn next_needed() -> Option<Arc<Pending>> {
-    NEEDED.lock().unwrap().pop_front()
-}
-
 /// Drop an unstarted orphaned job outside all locks and wake any concurrent waiter.
 fn drop_unstarted_job(p: &Pending) {
     let job = p.job.lock().unwrap().take();
@@ -301,8 +296,32 @@ fn drop_unstarted_job(p: &Pending) {
 
 type Work = Box<dyn FnOnce() + Send>;
 
-/// The receiver of the work queue, kept so that more workers can be started (`park`).
-static RECEIVER: OnceLock<Arc<Mutex<mpsc::Receiver<Work>>>> = OnceLock::new();
+/// What a pool worker runs: a pipeline's build, or a helper of one (`build_pieces`).
+enum Item {
+    Build(Arc<Pending>),
+    Help(Work),
+}
+
+/// The pool's lanes, in the order a general worker takes them (`pick`).
+const WANTED_GRAPHICS: usize = 0;
+const HELP: usize = 1;
+const WANTED_COMPUTE: usize = 2;
+const GRAPHICS: usize = 3;
+const COMPUTE: usize = 4;
+const LANES: usize = 5;
+
+struct Pool {
+    lanes: Mutex<[std::collections::VecDeque<Item>; LANES]>,
+    /// the general workers wait here
+    general: Condvar,
+    /// the reserved graphics workers wait here
+    reserved: Condvar,
+}
+
+static POOL: OnceLock<Pool> = OnceLock::new();
+/// Reserved graphics workers started, and those running a build now.
+static RESERVED: AtomicUsize = AtomicUsize::new(0);
+static RESERVED_BUSY: AtomicUsize = AtomicUsize::new(0);
 /// Worker threads started (the initial pool and the extra ones).
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 /// Workers now waiting at the big-compile gate.
@@ -315,35 +334,95 @@ thread_local! {
     static IS_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn worker_loop(rx: Arc<Mutex<mpsc::Receiver<Work>>>) {
-    IS_WORKER.with(|w| w.set(true));
-    loop {
-        let next = rx.lock().unwrap().recv();
-        let Ok(work) = next else { return };
-        while let Some(p) = next_needed() {
-            build_queued(&p);
-        }
-        work();
+/// How many threads build only graphics pipelines, for a pool of `n` general workers.
+fn reserved_workers(n: usize) -> usize {
+    (n / 4).clamp(2, 8)
+}
+
+/// The lane a worker takes next, `None` when there is nothing for it. A general worker takes the
+/// first lane with an item; a reserved one only the graphics lanes, wanted first.
+fn pick(lens: &[usize; LANES], reserved: bool) -> Option<usize> {
+    if reserved {
+        return [WANTED_GRAPHICS, GRAPHICS].into_iter().find(|&l| lens[l] != 0);
+    }
+    (0..LANES).find(|&l| lens[l] != 0)
+}
+
+fn lane_for(compute: bool, wanted: bool) -> usize {
+    match (compute, wanted) {
+        (false, true) => WANTED_GRAPHICS,
+        (true, true) => WANTED_COMPUTE,
+        (false, false) => GRAPHICS,
+        (true, false) => COMPUTE,
     }
 }
 
-fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
-    Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Work>();
-        let rx = Arc::new(Mutex::new(rx));
-        let _ = RECEIVER.set(rx.clone());
+fn pool() -> &'static Pool {
+    static START: std::sync::Once = std::sync::Once::new();
+    let pool = POOL.get_or_init(|| Pool { lanes: Mutex::new(Default::default()), general: Condvar::new(), reserved: Condvar::new() });
+    START.call_once(|| {
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
         WORKERS.fetch_add(n, Ordering::SeqCst);
         for k in 0..n {
-            let rx = rx.clone();
-            if std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || worker_loop(rx)).is_err() {
+            if std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(|| worker_loop(false)).is_err() {
                 WORKERS.fetch_sub(1, Ordering::SeqCst);
             }
         }
-        Mutex::new(tx)
-    })
+        // these take only graphics pipelines, so a queue of slow compute ones never holds them up
+        for k in 0..reserved_workers(n) {
+            if std::thread::Builder::new().name(format!("xcl-pso-g{k}")).stack_size(64 << 20).spawn(|| worker_loop(true)).is_ok() {
+                RESERVED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    pool
+}
+
+fn push(lane: usize, item: Item) {
+    let pool = pool();
+    pool.lanes.lock().unwrap()[lane].push_back(item);
+    if lane == WANTED_GRAPHICS || lane == GRAPHICS {
+        pool.reserved.notify_one();
+    }
+    pool.general.notify_one();
+}
+
+/// The next item for a worker of this class, waiting for one.
+fn take(reserved: bool) -> Item {
+    let pool = pool();
+    let mut lanes = pool.lanes.lock().unwrap();
+    loop {
+        let mut lens = [0; LANES];
+        for (len, lane) in lens.iter_mut().zip(lanes.iter()) {
+            *len = lane.len();
+        }
+        if let Some(l) = pick(&lens, reserved) {
+            return lanes[l].pop_front().unwrap();
+        }
+        let cv = if reserved { &pool.reserved } else { &pool.general };
+        lanes = cv.wait(lanes).unwrap();
+    }
+}
+
+fn worker_loop(reserved: bool) {
+    // (reserved workers are not `IS_WORKER`: they never park at the gate)
+    if !reserved {
+        IS_WORKER.with(|w| w.set(true));
+    }
+    loop {
+        let item = take(reserved);
+        if reserved {
+            RESERVED_BUSY.fetch_add(1, Ordering::SeqCst);
+        }
+        match item {
+            Item::Build(p) => build_queued(&p),
+            Item::Help(w) => w(),
+        }
+        if reserved {
+            RESERVED_BUSY.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 /// A worker is short of a free place when fewer than `n` of its `workers` are not parked, up to
@@ -371,7 +450,9 @@ pub(super) fn park() -> Parked {
     }
     PARKED.fetch_add(1, Ordering::SeqCst);
     let parked = Parked(true);
-    let Some(rx) = RECEIVER.get() else { return parked };
+    if POOL.get().is_none() {
+        return parked;
+    }
     let n = crate::gpu::recomp::dxc::compile_threads();
     // reserve the place with a compare-and-swap, so two parking workers never take the same one
     let mut w = WORKERS.load(Ordering::SeqCst);
@@ -385,8 +466,7 @@ pub(super) fn park() -> Parked {
         }
     }
     let k = EXTRA_STARTED.fetch_add(1, Ordering::SeqCst);
-    let rx = rx.clone();
-    if std::thread::Builder::new().name(format!("xcl-pso-x{k}")).stack_size(64 << 20).spawn(move || worker_loop(rx)).is_err() {
+    if std::thread::Builder::new().name(format!("xcl-pso-x{k}")).stack_size(64 << 20).spawn(|| worker_loop(false)).is_err() {
         WORKERS.fetch_sub(1, Ordering::SeqCst);
     }
     parked
@@ -398,7 +478,36 @@ pub fn workers() -> (usize, usize) {
 }
 
 fn enqueue(p: Arc<Pending>) {
-    let _ = queue().lock().unwrap().send(Box::new(move || build_queued(&p)));
+    push(lane_for(p.compute, false), Item::Build(p));
+}
+
+/// The pool's lane lengths and its workers' states (`queue_gauges`).
+#[allow(dead_code)]
+pub struct QueueGauges {
+    pub lanes: [usize; LANES],
+    pub general: usize,
+    pub parked: usize,
+    pub reserved: usize,
+    pub reserved_busy: usize,
+}
+
+/// What the pool holds now. Starts nothing: all zero lanes before the first build is queued.
+#[allow(dead_code)]
+pub fn queue_gauges() -> QueueGauges {
+    let mut lanes = [0; LANES];
+    if let Some(pool) = POOL.get() {
+        let held = pool.lanes.lock().unwrap();
+        for (len, lane) in lanes.iter_mut().zip(held.iter()) {
+            *len = lane.len();
+        }
+    }
+    QueueGauges {
+        lanes,
+        general: WORKERS.load(Ordering::SeqCst),
+        parked: PARKED.load(Ordering::SeqCst),
+        reserved: RESERVED.load(Ordering::SeqCst),
+        reserved_busy: RESERVED_BUSY.load(Ordering::SeqCst),
+    }
 }
 
 fn build_queued(p: &Arc<Pending>) {
@@ -429,11 +538,11 @@ pub(super) fn build_pieces(jobs: Vec<Job>) -> Vec<usize> {
     let parent = BUILDING.with(|b| b.borrow().clone());
     for _ in 1..count.min(crate::gpu::recomp::dxc::compile_threads()) {
         let (drain, parent) = (drain.clone(), parent.clone());
-        let _ = queue().lock().unwrap().send(Box::new(move || {
+        push(HELP, Item::Help(Box::new(move || {
             let before = BUILDING.with(|b| b.replace(parent));
             drain();
             BUILDING.with(|b| *b.borrow_mut() = before);
-        }));
+        })));
     }
     drain();
     let mut results = vec![0; count];
@@ -1070,12 +1179,190 @@ mod used_tests {
 
     static WORKER_SATURATION_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Opens a gate when dropped, so a failed test never leaves the pool blocked on it.
+    struct OpenGate(Arc<(Mutex<bool>, Condvar)>);
+
+    impl Drop for OpenGate {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            self.0 .1.notify_all();
+        }
+    }
+
+    /// Occupies every general worker, the extra ones an earlier test started included, with a
+    /// blocker that waits at `gate` (and never parks, so it starts no extra worker), and returns
+    /// their stand-ins once no general worker is free. The blockers are compute builds, so the
+    /// reserved graphics workers cannot take them; they return 0 (a failed build: nothing for
+    /// `release`). The stand-ins are `base + k`, k < 2 * compile_threads(). The caller holds
+    /// `WORKER_SATURATION_LOCK` and an `OpenGate` on `gate` before calling, and releases the
+    /// stand-ins after opening it. Panics when the workers are not all held within the bounds.
+    fn saturate_general_workers(base: usize, gate: &Arc<(Mutex<bool>, Condvar)>) -> Vec<usize> {
+        use std::time::{Duration, Instant};
+
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        let (started_tx, started_rx) = mpsc::channel();
+        let mut blockers: Vec<usize> = Vec::with_capacity(2 * n);
+        let mut started = 0;
+        let mut stable = 0;
+        let overall = Instant::now() + Duration::from_secs(120);
+        loop {
+            assert!(Instant::now() < overall, "the general workers were not all held within 120 s ({} blockers, {} workers)", blockers.len(), workers().0);
+            let held = workers().0;
+            assert!(held <= 2 * n, "more than 2 * compile_threads general workers ({held})");
+            while blockers.len() < held {
+                let standin = base + blockers.len();
+                let (tx, gate) = (started_tx.clone(), gate.clone());
+                submit(standin, true, Box::new(move || {
+                    let _ = tx.send(());
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    let mut open = gate.0.lock().unwrap_or_else(|e| e.into_inner());
+                    while !*open {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        open = gate.1.wait_timeout(open, left).unwrap_or_else(|e| e.into_inner()).0;
+                    }
+                    0
+                }));
+                blockers.push(standin);
+            }
+            while started < blockers.len() {
+                started_rx
+                    .recv_timeout(Duration::from_secs(20))
+                    .unwrap_or_else(|_| panic!("a blocker did not start within 20 s: {started} of {} started, {} general workers", blockers.len(), workers().0));
+                started += 1;
+            }
+            if workers().0 == started {
+                stable += 1;
+                if stable == 2 {
+                    return blockers;
+                }
+            } else {
+                stable = 0;
+            }
+            // (a worker that starts now has had a moment to show itself)
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     #[test]
     fn extra_workers_follow_the_parked_count() {
         assert!(!extra_needed(15, 0, 15));
         assert!(extra_needed(15, 1, 15));
         assert!(!extra_needed(16, 1, 15));
         assert!(!extra_needed(30, 16, 15));
+    }
+
+    #[test]
+    fn general_workers_take_lanes_in_order() {
+        assert_eq!(pick(&[1, 1, 1, 1, 1], false), Some(0));
+        assert_eq!(pick(&[0, 1, 1, 1, 1], false), Some(1));
+        assert_eq!(pick(&[0, 0, 1, 1, 1], false), Some(2));
+        assert_eq!(pick(&[0, 0, 0, 1, 1], false), Some(3));
+        assert_eq!(pick(&[0, 0, 0, 0, 1], false), Some(4));
+        assert_eq!(pick(&[0, 0, 0, 0, 0], false), None);
+    }
+
+    #[test]
+    fn reserved_workers_take_only_graphics() {
+        assert_eq!(pick(&[1, 1, 1, 1, 1], true), Some(WANTED_GRAPHICS));
+        assert_eq!(pick(&[0, 1, 1, 1, 1], true), Some(GRAPHICS));
+        assert_eq!(pick(&[0, 1, 1, 0, 1], true), None);
+        assert_eq!(pick(&[0, 0, 0, 0, 0], true), None);
+    }
+
+    #[test]
+    fn lanes_follow_kind_and_demand() {
+        assert_eq!(lane_for(false, true), WANTED_GRAPHICS);
+        assert_eq!(lane_for(true, true), WANTED_COMPUTE);
+        assert_eq!(lane_for(false, false), GRAPHICS);
+        assert_eq!(lane_for(true, false), COMPUTE);
+    }
+
+    #[test]
+    fn reserved_workers_scale_with_the_pool() {
+        assert_eq!(reserved_workers(1), 2);
+        assert_eq!(reserved_workers(8), 2);
+        assert_eq!(reserved_workers(15), 3);
+        assert_eq!(reserved_workers(32), 8);
+        assert_eq!(reserved_workers(64), 8);
+    }
+
+    /// With every general worker parked at the gate, a graphics build still runs (on a reserved
+    /// worker) and a compute build does not.
+    #[test]
+    fn a_graphics_build_runs_while_every_general_worker_is_parked() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        let start = Instant::now();
+        while queue_gauges().lanes.iter().any(|&l| l != 0) && start.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let before = workers().1;
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _open = OpenGate(gate.clone());
+        let (started_tx, started_rx) = mpsc::channel();
+        let mut standins = Vec::with_capacity(2 * n + 2);
+        for k in 0..2 * n {
+            let standin = 0x7E57_F100usize + k;
+            let (gate, started_tx) = (gate.clone(), started_tx.clone());
+            submit(standin, true, Box::new(move || {
+                let _ = started_tx.send(());
+                let _parked = park();
+                let deadline = Instant::now() + Duration::from_secs(40);
+                let mut open = gate.0.lock().unwrap_or_else(|e| e.into_inner());
+                while !*open {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    open = gate.1.wait_timeout(open, left).unwrap_or_else(|e| e.into_inner()).0;
+                }
+                // (0: a failed build, nothing for `release` whenever the stand-in is released)
+                0
+            }));
+            standins.push(standin);
+        }
+        let mut started = 0;
+        while started < 2 * n && started_rx.recv_timeout(Duration::from_secs(10)).is_ok() {
+            started += 1;
+        }
+
+        let (compute, graphics) = (0x7E57_F1C0usize, 0x7E57_F1C1usize);
+        let compute_ran = Arc::new(AtomicBool::new(false));
+        let (graphics_tx, graphics_rx) = mpsc::channel();
+        let flag = compute_ran.clone();
+        submit(compute, true, Box::new(move || {
+            flag.store(true, Ordering::Release);
+            0
+        }));
+        submit(graphics, false, Box::new(move || {
+            let _ = graphics_tx.send(());
+            0
+        }));
+        standins.push(compute);
+        standins.push(graphics);
+        let graphics_ran = graphics_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+        let compute_ran_early = compute_ran.load(Ordering::Acquire);
+
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        for &standin in &standins {
+            let start = Instant::now();
+            while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            released(standin);
+        }
+        assert_eq!(started, 2 * n, "every blocker started");
+        assert!(graphics_ran, "a graphics build ran while every general worker was parked");
+        assert!(!compute_ran_early, "a reserved worker took a compute build");
+        assert!(compute_ran.load(Ordering::Acquire), "the compute build ran once the gate opened");
+        assert_eq!(workers().1, before, "parked count returns");
     }
 
     /// With every worker parked at the gate, a job queued meanwhile still runs.
@@ -1085,29 +1372,36 @@ mod used_tests {
         use std::time::{Duration, Instant};
 
         let n = crate::gpu::recomp::dxc::compile_threads();
+        // (other tests queue builds on the same pool: their backlog goes first, so let it drain)
+        let start = Instant::now();
+        while queue_gauges().lanes.iter().any(|&l| l != 0) && start.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let before = workers().1;
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _open = OpenGate(gate.clone());
         let mut blockers = Vec::with_capacity(n);
         for k in 0..n {
             let standin = 0x7E57_9730usize + k;
             let gate = gate.clone();
-            submit(standin, false, Box::new(move || {
+            submit(standin, true, Box::new(move || {
                 let _parked = park();
-                let deadline = Instant::now() + Duration::from_secs(5);
-                let mut open = gate.0.lock().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(40);
+                let mut open = gate.0.lock().unwrap_or_else(|e| e.into_inner());
                 while !*open {
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
                         break;
                     }
-                    open = gate.1.wait_timeout(open, left).unwrap().0;
+                    open = gate.1.wait_timeout(open, left).unwrap_or_else(|e| e.into_inner()).0;
                 }
-                0x9730 + k
+                // (0: a failed build, nothing for `release` whenever the stand-in is released)
+                0
             }));
             blockers.push(standin);
         }
         let start = Instant::now();
-        while workers().1 < before + n && start.elapsed() < Duration::from_secs(4) {
+        while workers().1 < before + n && start.elapsed() < Duration::from_secs(20) {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(workers().1 >= before + n, "every job parked");
@@ -1115,11 +1409,11 @@ mod used_tests {
 
         let (done_tx, done_rx) = mpsc::channel();
         let target = 0x7E57_973Fusize;
-        submit(target, false, Box::new(move || {
+        submit(target, true, Box::new(move || {
             let _ = done_tx.send(());
-            0x973F
+            0
         }));
-        let ran = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        let ran = done_rx.recv_timeout(Duration::from_secs(20)).is_ok();
 
         *gate.0.lock().unwrap() = true;
         gate.1.notify_all();
@@ -1149,37 +1443,21 @@ mod used_tests {
             }
         }
 
-        let n = crate::gpu::recomp::dxc::compile_threads();
-        let (started_tx, started_rx) = mpsc::channel();
+        // every general worker, the extra ones an earlier test started included, holds a blocker
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let mut blockers = Vec::with_capacity(n);
-        for k in 0..n {
-            let standin = 0x7E57_9720usize + k;
-            let started_tx = started_tx.clone();
-            let gate = gate.clone();
-            submit(standin, false, Box::new(move || {
-                let _ = started_tx.send(());
-                let mut open = gate.0.lock().unwrap();
-                while !*open {
-                    open = gate.1.wait(open).unwrap();
-                }
-                0x9720 + k
-            }));
-            blockers.push(standin);
-        }
-        for _ in 0..n {
-            started_rx.recv_timeout(Duration::from_secs(10)).expect("normal workers saturated");
-        }
+        let _open = OpenGate(gate.clone());
+        let blockers = saturate_general_workers(0x7E57_9A00, &gate);
 
         let target = 0x7E57_97FFusize;
         let ran = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicBool::new(false));
         let ran_job = ran.clone();
         let drop_flag = DropFlag(dropped.clone());
-        submit(target, false, Box::new(move || {
+        submit(target, true, Box::new(move || {
             let _keep = &drop_flag;
             ran_job.store(true, Ordering::Release);
-            0x9721
+            // (0: a failed build, nothing for `release` if it ever ran)
+            0
         }));
         assert_eq!(released(target), 0);
 
@@ -1248,43 +1526,19 @@ mod used_tests {
                 self.0.store(true, Ordering::Release);
             }
         }
-        struct OpenGate(Arc<(Mutex<bool>, Condvar)>);
-        impl Drop for OpenGate {
-            fn drop(&mut self) {
-                *self.0 .0.lock().unwrap() = true;
-                self.0 .1.notify_all();
-            }
-        }
-
-        // Saturate normal workers and verify released() drops the queued job immediately.
-        let n = crate::gpu::recomp::dxc::compile_threads();
-        let (started_tx, started_rx) = mpsc::channel();
+        // Saturate normal workers (every general worker, the extra ones included) and verify
+        // released() drops the queued job immediately.
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let open_normal = OpenGate(gate.clone());
-        let mut blockers = Vec::with_capacity(n);
-        for k in 0..n {
-            let standin = 0x7E57_A100usize + k;
-            let (tx, g) = (started_tx.clone(), gate.clone());
-            submit(standin, false, Box::new(move || {
-                let _ = tx.send(());
-                let mut open = g.0.lock().unwrap();
-                while !*open {
-                    open = g.1.wait(open).unwrap();
-                }
-                0xA100 + k
-            }));
-            blockers.push(standin);
-        }
-        for _ in 0..n {
-            started_rx.recv_timeout(Duration::from_secs(10)).expect("normal workers saturated");
-        }
+        let blockers = saturate_general_workers(0x7E57_9B00, &gate);
         let target_n = 0x7E57_A1FFusize;
         let (ran_n, dropped_n) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let (ran_job, flag_n) = (ran_n.clone(), DropFlag(dropped_n.clone()));
-        submit(target_n, false, Box::new(move || {
+        submit(target_n, true, Box::new(move || {
             let _keep = &flag_n;
             ran_job.store(true, Ordering::Release);
-            0xA1FF
+            // (0: a failed build, nothing for `release` if it ever ran)
+            0
         }));
         assert_eq!(released(target_n), 0);
         assert!(dropped_n.load(Ordering::Acquire), "normal queued job was not dropped immediately on released()");
@@ -1315,7 +1569,8 @@ mod used_tests {
                 while !*open {
                     open = g.1.wait(open).unwrap();
                 }
-                0xA200 + k
+                // (0: a failed build, nothing for `release` whenever the stand-in is released)
+                0
             }), key);
             p_blockers.push(standin);
         }
@@ -1330,7 +1585,8 @@ mod used_tests {
         submit_lazy(target_p, false, Box::new(move || {
             let _keep = &flag_p;
             ran_job.store(true, Ordering::Release);
-            0xA2FF
+            // (0: a failed build, nothing for `release` if it ever ran)
+            0
         }), key_p);
         assert_eq!(released(target_p), 0);
         assert!(dropped_p.load(Ordering::Acquire), "preload queued job was not dropped immediately on released()");
@@ -1715,8 +1971,7 @@ fn need_now(p: &Arc<Pending>) {
         !std::mem::replace(&mut d.by_submit, true)
     };
     if first {
-        NEEDED.lock().unwrap().push_back(p.clone());
-        let _ = queue().lock().unwrap().send(Box::new(|| ()));
+        push(lane_for(p.compute, true), Item::Build(p.clone()));
     }
     p.sent.store(true, Ordering::Release);
 }
