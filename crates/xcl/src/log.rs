@@ -627,3 +627,640 @@ mod telemetry_tests {
         assert_eq!(&kept[100..], &[1000, 2000, 3000]);
     }
 }
+
+// ---- fork telemetry (docs/guide/telemetry.md, parts 2-3: timing math and event fields) ----
+type Fields = Vec<(&'static str, serde_json::Value)>;
+
+/// `XCL_TELEMETRY_SAMPLE`: None/"" -> 1; "1".."10000" -> n; else Err (the caller warns and uses 1).
+pub fn parse_sample(value: Option<&str>) -> Result<u32, String> {
+    let v = value.unwrap_or("").trim();
+    if v.is_empty() {
+        return Ok(1);
+    }
+    match v.parse::<u32>() {
+        Ok(n) if (1..=10_000).contains(&n) => Ok(n),
+        _ => Err(format!("XCL_TELEMETRY_SAMPLE={v:?} is not a whole number from 1 to 10000")),
+    }
+}
+
+/// Whether frame `i` (1-based) gets GPU stamps at sampling `n`.
+pub fn sample_due(i: u64, n: u32) -> bool {
+    n <= 1 || i % n as u64 == 0
+}
+
+/// Length of the union of [start, end) intervals in ms; no valid interval -> None. Sorts in place.
+/// Never a sum: overlapping and nested intervals count once.
+pub fn union_ms(iv: &mut [(f64, f64)]) -> Option<f64> {
+    iv.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut total = 0.0;
+    let mut any = false;
+    let mut cur: Option<(f64, f64)> = None;
+    for &(s, e) in iv.iter() {
+        if !s.is_finite() || !e.is_finite() || e < s {
+            continue;
+        }
+        any = true;
+        cur = match cur {
+            None => Some((s, e)),
+            Some((cs, ce)) if s <= ce => Some((cs, ce.max(e))),
+            Some((cs, ce)) => {
+                total += ce - cs;
+                Some((s, e))
+            }
+        };
+    }
+    if let Some((cs, ce)) = cur {
+        total += ce - cs;
+    }
+    any.then_some(total)
+}
+
+/// GPU tick -> QPC through a calibration pair; None for tick 0, freq < 1000, qpf <= 0 or overflow.
+/// Ticks before the calibration tick convert too (signed difference, i128 arithmetic).
+pub fn tick_to_qpc(tick: u64, cal_tick: u64, cal_qpc: i64, freq: u64, qpf: i64) -> Option<i64> {
+    if tick == 0 || freq < 1000 || qpf <= 0 {
+        return None;
+    }
+    let delta = tick as i128 - cal_tick as i128;
+    let scaled = delta.checked_mul(qpf as i128)? / freq as i128;
+    i64::try_from((cal_qpc as i128).checked_add(scaled)?).ok()
+}
+
+/// The presenting thread's time neither presenting nor waiting on the frame clock; clamped at 0.
+pub fn frame_cpu_ms(interval_ms: f64, present_ms: f64, thread_wait_ms: f64) -> f64 {
+    let v = interval_ms - present_ms - thread_wait_ms;
+    if v > 0.0 {
+        v
+    } else {
+        0.0
+    }
+}
+
+/// ms rounded to 3 decimals; a non-finite value becomes null.
+fn ms_val(x: f64) -> serde_json::Value {
+    if x.is_finite() {
+        serde_json::Value::from((x * 1000.0).round() / 1000.0)
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+fn ms_opt(x: Option<f64>) -> serde_json::Value {
+    x.map_or(serde_json::Value::Null, ms_val)
+}
+
+fn num_opt(x: Option<u64>) -> serde_json::Value {
+    x.map_or(serde_json::Value::Null, serde_json::Value::from)
+}
+
+fn str_opt(x: Option<&str>) -> serde_json::Value {
+    x.map_or(serde_json::Value::Null, serde_json::Value::from)
+}
+
+/// Per-frame facts for the `frame` event.
+pub struct FrameFacts {
+    pub i: u64,
+    pub interval_ms: f64,
+    pub cpu_ms: f64,
+    pub present_ms: f64,
+    pub wait_ms: f64,
+    pub wait_calls: u64,
+    pub gpu_ms: Option<f64>,
+    pub gpu_first_ms: Option<f64>,
+    pub gpu_last_ms: Option<f64>,
+    pub gpu_lists_null: u32,
+    pub lists: u32,
+    pub draws: u64,
+    pub dispatches: u64,
+    pub barriers: Option<u64>,
+    pub pso_wait_ms: f64,
+    pub look_ms: f64,
+    pub sampled: bool,
+    pub why: Option<&'static str>,
+}
+
+/// Facts for the `list` event (one PC command list in one driver call).
+pub struct ListFacts {
+    pub frame: u64,
+    pub seq: u64,
+    pub id: u64,
+    pub chunk: u64,
+    pub queue: u32,
+    pub queue_type: &'static str,
+    pub start_tick: Option<u64>,
+    pub end_tick: Option<u64>,
+    pub start_ms: Option<f64>,
+    pub end_ms: Option<f64>,
+    pub cpu_us: u32,
+    pub resubmitted: bool,
+    pub origin: &'static str,
+    pub why: Option<&'static str>,
+}
+
+/// Facts for the `memory` event; a source that failed is None.
+pub struct MemoryFacts {
+    pub frame: u64,
+    pub committed_mb: Option<u64>,
+    pub vram_local_mb: Option<u64>,
+    pub vram_nonlocal_mb: Option<u64>,
+    pub vram_budget_mb: Option<u64>,
+    pub arenas_mb: Option<u64>,
+    pub arenas_made_mb: Option<u64>,
+    pub pages_mb: Option<u64>,
+    pub page_pools_mb: Option<u64>,
+    pub sparse_mb: Option<u64>,
+    pub sparse_mapped_mb: Option<u64>,
+}
+
+/// Facts for the `pass` event (one barrier-delimited span of a stamped list).
+pub struct PassFacts {
+    pub frame: u64,
+    pub list: u64,
+    pub queue: u32,
+    pub i: u32,
+    pub start_tick: Option<u64>,
+    pub end_tick: Option<u64>,
+    pub start_ms: Option<f64>,
+    pub end_ms: Option<f64>,
+    pub kind: &'static str,
+    pub draws: u32,
+    pub dispatches: u32,
+    pub indirect: u32,
+    pub pipelines: Vec<u64>,
+    pub pipeline_ids_truncated: bool,
+    pub barriers_before: u32,
+    pub resubmitted: bool,
+    pub why: Option<&'static str>,
+}
+
+/// Facts for the `pipeline` creation event.
+pub struct PipelineFacts {
+    pub id: u64,
+    pub stage: &'static str,
+    pub record: Option<u64>,
+    pub dxil_bytes: u64,
+    pub compile_ms: f64,
+    pub waited_ms: f64,
+    pub source: Option<&'static str>,
+    pub blob: bool,
+}
+
+/// Facts for the `resource` creation event.
+pub struct ResourceFacts {
+    pub kind: &'static str,
+    pub dim: Option<&'static str>,
+    pub bytes: Option<u64>,
+    pub ms: f64,
+    pub frame: u64,
+}
+
+/// Facts for the per-frame aggregated `io` event.
+pub struct IoFacts {
+    pub requests: u32,
+    pub bytes: u64,
+    pub ms: f64,
+    pub max_ms: f64,
+    pub zlib: u32,
+    pub frame: u64,
+}
+
+pub fn frame_fields(f: &FrameFacts) -> Fields {
+    use serde_json::Value;
+    let mut v: Fields = vec![
+        ("i", Value::from(f.i)),
+        ("interval_ms", ms_val(f.interval_ms)),
+        ("cpu_ms", ms_val(f.cpu_ms)),
+        ("present_ms", ms_val(f.present_ms)),
+        ("wait_ms", ms_val(f.wait_ms)),
+        ("wait_calls", Value::from(f.wait_calls)),
+        ("gpu_ms", ms_opt(f.gpu_ms)),
+        ("gpu_first_ms", ms_opt(f.gpu_first_ms)),
+        ("gpu_last_ms", ms_opt(f.gpu_last_ms)),
+        ("gpu_lists_null", Value::from(f.gpu_lists_null)),
+        ("lists", Value::from(f.lists)),
+        ("draws", Value::from(f.draws)),
+        ("dispatches", Value::from(f.dispatches)),
+        ("barriers", num_opt(f.barriers)),
+        ("pso_wait_ms", ms_val(f.pso_wait_ms)),
+        ("look_ms", ms_val(f.look_ms)),
+        ("sampled", Value::from(f.sampled)),
+    ];
+    if let Some(w) = f.why {
+        v.push(("why", Value::from(w)));
+    }
+    v
+}
+
+/// `translate_us` and `console_bytes` are always null (not measured, decision O-7).
+pub fn list_fields(l: &ListFacts) -> Fields {
+    use serde_json::Value;
+    let mut v: Fields = vec![
+        ("frame", Value::from(l.frame)),
+        ("seq", Value::from(l.seq)),
+        ("id", Value::from(l.id)),
+        ("chunk", Value::from(l.chunk)),
+        ("queue", Value::from(l.queue)),
+        ("queue_type", Value::from(l.queue_type)),
+        ("start_tick", num_opt(l.start_tick)),
+        ("end_tick", num_opt(l.end_tick)),
+        ("start_ms", ms_opt(l.start_ms)),
+        ("end_ms", ms_opt(l.end_ms)),
+        ("cpu_us", Value::from(l.cpu_us)),
+        ("translate_us", Value::Null),
+        ("console_bytes", Value::Null),
+        ("resubmitted", Value::from(l.resubmitted)),
+        ("origin", Value::from(l.origin)),
+    ];
+    if let Some(w) = l.why {
+        v.push(("why", Value::from(w)));
+    }
+    v
+}
+
+/// `frequency` is null when absent or below 1000 Hz.
+pub fn clock_fields(queue: u32, kind: &str, gpu_tick: u64, cpu_qpc: i64, freq: Option<u64>, qpf: i64) -> Fields {
+    use serde_json::Value;
+    vec![
+        ("queue", Value::from(queue)),
+        ("queue_type", Value::from(kind)),
+        ("gpu_tick", Value::from(gpu_tick)),
+        ("cpu_qpc", Value::from(cpu_qpc)),
+        ("frequency", num_opt(freq.filter(|&f| f >= 1000))),
+        ("qpc_frequency", Value::from(qpf)),
+    ]
+}
+
+pub fn memory_fields(m: &MemoryFacts) -> Fields {
+    use serde_json::Value;
+    vec![
+        ("frame", Value::from(m.frame)),
+        ("committed_mb", num_opt(m.committed_mb)),
+        ("vram_local_mb", num_opt(m.vram_local_mb)),
+        ("vram_nonlocal_mb", num_opt(m.vram_nonlocal_mb)),
+        ("vram_budget_mb", num_opt(m.vram_budget_mb)),
+        ("arenas_mb", num_opt(m.arenas_mb)),
+        ("arenas_made_mb", num_opt(m.arenas_made_mb)),
+        ("pages_mb", num_opt(m.pages_mb)),
+        ("page_pools_mb", num_opt(m.page_pools_mb)),
+        ("sparse_mb", num_opt(m.sparse_mb)),
+        ("sparse_mapped_mb", num_opt(m.sparse_mapped_mb)),
+    ]
+}
+
+/// `pipelines` is an array of plain numbers; `pipeline_ids_truncated` is present only when true.
+pub fn pass_fields(p: &PassFacts) -> Fields {
+    use serde_json::Value;
+    let mut v: Fields = vec![
+        ("frame", Value::from(p.frame)),
+        ("list", Value::from(p.list)),
+        ("queue", Value::from(p.queue)),
+        ("i", Value::from(p.i)),
+        ("start_tick", num_opt(p.start_tick)),
+        ("end_tick", num_opt(p.end_tick)),
+        ("start_ms", ms_opt(p.start_ms)),
+        ("end_ms", ms_opt(p.end_ms)),
+        ("kind", Value::from(p.kind)),
+        ("draws", Value::from(p.draws)),
+        ("dispatches", Value::from(p.dispatches)),
+        ("indirect", Value::from(p.indirect)),
+        ("pipelines", Value::from(p.pipelines.clone())),
+    ];
+    if p.pipeline_ids_truncated {
+        v.push(("pipeline_ids_truncated", Value::from(true)));
+    }
+    v.push(("barriers_before", Value::from(p.barriers_before)));
+    v.push(("resubmitted", Value::from(p.resubmitted)));
+    if let Some(w) = p.why {
+        v.push(("why", Value::from(w)));
+    }
+    v
+}
+
+/// `records` holds the console record hash as 16 lowercase hex digits when known, else is empty.
+pub fn pipeline_fields_built(p: &PipelineFacts) -> Fields {
+    use serde_json::Value;
+    let records: Vec<Value> = p.record.map(|r| Value::from(format!("{r:016x}"))).into_iter().collect();
+    vec![
+        ("id", Value::from(p.id)),
+        ("stage", Value::from(p.stage)),
+        ("records", Value::Array(records)),
+        ("dxil_bytes", Value::from(p.dxil_bytes)),
+        ("compile_ms", ms_val(p.compile_ms)),
+        ("waited_ms", ms_val(p.waited_ms)),
+        ("source", str_opt(p.source)),
+        ("blob", Value::from(p.blob)),
+    ]
+}
+
+/// The console-slot hooks are title-only, so `where` is always `title` and `reason` `explicit`.
+pub fn resource_fields(r: &ResourceFacts) -> Fields {
+    use serde_json::Value;
+    vec![
+        ("kind", Value::from(r.kind)),
+        ("dim", str_opt(r.dim)),
+        ("bytes", num_opt(r.bytes)),
+        ("where", Value::from("title")),
+        ("reason", Value::from("explicit")),
+        ("ms", ms_val(r.ms)),
+        ("frame", Value::from(r.frame)),
+    ]
+}
+
+pub fn io_fields(i: &IoFacts) -> Fields {
+    use serde_json::Value;
+    vec![
+        ("requests", Value::from(i.requests)),
+        ("bytes", Value::from(i.bytes)),
+        ("ms", ms_val(i.ms)),
+        ("max_ms", ms_val(i.max_ms)),
+        ("zlib", Value::from(i.zlib)),
+        ("frame", Value::from(i.frame)),
+    ]
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    use serde_json::Value;
+
+    /// The event line the writer would produce, parsed back.
+    fn line(ev: &str, f: &[(&'static str, Value)]) -> serde_json::Map<String, Value> {
+        let text = format!("{{\"t\":1.000,{}}}", event_body(ev, f));
+        assert!(!text.contains('\n'), "{text:?}");
+        match serde_json::from_str::<Value>(&text).unwrap() {
+            Value::Object(o) => o,
+            other => panic!("not an object: {other}"),
+        }
+    }
+
+    fn close(a: Option<f64>, b: f64) {
+        assert!((a.unwrap() - b).abs() < 1e-9, "{a:?} != {b}");
+    }
+
+    #[test]
+    fn union_counts_overlap_once_and_never_sums() {
+        close(union_ms(&mut [(0.0, 4.0), (2.0, 6.0)]), 6.0);
+        close(union_ms(&mut [(0.0, 10.0), (2.0, 3.0), (4.0, 5.0)]), 10.0);
+        close(union_ms(&mut [(0.0, 1.0), (2.0, 3.5)]), 2.5);
+        close(union_ms(&mut [(5.0, 6.0), (0.0, 1.0), (0.5, 2.0)]), 3.0);
+        close(union_ms(&mut [(0.0, 1.0), (1.0, 2.0)]), 2.0);
+        close(union_ms(&mut [(3.0, 3.0)]), 0.0);
+        assert_eq!(union_ms(&mut []), None);
+        assert_eq!(union_ms(&mut [(f64::NAN, 1.0)]), None);
+    }
+
+    #[test]
+    fn ticks_convert_at_any_frequency() {
+        let qpf = 10_000_000i64;
+        // 1 GHz: 1e9 ticks = 1 s = qpf counts.
+        assert_eq!(tick_to_qpc(2_000_000_000, 1_000_000_000, 500, 1_000_000_000, qpf), Some(500 + qpf));
+        // 25 MHz.
+        assert_eq!(tick_to_qpc(50_000_000, 25_000_000, 0, 25_000_000, qpf), Some(qpf));
+        // 100 MHz.
+        assert_eq!(tick_to_qpc(300_000_000, 100_000_000, 1_000, 100_000_000, qpf), Some(1_000 + 2 * qpf));
+        // Before the calibration tick.
+        assert_eq!(tick_to_qpc(1_000_000_000, 2_000_000_000, qpf, 1_000_000_000, qpf), Some(0));
+    }
+
+    #[test]
+    fn tick_conversion_refuses_what_it_cannot_do() {
+        assert_eq!(tick_to_qpc(0, 5, 5, 1_000_000_000, 10_000_000), None);
+        assert_eq!(tick_to_qpc(10, 5, 5, 999, 10_000_000), None);
+        assert_eq!(tick_to_qpc(10, 5, 5, 0, 10_000_000), None);
+        assert_eq!(tick_to_qpc(10, 5, 5, 1_000_000_000, 0), None);
+        assert_eq!(tick_to_qpc(10, 5, 5, 1_000_000_000, -1), None);
+        assert!(tick_to_qpc(10, 5, 5, 1000, 10_000_000).is_some());
+        // Overflow of i64.
+        assert_eq!(tick_to_qpc(u64::MAX, 1, i64::MAX, 1000, i64::MAX), None);
+        // Huge but representable: no panic, exact.
+        assert_eq!(tick_to_qpc(u64::MAX, u64::MAX - 1_000_000_000, 7, 1_000_000_000, 10_000_000), Some(7 + 10_000_000));
+        assert_eq!(tick_to_qpc(1, u64::MAX, 0, 1000, 1), Some(-18_446_744_073_709_551));
+    }
+
+    #[test]
+    fn sample_parsing_and_due_frames() {
+        assert_eq!(parse_sample(None), Ok(1));
+        assert_eq!(parse_sample(Some("")), Ok(1));
+        assert_eq!(parse_sample(Some(" 4 ")), Ok(4));
+        assert_eq!(parse_sample(Some("1")), Ok(1));
+        assert_eq!(parse_sample(Some("10000")), Ok(10_000));
+        for bad in ["0", "10001", "-1", "abc", "1.5", "99999999999"] {
+            assert!(parse_sample(Some(bad)).is_err(), "{bad:?}");
+        }
+        assert!((1..=5).all(|i| sample_due(i, 1)));
+        let due: Vec<u64> = (1..=10).filter(|&i| sample_due(i, 4)).collect();
+        assert_eq!(due, [4, 8]);
+        assert!(sample_due(7, 0));
+    }
+
+    #[test]
+    fn cpu_ms_is_clamped_at_zero() {
+        assert_eq!(frame_cpu_ms(16.0, 4.0, 2.0), 10.0);
+        assert_eq!(frame_cpu_ms(5.0, 4.0, 4.0), 0.0);
+        assert_eq!(frame_cpu_ms(0.0, 0.0, 0.0), 0.0);
+    }
+
+    fn frame() -> FrameFacts {
+        FrameFacts {
+            i: 3,
+            interval_ms: 16.66666,
+            cpu_ms: 5.0,
+            present_ms: 1.0,
+            wait_ms: 2.0,
+            wait_calls: 1,
+            gpu_ms: Some(7.12345),
+            gpu_first_ms: Some(100.0),
+            gpu_last_ms: Some(108.0),
+            gpu_lists_null: 0,
+            lists: 4,
+            draws: 10,
+            dispatches: 2,
+            barriers: None,
+            pso_wait_ms: 0.0,
+            look_ms: 0.25,
+            sampled: true,
+            why: None,
+        }
+    }
+
+    #[test]
+    fn frame_fields_serialise_flat_with_nulls() {
+        let o = line("frame", &frame_fields(&frame()));
+        assert_eq!(o["ev"], "frame");
+        assert_eq!(o["i"], 3);
+        assert_eq!(o["interval_ms"], 16.667);
+        assert_eq!(o["gpu_ms"], 7.123);
+        assert!(o["barriers"].is_null());
+        assert_eq!(o["sampled"], true);
+        assert!(!o.contains_key("why"));
+        let keys: Vec<&str> = o.keys().map(|k| k.as_str()).collect();
+        assert!(keys.contains(&"wait_calls") && keys.contains(&"look_ms"));
+        let mut f = frame();
+        f.gpu_ms = None;
+        f.gpu_first_ms = None;
+        f.gpu_last_ms = None;
+        f.barriers = Some(9);
+        f.why = Some("late");
+        f.wait_ms = f64::NAN;
+        let o = line("frame", &frame_fields(&f));
+        assert!(o["gpu_ms"].is_null() && o["gpu_first_ms"].is_null() && o["gpu_last_ms"].is_null());
+        assert!(o["wait_ms"].is_null());
+        assert_eq!(o["barriers"], 9);
+        assert_eq!(o["why"], "late");
+    }
+
+    #[test]
+    fn list_fields_always_carry_null_translate_and_console_bytes() {
+        let mut l = ListFacts {
+            frame: 2,
+            seq: 9,
+            id: 0x1234,
+            chunk: 5,
+            queue: 1,
+            queue_type: "direct",
+            start_tick: Some(100),
+            end_tick: Some(200),
+            start_ms: Some(1.23456),
+            end_ms: Some(2.0),
+            cpu_us: 40,
+            resubmitted: false,
+            origin: "submit",
+            why: None,
+        };
+        let o = line("list", &list_fields(&l));
+        assert!(o["translate_us"].is_null() && o["console_bytes"].is_null());
+        assert_eq!(o["start_tick"], 100);
+        assert_eq!(o["start_ms"], 1.235);
+        assert_eq!(o["queue_type"], "direct");
+        assert_eq!(o["origin"], "submit");
+        assert!(!o.contains_key("why"));
+        l.start_tick = None;
+        l.end_tick = None;
+        l.start_ms = None;
+        l.end_ms = None;
+        l.why = Some("no_frequency");
+        let o = line("list", &list_fields(&l));
+        assert!(o["start_tick"].is_null() && o["end_tick"].is_null() && o["start_ms"].is_null() && o["end_ms"].is_null());
+        assert_eq!(o["why"], "no_frequency");
+        assert!(o["translate_us"].is_null());
+    }
+
+    #[test]
+    fn clock_fields_name_the_calibration() {
+        let o = line("clock", &clock_fields(2, "compute", 1234, -5, Some(25_000_000), 10_000_000));
+        assert_eq!(o["queue"], 2);
+        assert_eq!(o["queue_type"], "compute");
+        assert_eq!(o["gpu_tick"], 1234);
+        assert_eq!(o["cpu_qpc"], -5);
+        assert_eq!(o["frequency"], 25_000_000);
+        assert_eq!(o["qpc_frequency"], 10_000_000);
+        assert!(line("clock", &clock_fields(0, "copy", 1, 1, None, 1))["frequency"].is_null());
+        assert!(line("clock", &clock_fields(0, "copy", 1, 1, Some(999), 1))["frequency"].is_null());
+    }
+
+    #[test]
+    fn memory_fields_keep_failed_sources_null() {
+        let m = MemoryFacts {
+            frame: 60,
+            committed_mb: Some(4096),
+            vram_local_mb: Some(1000),
+            vram_nonlocal_mb: None,
+            vram_budget_mb: Some(8000),
+            arenas_mb: Some(1),
+            arenas_made_mb: Some(2),
+            pages_mb: None,
+            page_pools_mb: Some(3),
+            sparse_mb: Some(4),
+            sparse_mapped_mb: None,
+        };
+        let o = line("memory", &memory_fields(&m));
+        assert_eq!(o["frame"], 60);
+        assert_eq!(o["committed_mb"], 4096);
+        assert!(o["vram_nonlocal_mb"].is_null() && o["pages_mb"].is_null() && o["sparse_mapped_mb"].is_null());
+        assert_eq!(o["page_pools_mb"], 3);
+        assert_eq!(o.len(), 13); // t, ev, frame and the ten sources
+    }
+
+    #[test]
+    fn pass_fields_flag_truncation_only_when_true() {
+        let mut p = PassFacts {
+            frame: 1,
+            list: 7,
+            queue: 0,
+            i: 2,
+            start_tick: Some(10),
+            end_tick: Some(20),
+            start_ms: Some(0.5),
+            end_ms: Some(0.75),
+            kind: "draw",
+            draws: 3,
+            dispatches: 0,
+            indirect: 1,
+            pipelines: vec![4, 5],
+            pipeline_ids_truncated: false,
+            barriers_before: 6,
+            resubmitted: false,
+            why: None,
+        };
+        let o = line("pass", &pass_fields(&p));
+        assert_eq!(o["pipelines"], serde_json::json!([4, 5]));
+        assert!(!o.contains_key("pipeline_ids_truncated") && !o.contains_key("why"));
+        assert_eq!(o["kind"], "draw");
+        assert_eq!(o["barriers_before"], 6);
+        p.pipeline_ids_truncated = true;
+        p.resubmitted = true;
+        p.start_tick = None;
+        p.end_tick = None;
+        p.start_ms = None;
+        p.end_ms = None;
+        p.why = Some("resubmitted");
+        let o = line("pass", &pass_fields(&p));
+        assert_eq!(o["pipeline_ids_truncated"], true);
+        assert!(o["start_tick"].is_null() && o["end_ms"].is_null());
+        assert_eq!(o["why"], "resubmitted");
+        assert_eq!(o["resubmitted"], true);
+    }
+
+    #[test]
+    fn pipeline_fields_hex_the_record_hash() {
+        let mut p = PipelineFacts { id: 3, stage: "graphics", record: Some(0xabc), dxil_bytes: 100, compile_ms: 1.23456, waited_ms: 0.0, source: Some("dxc"), blob: true };
+        let o = line("pipeline", &pipeline_fields_built(&p));
+        assert_eq!(o["records"], serde_json::json!(["0000000000000abc"]));
+        assert_eq!(o["compile_ms"], 1.235);
+        assert_eq!(o["source"], "dxc");
+        assert_eq!(o["blob"], true);
+        p.record = None;
+        p.source = None;
+        let o = line("pipeline", &pipeline_fields_built(&p));
+        assert_eq!(o["records"], serde_json::json!([]));
+        assert!(o["source"].is_null());
+    }
+
+    #[test]
+    fn resource_fields_say_title_and_explicit() {
+        let r = ResourceFacts { kind: "placed", dim: Some("texture"), bytes: None, ms: 0.5, frame: 12 };
+        let o = line("resource", &resource_fields(&r));
+        assert_eq!(o["where"], "title");
+        assert_eq!(o["reason"], "explicit");
+        assert!(o["bytes"].is_null());
+        assert_eq!(o["dim"], "texture");
+        assert_eq!(o["frame"], 12);
+        let r = ResourceFacts { kind: "reserved", dim: None, bytes: Some(65536), ms: 0.0, frame: 1 };
+        let o = line("resource", &resource_fields(&r));
+        assert!(o["dim"].is_null());
+        assert_eq!(o["bytes"], 65536);
+    }
+
+    #[test]
+    fn io_fields_are_plain_numbers() {
+        let i = IoFacts { requests: 3, bytes: 1 << 40, ms: 2.0004, max_ms: 1.5, zlib: 1, frame: 8 };
+        let o = line("io", &io_fields(&i));
+        assert_eq!(o["requests"], 3);
+        assert_eq!(o["bytes"], 1u64 << 40);
+        assert_eq!(o["ms"], 2.0);
+        assert_eq!(o["max_ms"], 1.5);
+        assert_eq!(o["zlib"], 1);
+        assert_eq!(o["frame"], 8);
+        assert!(o.values().all(|v| !v.is_object() && !v.is_array()));
+    }
+}
