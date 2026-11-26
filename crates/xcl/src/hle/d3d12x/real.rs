@@ -2180,7 +2180,8 @@ unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, 
     if copy.is_none() {
         copy = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| default_dsv(&r.GetDesc()));
     }
-    f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
+    f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu);
+    super::present::note_dsv(cpu as usize, res as usize);
 }
 
 /// The view a DSV without a description has, for a depth buffer `pc_resource_desc` made
@@ -2692,6 +2693,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
     pc_uav(slot.pc_uav);
     super::console_heap::publish(&slot, true);
     super::console_heap::note_resource(&slot, res as usize);
+    super::pass_capture::note_uav_view(slot.at as usize, res as usize);
     let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
         // A null image UAV was already created and published at `slot.index + 1`. Create a
         // matching null companion SRV at `slot.index` and write a valid T# referencing

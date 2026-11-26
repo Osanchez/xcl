@@ -808,6 +808,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         super::title_textures::note_transitions(st.pc, &t);
                     }
                     crate::report::telemetry_pass_boundary(list.as_raw(), n as u32);
+                    super::pass_capture::boundary(list.as_raw(), std::slice::from_raw_parts(b.as_ptr() as *const [u32; 8], n));
                     list.ResourceBarrier(std::slice::from_raw_parts(b.as_ptr() as *const D3D12_RESOURCE_BARRIER, n));
                 }
                 out.barriers += n as u32;
@@ -868,6 +869,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 at += 35;
             } else if w0 == BARRIER_MARKER {
                 crate::report::telemetry_pass_boundary(list.as_raw(), 1);
+                super::pass_capture::boundary(list.as_raw(), &[]);
                 list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                     Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -914,6 +916,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         for k in 0..4 {
                             list.SetComputeRootUnorderedAccessView(2 + k as u32, windows.get(k).copied().unwrap_or(uma_va));
                         }
+                        super::pass_capture::note_dispatch_args(list.as_raw(), layout.as_deref(), &table);
                         let raw = real as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);

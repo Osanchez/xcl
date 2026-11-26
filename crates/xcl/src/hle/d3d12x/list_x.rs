@@ -562,6 +562,7 @@ pub(super) unsafe fn note_render_targets(this: *mut c_void, n: u32, rtvs: *const
     // handle when `RTsSingleHandleToDescriptorRange != 0` or `num_targets` handles otherwise.
     let handles = if read_count == 0 { Vec::new() } else { std::slice::from_raw_parts(rtvs, read_count).to_vec() };
     let d = dsv.as_ref().copied();
+    super::pass_capture::note_targets(this, &handles, d);
     with_bindings(this, |b| b.render_targets = Some(RenderTargets { num_targets, handles, single, dsv: d }));
 }
 
@@ -4256,6 +4257,7 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
         return;
     }
     crate::report::telemetry_pass_boundary(this, n);
+    super::pass_capture::boundary(this, std::slice::from_raw_parts(barriers, n as usize));
     let mut out: Vec<[u32; 8]> = Vec::with_capacity(n as usize + 1);
     // a UAV barrier for all resources is in `out` / a transition from or to UNORDERED_ACCESS
     let (mut any_uav, mut uav_transition) = (false, false);

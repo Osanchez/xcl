@@ -38,6 +38,7 @@ use crate::gpu::fence::{self, FenceError};
 use crate::stubs::StubInfo;
 
 static RTVS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+static DSVS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static LISTS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static CANDIDATE: Mutex<Option<(usize, usize)>> = Mutex::new(None); // (queue, resource) – resource AddRef'd
 static PRESENTS: AtomicU64 = AtomicU64::new(0);
@@ -220,6 +221,14 @@ pub unsafe fn note_rtv(handle: usize, res: *mut c_void) {
     }
 }
 
+/// A depth-stencil view was created at `handle` for `res` (the twin of `note_rtv`).
+pub fn note_dsv(handle: usize, res: usize) {
+    if !enabled() || res == 0 {
+        return;
+    }
+    DSVS.lock().unwrap().get_or_insert_with(HashMap::new).insert(handle, res);
+}
+
 /// `XCL_TRACE_FRAME=1`: what console code does with each resource it later presents –
 /// render-target binds, UAV views, copy destinations, clears (logged at the first presents)
 static USES: Mutex<Option<HashMap<usize, [u64; 4]>>> = Mutex::new(None);
@@ -250,6 +259,11 @@ pub fn is_presented(res: usize) -> bool {
 /// the resource an RTV handle names (render-target binds)
 pub fn rtv_resource(handle: usize) -> Option<usize> {
     RTVS.lock().unwrap().as_ref()?.get(&handle).copied()
+}
+
+/// the resource a DSV handle names (depth binds)
+pub fn dsv_resource(handle: usize) -> Option<usize> {
+    DSVS.lock().unwrap().as_ref()?.get(&handle).copied()
 }
 
 /// The resource bound as render target 0 on `list` (`XCL_TRACE_FRAME`).
