@@ -11,6 +11,7 @@ pub mod effects;
 pub mod nvprofile;
 pub(crate) mod fence;
 pub mod pack;
+pub mod pass_stats;
 pub mod rdna2;
 pub mod recomp;
 mod rdna2_spec;
