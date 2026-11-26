@@ -295,6 +295,9 @@ fn write_end(reason: &str, code: Option<i64>, fatal_kind: Option<&str>) {
     if let Some(k) = fatal_kind {
         f.push(("fatal_kind", k.into()));
     }
+    if let Some(s) = crate::hle::d3d12x::rt_chain::summary() {
+        crate::xlog_info!("{s}");
+    }
     crate::log::event(crate::log::Tier::Frame, "end", &f);
 }
 

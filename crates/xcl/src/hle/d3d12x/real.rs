@@ -1833,6 +1833,7 @@ pub(super) fn forget_pso_for_test(pso: usize) {
 fn forget_pso(pso: usize) {
     super::dred::forget_pso(pso);
     dispatch_chain::forget(pso);
+    super::rt_chain::forget(pso);
     if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
@@ -6224,6 +6225,7 @@ unsafe fn go_background(
     standin: unsafe fn(*mut c_void, PsoFn, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT,
     shared_by: unsafe fn(*mut c_void, *const c_void) -> Option<super::standin::Key>,
     build: unsafe fn(Dev, &OwnedDesc, *mut *mut c_void) -> bool,
+    left_out: Option<super::pso_async::LeftOut>,
 ) -> Option<HRESULT> {
     let key = if super::standin::enabled() && !ppv.is_null() { shared_by(this, desc) } else { None };
     let mut driver = 0;
@@ -6251,6 +6253,14 @@ unsafe fn go_background(
             crate::xlog_warn!("D3D12.X: no stand-in pipeline ({hr:#x}) – building this one in the call");
         }
         return None;
+    }
+    // left out on purpose: the stand-in only, no job, no cache read or written
+    if let Some(why) = left_out {
+        super::pso_async::submit_left_out(*ppv as usize, why);
+        if driver != 0 {
+            super::pso_async::shared(*ppv as usize, driver);
+        }
+        return Some(hr);
     }
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
@@ -6303,7 +6313,7 @@ unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_graphics_pso(this, f, desc, riid, ppv)) } else { (translated_graphics_pso(this, f, desc, riid, ppv), false) };
     if missed {
-        if let Some(hr) = own_graphics(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_graphics, graphics_key, build_graphics)) {
+        if let Some(hr) = own_graphics(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_graphics, graphics_key, build_graphics, None)) {
             return hr;
         }
         if let Some(hr) = translated_graphics_pso(this, f, desc, riid, ppv) {
@@ -6352,11 +6362,48 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
 }
 
 unsafe fn create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let cs = if crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        shader_bytes(&(*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC)).CS)
+    } else {
+        None
+    };
+    let (role, left) = cs.map_or((super::leave_out::Role::None, None), super::rt_chain::classify);
+    let left_out = left.and_then(|why| {
+        super::null::capture_compute_desc(desc as *const u8);
+        let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+        let hr = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, compute_key, build_compute, Some(why)));
+        match hr {
+            Some(hr) => {
+                // as the missed branch of `create_compute_pso_normal`: a console program, never translated
+                LAST_COMPUTE_TRANSLATED.with(|c| c.set(true));
+                LAST_COMPUTE_RS.with(|c| c.set(0));
+                note_console_compute(hr, ppv);
+            }
+            None => {
+                static ONCE: AtomicBool = AtomicBool::new(false);
+                if !ONCE.swap(true, Ordering::Relaxed) {
+                    crate::xlog_warn!("rt chain: no stand-in for a left-out pipeline: built and run normally");
+                }
+            }
+        }
+        hr
+    });
+    let hr = match left_out {
+        Some(hr) => hr,
+        None => create_compute_pso_normal(this, desc, riid, ppv),
+    };
+    if hr >= 0 && role != super::leave_out::Role::None && !ppv.is_null() && !(*ppv).is_null() {
+        super::rt_chain::note_role(*ppv as usize, role, !super::pso_async::is_pending(*ppv as usize));
+    }
+    hr
+}
+
+unsafe fn create_compute_pso_normal(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
     if missed {
-        if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, compute_key, build_compute)) {
+        if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, compute_key, build_compute, None)) {
             // a console program the worker is translating (its root signature comes with it);
             // the real PSO registers itself in TRANSLATED_COMPUTE once build_compute succeeds
             // (if build_compute fails, the stand-in stays unregistered so Dispatch /
@@ -7433,7 +7480,7 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_mesh_stream(this, desc, riid, ppv)) } else { (translated_mesh_stream(this, desc, riid, ppv), false) };
     if missed {
-        if let Some(hr) = own_stream(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_stream, stream_key, build_stream)) {
+        if let Some(hr) = own_stream(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_stream, stream_key, build_stream, None)) {
             return hr;
         }
         if let Some(hr) = translated_mesh_stream(this, desc, riid, ppv) {

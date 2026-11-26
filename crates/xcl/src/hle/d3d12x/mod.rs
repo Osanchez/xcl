@@ -31,6 +31,7 @@ pub mod present;
 pub mod pso_async;
 pub mod pso_manifest;
 pub mod real;
+pub mod rt_chain;
 mod shader_cache_session;
 pub mod sparse;
 mod standin;

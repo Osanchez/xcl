@@ -3353,4 +3353,21 @@ mod tests {
         // (0x1234 is no pipeline: taken, not released)
         assert_eq!((released(left), released(normal)), (0, 0x1234));
     }
+
+    /// The title releasing a left-out pipeline forgets it, and its role (`real::forget_pso`): the
+    /// address may come back for another object, which then has neither.
+    #[test]
+    fn released_left_out_pipeline_is_forgotten() {
+        let standin = 0x7E57_E141usize;
+        submit_left_out(standin, LeftOut::RtOff);
+        super::super::rt_chain::note_role(standin, super::super::leave_out::Role::Trace, false);
+        assert!(is_pending(standin));
+        super::super::real::forget_pso_for_test(standin);
+        assert_eq!(super::super::rt_chain::role_of(standin), super::super::leave_out::Role::None);
+        assert_eq!(released(standin), 0, "no real pipeline to release");
+        assert_eq!(why_unbuilt(standin), None, "no entry");
+        assert!(!is_pending(standin) && !is_spared(standin));
+        assert_eq!(resolve(standin), standin, "a reused address starts with no entry");
+        assert_eq!(released(standin), 0, "a second release finds nothing");
+    }
 }
