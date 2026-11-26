@@ -1159,6 +1159,77 @@ mod used_tests {
             let _ = released(standin);
         }
     }
+
+    /// A compute wait never builds on the waiting thread: a worker does, a `xcl-pso*` thread.
+    #[test]
+    fn a_compute_wait_never_builds_on_the_waiting_thread() {
+        let standin = 0x7E57_C501usize;
+        let (info_tx, info) = mpsc::channel();
+        submit_lazy(standin, true, Box::new(move || {
+            let _ = info_tx.send(std::thread::current().name().map(str::to_owned));
+            0x7C01
+        }), 0);
+        assert_eq!(resolve_wait_limited(standin, Some(std::time::Duration::from_secs(20))), 0x7C01);
+        let name = info.recv_timeout(std::time::Duration::from_secs(10)).expect("the job ran");
+        assert!(name.is_some_and(|n| n.starts_with("xcl-pso")), "built on the waiting thread");
+        let _ = released(standin);
+    }
+
+    /// A compute wait is built ahead of a long queue of graphics builds.
+    #[test]
+    fn a_compute_wait_goes_ahead_of_the_fifo() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let standins: Vec<usize> = (0..64).map(|i| 0x7E57_C510usize + i).collect();
+        for &s in &standins {
+            submit_lazy(s, false, Box::new(|| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                0x7C10
+            }), 0);
+            resolve(s);
+        }
+        let compute = 0x7E57_C5A0usize;
+        submit_lazy(compute, true, Box::new(|| 0x7C11), 0);
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_wait_limited(compute, Some(std::time::Duration::from_secs(20))), 0x7C11);
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "the compute wait queued behind the FIFO ({:?})", t.elapsed());
+        for &s in &standins {
+            wait_built(s);
+            let _ = released(s);
+        }
+        let _ = released(compute);
+    }
+
+    /// A compute wait whose limit passes returns the stand-in, marks the pipeline late and does
+    /// not wait again; once built, the real pipeline.
+    #[test]
+    fn a_compute_wait_ends_at_its_limit() {
+        let standin = 0x7E57_C5B0usize;
+        let (go, finish) = mpsc::channel::<()>();
+        submit_lazy(standin, true, Box::new(move || {
+            let _ = finish.recv_timeout(std::time::Duration::from_secs(20));
+            0x7C20
+        }), 0);
+        let limit = Some(std::time::Duration::from_millis(50));
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_wait_limited(standin, limit), standin, "not built within the limit: the stand-in");
+        assert!(t.elapsed() >= std::time::Duration::from_millis(45) && t.elapsed() < std::time::Duration::from_secs(5), "waited {:?}", t.elapsed());
+        assert!(entry(standin).unwrap().late.load(Ordering::Acquire), "the pipeline is not late");
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_wait_limited(standin, limit), standin);
+        assert!(t.elapsed() < std::time::Duration::from_millis(40), "a late pipeline is waited for again ({:?})", t.elapsed());
+        go.send(()).unwrap();
+        wait_built(standin);
+        assert_eq!(resolve_wait_limited(standin, limit), 0x7C20, "built by a worker");
+        let _ = released(standin);
+    }
+
+    #[test]
+    fn image_skip_is_on_unless_turned_off() {
+        assert!(image_skip_from(None));
+        assert!(image_skip_from(Some("1")));
+        assert!(!image_skip_from(Some("0")));
+        assert!(!image_skip_from(Some(" 0 ")));
+    }
 }
 
 fn entry(pso: usize) -> Option<Arc<Pending>> {
@@ -1201,14 +1272,25 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
-/// `resolve`, waiting for a pipeline still being built – built here if no worker has started
-/// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
+/// `resolve`, waiting for a pipeline still being built: a worker builds it, ahead of the queue
+/// (a queue of a title's hundreds of pipelines must not hold up the one it binds now); this
+/// thread never does.
 pub fn resolve_wait(pso: usize) -> usize {
     resolve_wait_for(pso, wait_budget())
 }
 
-/// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
+/// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built, or for a compute
+/// pipeline until `compute_wait_limit`).
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
+    resolve_wait_inner(pso, budget, compute_wait_limit())
+}
+
+/// `resolve_wait_for` with no budget, a compute pipeline waited for at most `limit` (None: no limit).
+fn resolve_wait_limited(pso: usize, limit: Option<std::time::Duration>) -> usize {
+    resolve_wait_inner(pso, None, limit)
+}
+
+fn resolve_wait_inner(pso: usize, budget: Option<std::time::Duration>, limit: Option<std::time::Duration>) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
     if p.spared.load(Ordering::Acquire) {
@@ -1228,29 +1310,61 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
         }
         return r;
     }
-    // (a graphics pipeline is never built on this thread: a worker builds it, ahead of the queue)
-    let job = if p.compute { p.job.lock().unwrap().take() } else { None };
-    let built_here = job.is_some();
-    if !p.compute && !already {
+    let limit = limit.filter(|_| p.compute);
+    // (its wait ran out earlier: its dispatches are skipped until a worker has built it)
+    if !already && limit.is_some() && p.late.load(Ordering::Acquire) {
+        return p.stand(pso);
+    }
+    // (no pipeline is built on this thread: a worker builds it, ahead of the queue)
+    let _open = (!already).then(|| OpenWait::new(pso, p.compute, false, started));
+    if !already {
         need_now(&p);
     }
-    let _open = (!already).then(|| OpenWait::new(pso, p.compute, built_here, started));
-    if let Some(job) = job {
-        complete(&p, job());
-    }
-    p.want();
     let mut done = p.done.lock().unwrap();
-    while !*done {
-        done = p.cv.wait(done).unwrap();
+    let mut expired = false;
+    match limit {
+        Some(limit) => {
+            let left = limit.saturating_sub(started.elapsed());
+            let (d, t) = p.cv.wait_timeout_while(done, left, |d| !*d).unwrap();
+            done = d;
+            expired = t.timed_out() && !*done;
+        }
+        None => {
+            while !*done {
+                done = p.cv.wait(done).unwrap();
+            }
+        }
     }
     drop(done);
     if !already {
-        note_blocked(p.compute, built_here, started.elapsed());
+        note_blocked(p.compute, false, started.elapsed());
+    }
+    if expired {
+        if let Some(limit) = limit {
+            if !p.late.swap(true, Ordering::AcqRel) {
+                let ms = limit.as_millis() as u64;
+                crate::xlog_warn!("D3D12.X: a compute pipeline was not built after {ms} ms: its dispatches are skipped until it is");
+                crate::report::telemetry_pipeline_wait_expired(true, ms);
+            }
+        }
+        return p.stand(pso);
     }
     match p.real.load(Ordering::Acquire) {
         0 => p.stand(pso),
         r => r,
     }
+}
+
+/// How long a bind waits for a compute pipeline a worker is building (`XCL_PSO_COMPUTE_WAIT_MS`,
+/// default 120 000; 0: no limit). A safety limit for a build that never ends: the pipeline is then
+/// `late` and its dispatches are skipped until it is built.
+fn compute_wait_limit() -> Option<std::time::Duration> {
+    static L: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *L.get_or_init(|| match std::env::var("XCL_PSO_COMPUTE_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(ms) => Some(std::time::Duration::from_millis(ms)),
+        None => Some(std::time::Duration::from_millis(120_000)),
+    })
 }
 
 /// Draw waits per shown frame, all threads together (`XCL_PSO_FRAME_WAIT_MS`, default 100;
@@ -1393,17 +1507,24 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     p.stand(pso)
 }
 
-/// `XCL_PSO_IMAGE_SKIP=1`: a bind does not wait for a big compute program that writes nothing
-/// but images (`gpu::effects::big_and_image_only`); its dispatches are left out until a worker
-/// has built it. Off by default: what such a program draws is missing for that long.
+/// A bind does not wait for a big compute program that writes nothing but images
+/// (`gpu::effects::big_and_image_only`); its dispatches are left out until a worker has built it.
+/// On by default (`XCL_PSO_IMAGE_SKIP=0`: off): what such a program draws is missing for that long.
 ///
 /// A retail title's world start binds one ray-tracing resolve program per material (73 – 118
 /// KiB of console code, about 1 MB of DXIL each): an RDNA2 driver takes 22 – 172 s for each,
-/// one bind at a time, and the title stands still for all of them. `XCL_PSO_WAIT_MS` goes on without every late
-/// program, also the culling passes whose counts an `ExecuteIndirect` reads next – a GPU hang.
+/// one bind at a time, and the title stands still for all of them. Skipping them cannot leave
+/// stale counts for an `ExecuteIndirect`: they write no buffer. A bounded wait (`XCL_PSO_WAIT_MS`)
+/// goes on without every late program, also the culling passes whose counts an `ExecuteIndirect`
+/// reads next – a GPU hang.
 pub fn image_skip() -> bool {
     static S: OnceLock<bool> = OnceLock::new();
-    *S.get_or_init(|| std::env::var("XCL_PSO_IMAGE_SKIP").is_ok_and(|v| v.trim() == "1"))
+    *S.get_or_init(|| image_skip_from(std::env::var("XCL_PSO_IMAGE_SKIP").ok().as_deref()))
+}
+
+/// `image_skip` for the value of `XCL_PSO_IMAGE_SKIP`: on unless it is `0`.
+fn image_skip_from(v: Option<&str>) -> bool {
+    v.map_or(true, |v| v.trim() != "0")
 }
 
 /// The compute pipeline behind stand-in `standin` writes nothing but images: binds go on
@@ -1595,6 +1716,12 @@ pub fn released(pso: usize) -> usize {
     0
 }
 
+/// `pso` is a stand-in whose compute pipeline's dispatches may be left out while it is built
+/// (`image_only`).
+pub fn is_spared(pso: usize) -> bool {
+    entry(pso).is_some_and(|p| p.spared.load(Ordering::Acquire))
+}
+
 /// `pso` is a stand-in whose real pipeline is still being built.
 pub fn is_pending(pso: usize) -> bool {
     entry(pso).is_some_and(|p| !*p.done.lock().unwrap())
@@ -1617,13 +1744,16 @@ pub fn counts() -> (usize, usize, usize) {
 mod tests {
     use super::*;
 
-    /// A bind that waits for a lazy compute pipeline nobody has started builds it itself, and the time
-    /// it was held up is counted under its kind (other tests wait too: increases are checked).
+    /// A bind that waits for a lazy compute pipeline nobody has started does not build it: a
+    /// worker does, and the time it was held up is counted under its kind, with none built in
+    /// the call (other tests wait too: increases are checked).
     #[test]
-    fn a_wait_that_builds_the_pipeline_is_counted_with_its_time() {
+    fn a_wait_for_a_worker_is_counted_with_its_time_and_built_nowhere_in_the_call() {
         let standin = 0x7E57_8001usize;
         let before = blocked();
-        submit_lazy(standin, true, Box::new(|| {
+        let (name_tx, name) = mpsc::channel();
+        submit_lazy(standin, true, Box::new(move || {
+            let _ = name_tx.send(std::thread::current().name().map(str::to_owned));
             std::thread::sleep(std::time::Duration::from_millis(50));
             0x4401
         }), 0);
@@ -1631,9 +1761,11 @@ mod tests {
         let after = blocked();
         let (b, a) = (before[1], after[1]);
         assert!(a[WAITS] > b[WAITS], "the compute wait is counted");
-        assert!(a[BUILT_HERE] > b[BUILT_HERE], "built by the caller: nobody had started it");
+        assert_eq!(a[BUILT_HERE], b[BUILT_HERE], "nothing is built in the call");
         assert!(a[TOTAL_US] - b[TOTAL_US] >= 50_000, "its 50 ms are in the total");
         assert!(a[LONGEST_US] >= 50_000);
+        let name = name.recv_timeout(std::time::Duration::from_secs(10)).expect("the job ran");
+        assert!(name.is_some_and(|n| n.starts_with("xcl-pso")), "built on a thread that is not a worker");
         released(standin);
     }
 
@@ -1661,12 +1793,12 @@ mod tests {
         let _ = released(standin);
     }
 
-    /// A wait is in the table of open waits while it runs (here: while the caller builds the
+    /// A wait is in the table of open waits while it runs (here: while a worker builds the
     /// pipeline), and not after it.
     #[test]
     fn a_wait_is_open_while_it_runs() {
         let standin = 0x7E57_8003usize;
-        let is_open = move || OPEN.lock().unwrap().iter().any(|(&(s, _), w)| s == standin && w.built_here && w.compute);
+        let is_open = move || OPEN.lock().unwrap().iter().any(|(&(s, _), w)| s == standin && !w.built_here && w.compute);
         let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let seen_in_job = seen.clone();
         submit_lazy(standin, true, Box::new(move || {

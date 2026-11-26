@@ -278,7 +278,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
-    let unbuilt_compute = signature_dispatches(sig) && super::pso_async::is_pending(raw_pso) && super::real::is_console_compute(raw_pso);
+    let unbuilt_compute = signature_dispatches(sig) && put_off_to_submit(raw_pso) && super::real::is_console_compute(raw_pso);
     if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
         return super::pso_async::need_by_submit(raw_pso);
     }
@@ -881,10 +881,16 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
     super::real::bind_pipeline(this, pso);
 }
 
+/// A compute call with `pso` is put off to the submit, which waits for the pipeline: it is still
+/// being built and is not one whose dispatches may be left out (`pso_async::image_only`).
+fn put_off_to_submit(pso: usize) -> bool {
+    super::pso_async::is_pending(pso) && !super::pso_async::is_spared(pso)
+}
+
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
     let pso = with(this, |s| s.pso);
-    if super::pso_async::is_pending(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
+    if put_off_to_submit(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
         return super::pso_async::need_by_submit(pso);
     }
     let pso = super::pso_async::resolve_wait(pso);
@@ -1662,6 +1668,52 @@ void main(uint t : SV_GroupIndex) {
         let _ = pso_async::released(shell_ok);
         real::forget_pso_for_test(shell_ok);
         real::forget_pso_for_test(real_ok);
+    }
+
+    /// A pending pipeline whose dispatches may be left out (`image_only`) is not put off to the
+    /// submit, which would wait for it: its dispatch is skipped at once. An ordinary pending one is.
+    #[test]
+    fn a_spared_dispatch_is_not_put_off() {
+        let mut orig_vt = [0usize; 64];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[14] = fake_dispatch as usize;
+        let mut ext_vt = vec![0usize; 65];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list_ptr = &*fake as *const FakeAdoptedList as *mut c_void;
+
+        let (spared, ordinary) = (0x7E57_C5C1usize, 0x7E57_C5C2usize);
+        // (lazy and never bound: nothing builds them, they stay pending)
+        pso_async::submit_lazy(spared, true, Box::new(|| 0), 0);
+        pso_async::submit_lazy(ordinary, true, Box::new(|| 0), 0);
+        pso_async::image_only(spared);
+        assert!(pso_async::is_pending(spared) && pso_async::is_spared(spared));
+        assert!(!put_off_to_submit(spared), "a spared pipeline is put off to the submit");
+        assert!(put_off_to_submit(ordinary), "an ordinary pending pipeline is not put off");
+        assert!(!pso_async::is_spared(ordinary) && !pso_async::is_spared(0x7E57_C5FF));
+
+        reset(list_ptr, 0x7E57_C5D0, spared);
+        let before = counts_snapshot();
+        unsafe {
+            dispatch(list_ptr, 1, 1, 1);
+        }
+        let after = counts_snapshot();
+        assert!(after[DISPATCHES_SKIPPED] > before[DISPATCHES_SKIPPED], "the dispatch is skipped");
+        assert_eq!(fake.dispatch_calls.load(Ordering::Relaxed), 0, "the dispatch reached the PC list");
+
+        forget(list_ptr);
+        let _ = pso_async::released(spared);
+        let _ = pso_async::released(ordinary);
     }
 
     #[test]

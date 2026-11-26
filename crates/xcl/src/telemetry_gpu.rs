@@ -2421,6 +2421,9 @@ fn built_by(name: Option<&str>) -> &'static str {
     }
 }
 
+/// A bind's wait for a pipeline ran out its limit (a later unit fills this in).
+pub fn telemetry_pipeline_wait_expired(_compute: bool, _ms: u64) {}
+
 /// A pipeline was built by the driver: writes its `pipeline` event. `kind` is the build's label
 /// (`compute` anywhere in it makes the stage compute); `record` is the console record hash and
 /// whether a driver blob was supplied.
