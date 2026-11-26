@@ -447,6 +447,7 @@ fn telemetry_final(report_json: &str) {
     update_manifest(|m| {
         m.dxc = ManifestDxc { dxcompiler: version(&tc.dxcompiler.file_version), dxil: version(&tc.dxil.file_version) };
     });
+    shaders_final();
 }
 
 /// A console shader XCL could not translate (`real::note_translation_error`).
@@ -890,5 +891,1383 @@ mod telemetry_tests {
         let p = v["path"].as_str().unwrap();
         assert!(p.contains('\\') && p.contains('"') && p.contains('\u{FFFD}'));
         assert!(as_json(io_failed_fields(0, 0, None, 1)).get("path").is_none());
+    }
+}
+
+// ---- split-wave shader shape (docs/guide/telemetry.md, part 4; shareable) ----
+
+/// What the split-wave report counts for one program: static exchange sites in the HLSL the
+/// translator writes for it (how often each ran is not known here).
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+pub struct Exchanges {
+    /// `xcl_x_ballot(` sites attributed to a console pc
+    pub ballot: u32,
+    /// entry ballots (no pc: the prologue)
+    pub entry: u32,
+    /// `xcl_x_rla_uniform(` plus the folded meets
+    pub readlane: u32,
+    /// of `readlane`: folded reduction tails (each replaced two or more `v_readlane`)
+    pub readlane_folded: u32,
+    /// `xcl_x_rla_any(`
+    pub bpermute: u32,
+    /// `xcl_x_meet() && xcl_half` meets
+    pub coherent_load: u32,
+    /// `xcl_x_meet()` in no known form (must be 0; a test pins it)
+    pub other: u32,
+    /// all of the above except `readlane_folded`
+    pub total: u32,
+    /// sites whose pc lies in a loop range
+    pub in_loops: u32,
+    /// `#define XCL_X_THREADS`
+    pub threads_per_group: u32,
+    /// `#define XCL_X_WAVES`
+    pub waves_per_group: u32,
+    /// `#define XCL_X_SPIN 1`: the halves meet through counters, not group barriers
+    pub spin: bool,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct RegisterArray {
+    pub name: String,
+    pub dwords: u32,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Form {
+    Straight,
+    Structured,
+    SwitchPc,
+    Direct,
+}
+
+/// Console-side shape (backend independent), from `gpu::dxil::cfg::Cfg`.
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+pub struct ProgramShape {
+    pub instructions: u32,
+    pub blocks: u32,
+    pub loops: u32,
+    pub max_loop_depth: u32,
+    pub divergent_branches: u32,
+    pub movrel_sites: u32,
+    /// byte range [header pc, end of its farthest back-edge source) per loop header
+    #[serde(skip)]
+    pub loop_ranges: Vec<(u64, u64)>,
+}
+
+/// The program a container holds for a stage (mirrors `pso::console_translation` and
+/// `pso::console_mesh_with`): code, mode, wave64, group threads (None for VS / PS).
+/// `gs_start` is `Some` for a geometry program (its `GsInterface::gs_start`).
+#[derive(Clone, Debug)]
+pub struct ConsoleProgram {
+    pub code: Vec<u8>,
+    pub mode: crate::gpu::recomp::Mode,
+    pub wave64: bool,
+    pub group_threads: Option<u32>,
+    pub gs_start: Option<Option<u64>>,
+}
+
+pub fn shape_console_program(blob: &[u8], stage: crate::gpu::recomp::pso::Stage) -> Result<ConsoleProgram, String> {
+    use crate::gpu::recomp::{self, pso::Stage, CsInterface, Mode};
+    if let Some(f) = recomp::pso::fspx(blob) {
+        if stage != Stage::Compute {
+            return Err("an FSPX (driver) container in a graphics slot".into());
+        }
+        // `CsInterface::from_rsrc2` is private to `gpu::recomp`: the same bits
+        let r = f.rsrc2;
+        let cs = CsInterface {
+            threads: f.threads,
+            user_sgprs: (r >> 1) & 31,
+            tgid: [(r >> 7) & 1 == 1, (r >> 8) & 1 == 1, (r >> 9) & 1 == 1],
+            tg_size: (r >> 10) & 1 == 1,
+            tid_components: ((r >> 11) & 3) + 1,
+        };
+        return Ok(ConsoleProgram { code: f.code.to_vec(), mode: Mode::Compute(cs), wave64: recomp::detect_wave64(f.code), group_threads: Some(f.threads.iter().product()), gs_start: None });
+    }
+    let sh = crate::gpu::xbox::parse(blob).ok_or("not a console shader container")?;
+    let want = match stage {
+        Stage::Vertex => 4,
+        Stage::Pixel => 5,
+        Stage::Compute => 6,
+        Stage::Mesh => 7,
+    };
+    let f = sh
+        .fssm
+        .iter()
+        .find(|f| f.stages.first().is_some_and(|s| s.hw == want))
+        .ok_or_else(|| format!("no hardware variant {}", crate::gpu::xbox::hw_stage_name(want)))?;
+    let mode = recomp::interface(blob, &sh, f).ok_or("unknown shader interface")?;
+    let fits = matches!((&mode, stage), (Mode::Vertex(_), Stage::Vertex) | (Mode::Pixel(_), Stage::Pixel) | (Mode::Compute(_), Stage::Compute) | (Mode::Mesh(_), Stage::Mesh));
+    if !fits {
+        return Err("the shader stage does not match its slot in the PSO".into());
+    }
+    let p = f.programs.first().ok_or("FSSM without a program")?;
+    let code = p.offset.checked_add(p.len).and_then(|end| f.data.get(p.offset..end)).ok_or("FSSM program out of range")?.to_vec();
+    let group_threads: Option<u32> = match &mode {
+        Mode::Compute(cs) => Some(cs.threads.iter().product()),
+        Mode::Mesh(ms) => Some(ms.threads),
+        _ => None,
+    };
+    let wave64 = recomp::fssm_wave64(f, &code);
+    Ok(ConsoleProgram { code, mode, wave64, group_threads, gs_start: None })
+}
+
+/// The ES variant of the console VS `vs` and the GS `gs` as one program (`geometry_program`).
+pub fn shape_geometry_program(vs: &[u8], gs: &[u8]) -> Result<ConsoleProgram, String> {
+    let (code, g) = crate::gpu::recomp::geometry_program(vs, gs)?;
+    let gs_start = g.gs_start;
+    Ok(ConsoleProgram { code, mode: crate::gpu::recomp::Mode::Geometry(g), wave64: true, group_threads: Some(64), gs_start: Some(gs_start) })
+}
+
+/// The console CFG's numbers for `code` (`gs_start` as in `ConsoleProgram`).
+pub fn shape_program(code: &[u8], gs_start: Option<Option<u64>>) -> Result<ProgramShape, String> {
+    use crate::gpu::dxil::cfg::{Cfg, Term};
+    let cfg = match gs_start {
+        Some(start) => Cfg::build_geometry(code, start)?,
+        None => Cfg::build(code)?,
+    };
+    let (mut divergent, mut movrel) = (0u32, 0u32);
+    for d in &cfg.insts {
+        let n = d.inst.name;
+        if matches!(n, "S_CBRANCH_EXECZ" | "S_CBRANCH_EXECNZ" | "S_CBRANCH_VCCZ" | "S_CBRANCH_VCCNZ") {
+            divergent += 1;
+        }
+        if n.starts_with("V_MOVREL") || n == "V_SWAPREL_B32" {
+            movrel += 1;
+        }
+    }
+    let mut pos = vec![usize::MAX; cfg.blocks.len()];
+    for (i, &b) in cfg.rpo.iter().enumerate() {
+        pos[b] = i;
+    }
+    let code_end = cfg.insts.last().map_or(0, |d| d.pc + d.len as u64);
+    let mut starts: Vec<u64> = cfg.blocks.iter().map(|b| b.pc).collect();
+    starts.sort_unstable();
+    starts.dedup();
+    let end_of = |pc: u64| starts.iter().copied().find(|&s| s > pc).unwrap_or(code_end);
+    // per loop header (a block): the end of its farthest back-edge source
+    let mut far: BTreeMap<usize, u64> = BTreeMap::new();
+    for &b in &cfg.rpo {
+        let succ = match &cfg.blocks[b].term {
+            Term::Jump(t) => vec![*t],
+            Term::Cond(_, t, f) => vec![*t, *f],
+            Term::End => vec![],
+        };
+        for t in succ {
+            if cfg.headers.contains(&t) && pos[t] <= pos[b] {
+                let e = far.entry(t).or_insert(0);
+                *e = (*e).max(end_of(cfg.blocks[b].pc));
+            }
+        }
+    }
+    let loop_ranges: Vec<(u64, u64)> = far.into_iter().map(|(h, end)| (cfg.blocks[h].pc, end)).collect();
+    // a range that starts inside another counts as nested in it (a partial overlap too)
+    let max_loop_depth = loop_ranges.iter().map(|&(lo, _)| loop_ranges.iter().filter(|&&(a, b)| a <= lo && lo < b).count() as u32).max().unwrap_or(0);
+    Ok(ProgramShape {
+        instructions: cfg.insts.len() as u32,
+        blocks: cfg.rpo.len() as u32,
+        loops: cfg.headers.len() as u32,
+        max_loop_depth,
+        divergent_branches: divergent,
+        movrel_sites: movrel,
+        loop_ranges,
+    })
+}
+
+/// The pc of a `// <pc>: <instruction>` comment line (`Em::inst` writes them with `{:04x}`).
+fn shape_comment_pc(line: &str) -> Option<u64> {
+    let rest = line.trim_start().strip_prefix("// ")?;
+    let (hex, _) = rest.split_once(": ")?;
+    if hex.len() < 4 || hex.len() > 8 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
+}
+
+/// The number of `#define <name> <n>[u]`.
+fn shape_hlsl_define(hlsl: &str, name: &str) -> Option<u32> {
+    let key = format!("#define {name} ");
+    let rest = &hlsl[hlsl.find(&key)? + key.len()..];
+    rest.split_whitespace().next()?.trim_end_matches('u').parse().ok()
+}
+
+/// The exchange call sites of a split-wave64 program's HLSL. Only the text from `void main(`
+/// on counts: the prelude before it defines the exchange functions. A site belongs to the pc
+/// of the last `// <pc>:` comment before it, none yet: the entry.
+pub fn shape_hlsl_exchanges(hlsl: &str, loop_ranges: &[(u64, u64)]) -> Exchanges {
+    let mut e = Exchanges {
+        threads_per_group: shape_hlsl_define(hlsl, "XCL_X_THREADS").unwrap_or(0),
+        waves_per_group: shape_hlsl_define(hlsl, "XCL_X_WAVES").unwrap_or(0),
+        spin: shape_hlsl_define(hlsl, "XCL_X_SPIN") == Some(1),
+        ..Default::default()
+    };
+    let Some(main) = hlsl.find("void main(") else { return e };
+    let mut pc: Option<u64> = None;
+    for line in hlsl[main..].lines() {
+        if let Some(p) = shape_comment_pc(line) {
+            pc = Some(p);
+            continue;
+        }
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        let ballots = line.matches("xcl_x_ballot(").count() as u32;
+        let readlane = line.matches("xcl_x_rla_uniform(").count() as u32;
+        let bpermute = line.matches("xcl_x_rla_any(").count() as u32;
+        let meets = line.matches("xcl_x_meet()").count() as u32;
+        let coherent = line.matches("xcl_x_meet() && xcl_half").count() as u32;
+        let folded = (line.matches("xcl_x_meet() ? xcl_x_get(").count() + line.matches("_ok = xcl_x_meet();").count()) as u32;
+        if pc.is_some() {
+            e.ballot += ballots;
+        } else {
+            e.entry += ballots;
+        }
+        e.readlane += readlane + folded;
+        e.readlane_folded += folded;
+        e.bpermute += bpermute;
+        e.coherent_load += coherent;
+        e.other += meets.saturating_sub(coherent + folded);
+        if pc.is_some_and(|p| loop_ranges.iter().any(|&(lo, hi)| lo <= p && p < hi)) {
+            e.in_loops += ballots + readlane + bpermute + meets;
+        }
+    }
+    e.total = e.ballot + e.entry + e.readlane + e.bpermute + e.coherent_load + e.other;
+    e
+}
+
+/// Every non-const `static uint NAME[N];` of the HLSL (today only `xcl_scratch`).
+pub fn shape_hlsl_register_arrays(hlsl: &str) -> Vec<RegisterArray> {
+    hlsl.lines()
+        .filter_map(|l| {
+            let rest = l.trim().strip_prefix("static uint ")?;
+            let (name, n) = rest.strip_suffix("];")?.split_once('[')?;
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                return None;
+            }
+            Some(RegisterArray { name: name.to_string(), dwords: n.parse().ok()? })
+        })
+        .collect()
+}
+
+/// The control-flow form of the HLSL: the `pc` chain (`uint pc = ` in `main`), structured
+/// control flow, or a straight line (`branches`: the program has branches).
+pub fn shape_hlsl_form(hlsl: &str, branches: bool) -> Form {
+    let body = hlsl.find("void main(").map_or(hlsl, |i| &hlsl[i..]);
+    if body.contains("\n    uint pc = ") {
+        Form::SwitchPc
+    } else if branches {
+        Form::Structured
+    } else {
+        Form::Straight
+    }
+}
+
+/// Whether the HLSL declares the upper-lanes form (`static bool xcl_hw32`).
+pub fn shape_hlsl_upper_lanes(hlsl: &str) -> bool {
+    hlsl.contains("static bool xcl_hw32")
+}
+
+/// The HLSL backend's shape of one program: what ran (`split` as passed) and, for a wave64
+/// compute / mesh / geometry program, exchanges of the split form, emitted for counting when it did not run split.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct HlslShape {
+    pub program: ProgramShape,
+    pub form: Form,
+    pub unstructured: bool,
+    pub register_arrays: Vec<RegisterArray>,
+    pub private_bytes_per_thread: u64,
+    pub upper_lanes: Option<bool>,
+    pub exchanges: Option<Exchanges>,
+    pub hlsl_bytes: u64,
+}
+
+/// The program's HLSL as the translator writes it (no DXC), with `split` as the split flag.
+fn shape_emit(p: &ConsoleProgram, windows: u32, split: bool) -> Result<crate::gpu::recomp::Translation, String> {
+    use crate::gpu::recomp::{self, Mode, Options};
+    match &p.mode {
+        Mode::Mesh(ms) => recomp::translate_mesh(&p.code, ms.clone(), p.wave64, split, windows),
+        Mode::Geometry(g) => recomp::translate_geometry(&p.code, g.clone(), split, windows),
+        mode => recomp::translate(&p.code, &Options { mode: mode.clone(), wave64: p.wave64, split_wave64: split, mem_windows: windows, ..Default::default() }),
+    }
+}
+
+/// Bytes of private memory per thread the arrays declare.
+fn shape_private_bytes(arrays: &[RegisterArray]) -> u64 {
+    arrays.iter().map(|a| a.dwords as u64 * 4).sum()
+}
+
+pub fn shape_hlsl(p: &ConsoleProgram, stage_is_graphics: bool, windows: u32, split: bool) -> Result<HlslShape, String> {
+    let program = shape_program(&p.code, p.gs_start)?;
+    let t = shape_emit(p, windows, split)?;
+    let register_arrays = shape_hlsl_register_arrays(&t.hlsl);
+    let form = shape_hlsl_form(&t.hlsl, t.blocks > 1);
+    let exchanges = if stage_is_graphics || !p.wave64 {
+        None
+    } else if split {
+        Some(shape_hlsl_exchanges(&t.hlsl, &program.loop_ranges))
+    } else {
+        // the split form is emitted for counting only: the numbers do not depend on the device
+        Some(shape_hlsl_exchanges(&shape_emit(p, windows, true)?.hlsl, &program.loop_ranges))
+    };
+    Ok(HlslShape {
+        form,
+        unstructured: form == Form::SwitchPc,
+        private_bytes_per_thread: shape_private_bytes(&register_arrays),
+        upper_lanes: stage_is_graphics.then(|| shape_hlsl_upper_lanes(&t.hlsl)),
+        hlsl_bytes: t.hlsl.len() as u64,
+        register_arrays,
+        exchanges,
+        program,
+    })
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+    use crate::gpu::recomp::{translate, CsInterface, Mode, Options, Translation};
+
+    const V: u64 = 256;
+    type I = (&'static str, &'static str, &'static [(&'static str, u64)]);
+    const ENDPGM: I = ("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)]);
+    const MOV: I = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)]);
+    const BPERM1: I = ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 3), ("ADDR", 1), ("DATA0", 2)]);
+    const BPERM2: I = ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 4), ("ADDR", 1), ("DATA0", 2)]);
+    const RLANE5: I = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 1), ("SRC1", 128 + 5)]);
+    const RLANE3: I = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V + 1), ("SRC1", 128 + 3)]);
+    const RLANE35: I = ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 5), ("SRC0", V + 1), ("SRC1", 128 + 35)]);
+    const CMP: I = ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 1)]);
+    const CNDMASK: I = ("V_CNDMASK_B32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V + 3), ("VSRC1", 4)]);
+    const MOV_S2_VCC: I = ("S_MOV_B64", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 106)]);
+    const COHERENT: I = ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 4), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 125), ("GLC", 1)]);
+    const SCRATCH_ST: I = ("SCRATCH_STORE_DWORD", "ENC_FLAT_SCRATCH", &[("ADDR", 2), ("DATA", 1), ("SADDR", 0x7F)]);
+    const SCRATCH_LD: I = ("SCRATCH_LOAD_DWORD", "ENC_FLAT_SCRATCH", &[("VDST", 3), ("ADDR", 2), ("SADDR", 0x7F)]);
+    // branch offsets are in dwords from the next instruction; DS, VOP3, SMEM and FLAT are 8 bytes
+    const SCC1_BACK_2: I = ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFE)]);
+    const SCC1_BACK_4: I = ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)]);
+    const SCC1_BACK_6: I = ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFA)]);
+    const EXECZ_FWD_1: I = ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 1)]);
+    const VCCNZ_BACK_4: I = ("S_CBRANCH_VCCNZ", "ENC_SOPP", &[("SIMM16", 0xFFFC)]);
+
+    fn asm(lines: &[I]) -> Vec<u8> {
+        lines.iter().flat_map(|(n, e, f)| crate::gpu::rdna2::encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"))).collect()
+    }
+
+    fn cs() -> Mode {
+        Mode::Compute(CsInterface { threads: [64, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 })
+    }
+
+    fn emit(code: &[u8], split: bool, structured: bool) -> Translation {
+        translate(code, &Options { mode: cs(), wave64: true, split_wave64: split, structured, ..Default::default() }).unwrap()
+    }
+
+    fn exchanges(code: &[u8]) -> Exchanges {
+        shape_hlsl_exchanges(&emit(code, true, true).hlsl, &[])
+    }
+
+    fn t1() -> Vec<u8> {
+        asm(&[BPERM1, BPERM2, RLANE5, ENDPGM])
+    }
+    fn t2() -> Vec<u8> {
+        asm(&[CMP, CNDMASK, ENDPGM])
+    }
+    fn t2_control() -> Vec<u8> {
+        asm(&[CMP, CNDMASK, MOV_S2_VCC, ENDPGM])
+    }
+    fn t3_pair() -> Vec<u8> {
+        asm(&[RLANE3, RLANE35, ENDPGM])
+    }
+    fn t3_coherent() -> Vec<u8> {
+        asm(&[COHERENT, ENDPGM])
+    }
+    fn t4_loop() -> Vec<u8> {
+        asm(&[MOV, SCC1_BACK_2, ENDPGM])
+    }
+    fn t4_scratch() -> Vec<u8> {
+        asm(&[MOV, SCRATCH_ST, SCRATCH_LD, SCC1_BACK_6, ENDPGM])
+    }
+    /// two nested loops, a forward `execz` branch inside the inner one:
+    /// 0 mov (outer header), 1 mov (inner header), 2 execz -> 4, 3 mov, 4 vccnz -> 1, 5 scc1 -> 0, 6 endpgm
+    fn t5() -> Vec<u8> {
+        asm(&[MOV, MOV, EXECZ_FWD_1, MOV, VCCNZ_BACK_4, SCC1_BACK_6, ENDPGM])
+    }
+    /// mov at pc 0 (header), bpermute at pc 4 (8 bytes), scc1 at pc 12 -> 0, endpgm at pc 16
+    fn t6() -> Vec<u8> {
+        asm(&[MOV, BPERM1, SCC1_BACK_4, ENDPGM])
+    }
+
+    #[test]
+    fn t1_bpermute_and_readlane_are_counted_and_native_has_none() {
+        let e = exchanges(&t1());
+        assert_eq!((e.bpermute, e.readlane, e.readlane_folded, e.ballot, e.entry, e.coherent_load, e.other), (2, 1, 0, 0, 1, 0, 0), "{e:?}");
+        assert_eq!((e.total, e.waves_per_group, e.threads_per_group), (4, 1, 64), "{e:?}");
+        // native wave64: no exchange at all
+        let native = emit(&t1(), false, true).hlsl;
+        assert!(!native.contains("xcl_x_"), "the native form has no exchange call");
+        assert_eq!(shape_hlsl_exchanges(&native, &[]).total, 0);
+        // the shape counts the split form on a device that did not split, with the same numbers
+        let p = ConsoleProgram { code: t1(), mode: cs(), wave64: true, group_threads: Some(64), gs_start: None };
+        let (ran_split, ran_native) = (shape_hlsl(&p, false, 1, true).unwrap(), shape_hlsl(&p, false, 1, false).unwrap());
+        assert_eq!(ran_split.exchanges, ran_native.exchanges);
+        assert_eq!(ran_native.exchanges.as_ref().map(|e| e.total), Some(4));
+        assert_eq!(ran_native.upper_lanes, None);
+        assert_eq!(shape_hlsl(&p, true, 1, true).unwrap().exchanges, None, "VS / PS: no exchanges");
+        let mut wave32 = p.clone();
+        wave32.wave64 = false;
+        assert_eq!(shape_hlsl(&wave32, false, 1, true).unwrap().exchanges, None, "wave32: no exchanges");
+    }
+
+    #[test]
+    fn t2_a_mask_read_lane_by_lane_needs_no_exchange() {
+        let e = exchanges(&t2());
+        assert_eq!((e.ballot, e.entry, e.total), (0, 1, 1), "{e:?}");
+        let e = exchanges(&t2_control());
+        assert_eq!((e.ballot, e.entry, e.total), (1, 1, 2), "{e:?}");
+    }
+
+    #[test]
+    fn t3_a_folded_pair_and_a_coherent_load() {
+        let e = exchanges(&t3_pair());
+        assert_eq!((e.readlane, e.readlane_folded, e.other), (1, 1, 0), "{e:?}");
+        let e = exchanges(&t3_coherent());
+        assert_eq!((e.coherent_load, e.other), (1, 0), "{e:?}");
+    }
+
+    #[test]
+    fn t4_register_arrays_and_form() {
+        let switch_pc = emit(&t4_loop(), true, false);
+        assert_eq!(shape_hlsl_form(&switch_pc.hlsl, switch_pc.blocks > 1), Form::SwitchPc);
+        let arrays = shape_hlsl_register_arrays(&switch_pc.hlsl);
+        assert_eq!((arrays.clone(), shape_private_bytes(&arrays)), (vec![], 0));
+        let scratch = emit(&t4_scratch(), true, false);
+        let arrays = shape_hlsl_register_arrays(&scratch.hlsl);
+        assert_eq!(arrays, vec![RegisterArray { name: "xcl_scratch".into(), dwords: 1024 }]);
+        assert_eq!(shape_private_bytes(&arrays), 4096);
+        let structured = emit(&t4_loop(), true, true);
+        assert_eq!(shape_hlsl_form(&structured.hlsl, structured.blocks > 1), Form::Structured);
+        let p = ConsoleProgram { code: t4_loop(), mode: cs(), wave64: true, group_threads: Some(64), gs_start: None };
+        let h = shape_hlsl(&p, false, 1, true).unwrap();
+        assert_eq!((h.form, h.unstructured, h.private_bytes_per_thread), (Form::Structured, false, 0));
+        let straight = emit(&asm(&[MOV, ENDPGM]), true, true);
+        assert_eq!(shape_hlsl_form(&straight.hlsl, straight.blocks > 1), Form::Straight);
+    }
+
+    #[test]
+    fn t5_program_shape() {
+        let code = t5();
+        let s = shape_program(&code, None).unwrap();
+        assert_eq!((s.divergent_branches, s.loops, s.max_loop_depth, s.movrel_sites), (2, 2, 2, 0), "{s:?}");
+        assert_eq!(s.instructions as usize, emit(&code, true, true).instructions);
+        assert_eq!(s.loop_ranges, vec![(0, 24), (4, 20)]);
+        let flat = shape_program(&asm(&[MOV, ENDPGM]), None).unwrap();
+        assert_eq!((flat.loops, flat.max_loop_depth, flat.blocks), (0, 0, 1));
+    }
+
+    #[test]
+    fn t6_sites_in_loops_and_every_meet_classifies() {
+        let code = t6();
+        let s = shape_program(&code, None).unwrap();
+        assert_eq!(s.loop_ranges, vec![(0, 16)]);
+        let e = shape_hlsl_exchanges(&emit(&code, true, true).hlsl, &s.loop_ranges);
+        assert_eq!((e.bpermute, e.in_loops, e.total), (1, 1, 2), "{e:?}");
+        // drift guard: a new meet form in the emitter would land in `other`
+        for (what, code) in [("t1", t1()), ("t2", t2()), ("t2c", t2_control()), ("t3p", t3_pair()), ("t3c", t3_coherent()), ("t4", t4_loop()), ("t4s", t4_scratch()), ("t5", t5()), ("t6", t6())] {
+            let e = exchanges(&code);
+            assert_eq!(e.other, 0, "{what}: an `xcl_x_meet()` in no known form: {e:?}");
+        }
+    }
+}
+
+// ---- fork telemetry (docs/guide/telemetry.md, part 4: shaders.json) ----
+use std::collections::HashSet;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, OnceLock};
+
+use crate::gpu::recomp::pso::{Compiled, Stage, TwoPass};
+use serde_json::{json, Map, Value};
+
+/// Jobs the shape queue holds, and the bytes of the blob and DXIL copies in them.
+const SHAPE_QUEUE_JOBS: usize = 1024;
+const SHAPE_QUEUE_BYTES: u64 = 64 << 20;
+/// Records `shaders.json` holds; more stay in `shaders.jsonl` only.
+const SHAPE_RECORDS_CAP: usize = 50_000;
+
+/// (fnv64 of the blob (geometry: of the GS xor the VS), stage, split argument, windows).
+type ShapeKey = (u64, u8, bool, u32);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Vs,
+    Ps,
+    Cs,
+    Ms,
+    Gs,
+}
+
+impl Kind {
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Vs => "vs",
+            Kind::Ps => "ps",
+            Kind::Cs => "cs",
+            Kind::Ms => "ms",
+            Kind::Gs => "gs",
+        }
+    }
+
+    fn graphics(self) -> bool {
+        matches!(self, Kind::Vs | Kind::Ps)
+    }
+
+    /// The pipeline slot of a container program (a geometry program has none: it goes through
+    /// `shape_geometry_program`).
+    fn stage(self) -> Stage {
+        match self {
+            Kind::Vs => Stage::Vertex,
+            Kind::Ps => Stage::Pixel,
+            Kind::Ms => Stage::Mesh,
+            Kind::Cs | Kind::Gs => Stage::Compute,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Backend {
+    Hlsl,
+    Direct,
+}
+
+impl Backend {
+    fn name(self) -> &'static str {
+        match self {
+            Backend::Hlsl => "hlsl",
+            Backend::Direct => "direct",
+        }
+    }
+}
+
+/// One program to analyse, with copies of what the worker needs from the caller.
+struct Job {
+    key: ShapeKey,
+    kind: Kind,
+    /// the container (geometry: the GS)
+    blob: Vec<u8>,
+    /// geometry: the VS container
+    vs: Option<Vec<u8>>,
+    split_arg: bool,
+    windows: u32,
+    /// the DXIL the call returned (the compute pass for mesh / geometry)
+    dxil: Vec<u8>,
+    chain_dwords: Option<u32>,
+    chain_pieces: Option<u32>,
+    compile_ms: f64,
+}
+
+impl Job {
+    #[allow(clippy::too_many_arguments)]
+    fn new(kind: Kind, blob: &[u8], vs: Option<&[u8]>, split_arg: bool, windows: u32, dxil: &[u8], chain: Option<&crate::gpu::dxil::kernel::DispatchChain>, compile_ms: f64) -> Job {
+        let hash = crate::gpu::shader::fnv64(blob);
+        let hash = match vs {
+            Some(v) => hash ^ crate::gpu::shader::fnv64(v).rotate_left(32),
+            None => hash,
+        };
+        Job {
+            key: (hash, kind as u8, split_arg, windows),
+            kind,
+            blob: blob.to_vec(),
+            vs: vs.map(|v| v.to_vec()),
+            split_arg,
+            windows,
+            dxil: dxil.to_vec(),
+            chain_dwords: chain.map(|c| c.dwords_per_group),
+            chain_pieces: chain.map(|c| c.pieces.len() as u32),
+            compile_ms,
+        }
+    }
+
+    /// Bytes of the copies, for the queue's budget.
+    fn bytes(&self) -> u64 {
+        (self.blob.len() + self.vs.as_ref().map_or(0, |v| v.len()) + self.dxil.len()) as u64
+    }
+
+    fn record_hex(&self) -> String {
+        format!("{:016x}", crate::gpu::shader::fnv64(&self.blob))
+    }
+
+    /// The identity `seen` and `shape` lines share (what `shaders_final` merges them by).
+    fn key_text(&self) -> String {
+        format!("{:016x}.{}.{}.{}", self.key.0, self.kind.name(), self.key.2 as u8, self.key.3)
+    }
+}
+
+#[derive(Default)]
+struct ShapeCounts {
+    seen: AtomicU64,
+    analysed: AtomicU64,
+    dropped: AtomicU64,
+    failed: AtomicU64,
+}
+
+/// What the worker shares with the sink.
+struct ShapeState {
+    lines: xlog::Events,
+    counts: ShapeCounts,
+    queued_bytes: AtomicU64,
+    /// jobs queued or being analysed
+    outstanding: AtomicU64,
+}
+
+/// One sink (the global one, or a test's own: part 1's globals are OnceLocks, tests must not open them).
+struct ShapeLog {
+    dir: PathBuf,
+    state: Arc<ShapeState>,
+    seen: Mutex<HashSet<ShapeKey>>,
+    queue: SyncSender<Job>,
+    /// bytes the queue may hold
+    budget: u64,
+    /// set by `write_shaders_json`: no new program is taken
+    closed: AtomicBool,
+}
+
+static SHAPE_LOG: OnceLock<Option<ShapeLog>> = OnceLock::new();
+
+/// The global sink; created on first use when telemetry has a run folder.
+fn shape_log() -> Option<&'static ShapeLog> {
+    let dir = xlog::run_dir()?;
+    SHAPE_LOG
+        .get_or_init(|| match ShapeLog::create(dir, SHAPE_QUEUE_BYTES, true) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                crate::xlog_warn!("telemetry: {e} - shader shapes off");
+                None
+            }
+        })
+        .as_ref()
+}
+
+impl ShapeLog {
+    /// `shaders.jsonl` in `dir`; `worker`: also start the analysing thread (tests without one
+    /// write lines themselves).
+    fn create(dir: &Path, budget: u64, worker: bool) -> Result<ShapeLog, String> {
+        let lines = xlog::Events::create(&dir.join("shaders.jsonl")).map_err(|e| format!("cannot open shaders.jsonl in {}: {e}", dir.display()))?;
+        let state = Arc::new(ShapeState { lines, counts: ShapeCounts::default(), queued_bytes: AtomicU64::new(0), outstanding: AtomicU64::new(0) });
+        let (queue, rx) = std::sync::mpsc::sync_channel::<Job>(SHAPE_QUEUE_JOBS);
+        if worker {
+            let st = state.clone();
+            // `translate` recurses (`MAX_NEST` 24): a big stack
+            std::thread::Builder::new().name("xcl-shader-shape".into()).stack_size(64 << 20).spawn(move || shape_worker(rx, st)).map_err(|e| format!("cannot start the shape worker: {e}"))?;
+        }
+        Ok(ShapeLog { dir: dir.to_path_buf(), state, seen: Mutex::new(HashSet::new()), queue, budget, closed: AtomicBool::new(false) })
+    }
+
+    /// The first sighting of a program: a `seen` line, and the job for the worker. Never waits:
+    /// a full queue (jobs or bytes) drops the job and says so in the line.
+    fn admit(&self, job: Job) {
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        match self.seen.lock() {
+            Ok(mut s) => {
+                if !s.insert(job.key) {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+        self.state.counts.seen.fetch_add(1, Ordering::Relaxed);
+        let mut fields = seen_fields(&job);
+        let bytes = job.bytes();
+        let before = self.state.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        let mut dropped = before.saturating_add(bytes) > self.budget;
+        if !dropped {
+            self.state.outstanding.fetch_add(1, Ordering::AcqRel);
+            if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) = self.queue.try_send(job) {
+                self.state.outstanding.fetch_sub(1, Ordering::AcqRel);
+                dropped = true;
+            }
+        }
+        if dropped {
+            self.state.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+            self.state.counts.dropped.fetch_add(1, Ordering::Relaxed);
+            fields.push(("shape", "dropped".into()));
+        }
+        self.state.lines.write("seen", &fields);
+    }
+
+    /// Waits until the worker has nothing queued or running, for at most `limit`.
+    fn wait_idle(&self, limit: Duration) -> bool {
+        let end = Instant::now() + limit;
+        while self.state.outstanding.load(Ordering::Acquire) > 0 {
+            if Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    /// `shaders.json` from `shaders.jsonl`: stops intake, waits up to 2 s for the queue, merges
+    /// `seen` and `shape` lines by key (a program without its shape is `pending_at_exit`), and
+    /// writes the file through a temporary one. Safe to call again.
+    fn write_shaders_json(&self, mut header: Map<String, Value>) -> std::io::Result<()> {
+        self.closed.store(true, Ordering::Release);
+        self.wait_idle(Duration::from_secs(2));
+        let text = std::fs::read_to_string(self.dir.join("shaders.jsonl"))?;
+        let m = merge_shape_lines(&text);
+        header.insert(
+            "counts".into(),
+            json!({
+                "records": m.records.len(),
+                "analysed": m.analysed,
+                "dropped": m.dropped,
+                "failed": m.failed,
+                "pending_at_exit": m.pending,
+                "kept_in_memory_cap_hit": m.over_cap,
+            }),
+        );
+        // compact, one record per line inside the array
+        let head = serde_json::to_string(&Value::Object(header)).map_err(std::io::Error::other)?;
+        let head = head.strip_suffix('}').unwrap_or(&head);
+        let records: Vec<String> = m.records.iter().filter_map(|r| serde_json::to_string(r).ok()).collect();
+        let doc = format!("{head},\"records\":[\n{}\n]}}\n", records.join(",\n"));
+        let tmp = self.dir.join("shaders.json.tmp");
+        std::fs::write(&tmp, doc).and_then(|_| std::fs::rename(&tmp, self.dir.join("shaders.json"))).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+    }
+}
+
+/// The fields of a program's `seen` line. `split` is the split argument of the call (the
+/// record's `split` needs the program's wave size).
+fn seen_fields(job: &Job) -> Vec<(&'static str, Value)> {
+    let mut f: Vec<(&'static str, Value)> = vec![("key", job.key_text().into()), ("record", job.record_hex().into())];
+    if let Some(vs) = &job.vs {
+        f.push(("vs", format!("{:016x}", crate::gpu::shader::fnv64(vs)).into()));
+    }
+    f.push(("stage", job.kind.name().into()));
+    f.push(("windows", job.windows.into()));
+    f.push(("split", job.split_arg.into()));
+    f.push(("wave64", Value::Null));
+    f.push(("dxil_bytes", (job.dxil.len() as u64).into()));
+    f.push(("compile_ms", job.compile_ms.into()));
+    f.push(("split_reason", split_reason().into()));
+    f
+}
+
+/// The worker: one job at a time at below-normal priority; a panic is a failed record.
+fn shape_worker(rx: Receiver<Job>, st: Arc<ShapeState>) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+    static DRAINED: AtomicU64 = AtomicU64::new(0);
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+    while let Ok(job) = rx.recv() {
+        let bytes = job.bytes();
+        let record = shape_job(job);
+        let failed = record["shape_status"].as_str().is_some_and(|s| s.starts_with("failed"));
+        if failed {
+            st.counts.failed.fetch_add(1, Ordering::Relaxed);
+        } else {
+            st.counts.analysed.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(o) = record.as_object() {
+            let fields: Vec<(&str, Value)> = o.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            st.lines.write("shape", &fields);
+        }
+        st.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        // the queue is empty: a reader can tell `pass` timings taken while the worker was busy
+        if st.outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
+            if let Some(n) = xlog::sampled(&DRAINED) {
+                let (analysed, failed) = (st.counts.analysed.load(Ordering::Relaxed), st.counts.failed.load(Ordering::Relaxed));
+                xlog::event(Tier::Pass, "shape_queue", &[("n", n.into()), ("analysed", analysed.into()), ("failed", failed.into())]);
+            }
+        }
+    }
+}
+
+fn first_line(e: &str) -> &str {
+    e.lines().next().unwrap_or("")
+}
+
+/// The same text as `pso::wave_mode_line`'s reason (that one is private).
+fn split_reason_text(range: Option<(u32, u32)>, forced: bool) -> String {
+    match (forced, range) {
+        (true, _) => "XCL_SPLIT_WAVE64=1".to_string(),
+        (false, None) => "wave range unknown".to_string(),
+        (false, Some((min, max))) => format!("device waves {min}-{max}"),
+    }
+}
+
+/// The device's wave lane range from the manifest, when the device has reported it.
+fn manifest_waves() -> Option<(u32, u32)> {
+    let g = lock_within(&MANIFEST, Duration::from_millis(20))?;
+    let m = g.as_ref()?;
+    m.wave_lane_count_min.zip(m.wave_lane_count_max)
+}
+
+/// Why wave64 compute / mesh / geometry programs run as they do on this device.
+fn split_reason() -> String {
+    split_reason_text(manifest_waves(), crate::gpu::recomp::pso::split_wave64_forced())
+}
+
+/// Which translator made the DXIL: `!llvm.ident` is "xcl" in the direct translator's modules
+/// (DXC writes its own). Any metadata string "xcl" of the module's metadata block counts. None:
+/// the bitcode could not be read.
+fn dxil_backend(container: &[u8]) -> Option<Backend> {
+    use crate::gpu::dxil::bitreader::{BitReader, Entry as BitEntry};
+    let bitcode = crate::gpu::dxil::stats::dxil_bitcode(container).ok()?;
+    let mut r = BitReader::new(bitcode).ok()?;
+    let mut ctx: Vec<u32> = Vec::new();
+    let (mut strings, mut xcl) = (0u32, false);
+    while let Some(e) = r.next_entry().ok()? {
+        match e {
+            // module block 8, its metadata block 15
+            BitEntry::Enter(id) => {
+                if matches!((ctx.as_slice(), id), ([], 8) | ([8], 15)) {
+                    ctx.push(id);
+                } else {
+                    r.skip_block().ok()?;
+                }
+            }
+            BitEntry::End(_) => {
+                ctx.pop();
+            }
+            // METADATA_STRING: the characters
+            BitEntry::Record(1) if ctx.as_slice() == [8, 15] => {
+                strings += 1;
+                xcl |= r.ops().len() == 3 && r.ops().iter().zip(b"xcl").all(|(&a, &b)| a == b as u64);
+            }
+            BitEntry::Record(_) => {}
+        }
+    }
+    if xcl {
+        Some(Backend::Direct)
+    } else if strings > 0 {
+        Some(Backend::Hlsl)
+    } else {
+        None
+    }
+}
+
+/// Whether the stage is routed to the direct translator by `XCL_DIRECT_DXIL` (it may still fall back).
+fn shape_routed_direct(kind: Kind) -> bool {
+    if kind.graphics() {
+        crate::gpu::dxil::kernel::enabled_graphics()
+    } else {
+        crate::gpu::dxil::kernel::enabled()
+    }
+}
+
+/// HLSL when the stage is not routed to direct and the rebuilt HLSL is not over what DXC
+/// compiles optimised (a compute program that big takes the direct translator); otherwise
+/// what the DXIL says (`ident`).
+fn pick_backend(kind: Kind, hlsl_bytes: Option<u64>, ident: Option<Backend>) -> Option<Backend> {
+    let enormous = kind == Kind::Cs && hlsl_bytes.is_some_and(|n| n > crate::gpu::recomp::dxc::UNOPTIMISED_ABOVE as u64);
+    if !shape_routed_direct(kind) && !enormous && hlsl_bytes.is_some() {
+        Some(Backend::Hlsl)
+    } else {
+        ident
+    }
+}
+
+/// A record with everything the call site knows and every analysed field null.
+fn shape_skeleton(job: &Job) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("record".into(), json!(job.record_hex()));
+    if let Some(vs) = &job.vs {
+        m.insert("vs".into(), json!(format!("{:016x}", crate::gpu::shader::fnv64(vs))));
+    }
+    m.insert("stage".into(), json!(job.kind.name()));
+    m.insert("windows".into(), json!(job.windows));
+    for k in [
+        "wave64",
+        "split",
+        "upper_lanes",
+        "backend",
+        "form",
+        "unstructured",
+        "register_arrays",
+        "instructions",
+        "blocks",
+        "loops",
+        "max_loop_depth",
+        "divergent_branches",
+        "movrel_sites",
+        "exchanges",
+        "dxil",
+    ] {
+        m.insert(k.into(), Value::Null);
+    }
+    m.insert("split_reason".into(), json!(split_reason()));
+    let chain = job.chain_dwords.map_or(0u64, |d| d as u64 * 4);
+    m.insert("scratch_hint".into(), json!({ "private_bytes_per_thread": null, "chain_bytes_per_group": chain, "group_threads": null, "bytes_per_group": null }));
+    m.insert("dxil_bytes".into(), json!(job.dxil.len() as u64));
+    m.insert("dispatch_chain_pieces".into(), json!(job.chain_pieces));
+    m.insert("compile_ms".into(), json!(job.compile_ms));
+    m.insert("shape_status".into(), json!("ok"));
+    m.insert("key".into(), json!(job.key_text()));
+    m
+}
+
+/// The record of a program (the worker's body): the backend that made its DXIL, the console
+/// shape, the HLSL shape, the DXIL's own statistics. A panic is a `failed: panic` record.
+fn shape_job(job: Job) -> Value {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shape_analyse(&job))) {
+        Ok(m) => Value::Object(m),
+        Err(_) => {
+            let mut m = shape_skeleton(&job);
+            m.insert("shape_status".into(), json!("failed: panic"));
+            Value::Object(m)
+        }
+    }
+}
+
+fn shape_analyse(job: &Job) -> Map<String, Value> {
+    let mut m = shape_skeleton(job);
+    let prog = match (job.kind, &job.vs) {
+        (Kind::Gs, Some(vs)) => shape_geometry_program(vs, &job.blob),
+        (Kind::Gs, None) => Err("a geometry program without its VS".to_string()),
+        (kind, _) => shape_console_program(&job.blob, kind.stage()),
+    };
+    let ident = dxil_backend(&job.dxil);
+    let stats = crate::gpu::dxil::stats::container_stats(&job.dxil).ok();
+    if let Some(s) = &stats {
+        m.insert(
+            "dxil".into(),
+            json!({
+                "bitcode_bytes": s.bitcode_bytes,
+                "blocks": s.blocks,
+                "instructions": s.instructions,
+                "phis": s.phis,
+                "backward_branches": s.backward_branches,
+                "allocas": s.allocas,
+                "switches": s.switches,
+            }),
+        );
+    }
+    let prog = match prog {
+        Ok(p) => p,
+        Err(e) => {
+            m.insert("backend".into(), json!(pick_backend(job.kind, None, ident).map(Backend::name)));
+            m.insert("shape_status".into(), json!(format!("failed: {}", first_line(&e))));
+            return m;
+        }
+    };
+    let split = !job.kind.graphics() && prog.wave64 && job.split_arg;
+    m.insert("wave64".into(), json!(prog.wave64));
+    m.insert("split".into(), json!(split));
+    let mut notes: Vec<String> = Vec::new();
+    match shape_program(&prog.code, prog.gs_start) {
+        Ok(p) => {
+            m.insert("instructions".into(), json!(p.instructions));
+            m.insert("blocks".into(), json!(p.blocks));
+            m.insert("loops".into(), json!(p.loops));
+            m.insert("max_loop_depth".into(), json!(p.max_loop_depth));
+            m.insert("divergent_branches".into(), json!(p.divergent_branches));
+            m.insert("movrel_sites".into(), json!(p.movrel_sites));
+        }
+        Err(e) => notes.push(format!("cfg: {}", first_line(&e))),
+    }
+    // the rebuilt HLSL describes a program that ran only on the HLSL backend: a program the
+    // direct translator made is not rebuilt
+    let hs = if shape_routed_direct(job.kind) && ident == Some(Backend::Direct) { None } else { Some(shape_hlsl(&prog, job.kind.graphics(), job.windows, job.split_arg)) };
+    let hlsl_bytes = match &hs {
+        Some(Ok(h)) => Some(h.hlsl_bytes),
+        _ => None,
+    };
+    let backend = pick_backend(job.kind, hlsl_bytes, ident);
+    m.insert("backend".into(), json!(backend.map(Backend::name)));
+    let mut private: Option<u64> = None;
+    match (backend, hs) {
+        (Some(Backend::Hlsl), Some(Ok(h))) => {
+            m.insert("form".into(), json!(h.form));
+            m.insert("unstructured".into(), json!(h.unstructured));
+            m.insert("register_arrays".into(), json!(h.register_arrays));
+            m.insert("upper_lanes".into(), json!(h.upper_lanes));
+            private = Some(h.private_bytes_per_thread);
+            if let Some(x) = &h.exchanges {
+                let mut v = serde_json::to_value(x).unwrap_or(Value::Null);
+                if let Value::Object(o) = &mut v {
+                    o.insert("paid".into(), json!(split));
+                }
+                m.insert("exchanges".into(), v);
+            }
+        }
+        (Some(Backend::Hlsl), Some(Err(e))) => notes.push(format!("hlsl: {}", first_line(&e))),
+        (Some(Backend::Hlsl), None) => {}
+        (Some(Backend::Direct), _) => {
+            m.insert("form".into(), json!(Form::Direct));
+            // the allocas are not sized in the statistics: only "none" is known
+            if stats.as_ref().is_some_and(|s| s.allocas == 0) {
+                m.insert("register_arrays".into(), json!(Vec::<RegisterArray>::new()));
+                private = Some(0);
+            }
+        }
+        (None, _) => notes.push("backend unreadable".into()),
+    }
+    let chain = job.chain_dwords.map_or(0u64, |d| d as u64 * 4);
+    let group = prog.group_threads;
+    let total = match (private, group) {
+        (Some(p), Some(g)) => Some(p * g as u64 + chain),
+        _ => None,
+    };
+    m.insert("scratch_hint".into(), json!({ "private_bytes_per_thread": private, "chain_bytes_per_group": chain, "group_threads": group, "bytes_per_group": total }));
+    if !notes.is_empty() {
+        m.insert("shape_status".into(), json!(format!("partial: {}", notes.join("; "))));
+    }
+    m
+}
+
+/// `shaders.jsonl` read back: the records, merged by key.
+struct MergedShapes {
+    records: Vec<Value>,
+    analysed: u64,
+    dropped: u64,
+    failed: u64,
+    pending: u64,
+    /// records left out of `records` by `SHAPE_RECORDS_CAP`
+    over_cap: u64,
+}
+
+/// A record from a `seen` line alone (the program was queued, dropped, or the run ended first).
+fn pending_record(seen: &Map<String, Value>) -> Map<String, Value> {
+    let mut m = Map::new();
+    for k in ["record", "vs", "stage", "windows", "split_reason", "dxil_bytes", "compile_ms"] {
+        if let Some(v) = seen.get(k) {
+            m.insert(k.into(), v.clone());
+        }
+    }
+    for k in [
+        "wave64",
+        "split",
+        "upper_lanes",
+        "backend",
+        "form",
+        "unstructured",
+        "register_arrays",
+        "instructions",
+        "blocks",
+        "loops",
+        "max_loop_depth",
+        "divergent_branches",
+        "movrel_sites",
+        "exchanges",
+        "dxil",
+        "dispatch_chain_pieces",
+    ] {
+        m.insert(k.into(), Value::Null);
+    }
+    m.insert("scratch_hint".into(), json!({ "private_bytes_per_thread": null, "chain_bytes_per_group": null, "group_threads": null, "bytes_per_group": null }));
+    let dropped = seen.get("shape").and_then(Value::as_str) == Some("dropped");
+    m.insert("shape_status".into(), json!(if dropped { "dropped" } else { "pending_at_exit" }));
+    m
+}
+
+/// Merges the `seen` and `shape` lines of `shaders.jsonl` by their `key`, in the order the
+/// programs were first seen. Lines that are not JSON (a torn last line) are skipped.
+fn merge_shape_lines(text: &str) -> MergedShapes {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_key: BTreeMap<String, (Option<Map<String, Value>>, Option<Map<String, Value>>)> = BTreeMap::new();
+    for line in text.lines() {
+        let Ok(Value::Object(o)) = serde_json::from_str::<Value>(line) else { continue };
+        let Some(key) = o.get("key").and_then(Value::as_str).map(str::to_string) else { continue };
+        let ev = o.get("ev").and_then(Value::as_str).unwrap_or("").to_string();
+        if !by_key.contains_key(&key) {
+            order.push(key.clone());
+        }
+        let slot = by_key.entry(key).or_default();
+        match ev.as_str() {
+            "seen" => slot.0 = Some(o),
+            "shape" => slot.1 = Some(o),
+            _ => {}
+        }
+    }
+    let mut out = MergedShapes { records: Vec::new(), analysed: 0, dropped: 0, failed: 0, pending: 0, over_cap: 0 };
+    for key in order {
+        let Some((seen, shape)) = by_key.remove(&key) else { continue };
+        let rec = match (shape, seen) {
+            (Some(mut s), _) => {
+                for k in ["ev", "t", "key"] {
+                    s.remove(k);
+                }
+                s
+            }
+            (None, Some(s)) => pending_record(&s),
+            (None, None) => continue,
+        };
+        match rec.get("shape_status").and_then(Value::as_str).unwrap_or("") {
+            "dropped" => out.dropped += 1,
+            "pending_at_exit" => out.pending += 1,
+            s if s.starts_with("failed") => out.failed += 1,
+            _ => out.analysed += 1,
+        }
+        if out.records.len() < SHAPE_RECORDS_CAP {
+            out.records.push(Value::Object(rec));
+        } else {
+            out.over_cap += 1;
+        }
+    }
+    out
+}
+
+/// The top level of `shaders.json` without `counts` and `records`.
+fn shaders_header(run_id: &str, range: Option<(u32, u32)>) -> Map<String, Value> {
+    use crate::gpu::recomp::pso;
+    let forced = pso::split_wave64_forced();
+    let compute_split = if forced { Some(true) } else { range.map(|(min, max)| pso::wave32_only(min, max)) };
+    let graphics_eligible = if forced { Some(true) } else { range.map(|(min, max)| pso::graphics_wave32(min, max)) };
+    match json!({
+        "schema": 1,
+        "run_id": run_id,
+        "translator_source_id": env!("XCL_TRANSLATOR_SOURCE_ID"),
+        "wave_lane_count_min": range.map(|r| r.0),
+        "wave_lane_count_max": range.map(|r| r.1),
+        "split_wave64_forced": forced,
+        "compute_split": compute_split,
+        "graphics_upper_lanes_eligible": graphics_eligible,
+        "split_reason": split_reason_text(range, forced),
+        "direct_dxil": std::env::var("XCL_DIRECT_DXIL").ok(),
+    }) {
+        Value::Object(m) => m,
+        _ => Map::new(),
+    }
+}
+
+/// From `telemetry_final`: `shaders.json` of the run (nothing when no program was seen).
+fn shaders_final() {
+    let Some(log) = SHAPE_LOG.get().and_then(|l| l.as_ref()) else { return };
+    let (run_id, range) = match lock_within(&MANIFEST, Duration::from_millis(200)) {
+        Some(g) => match g.as_ref() {
+            Some(m) => (m.run_id.clone(), m.wave_lane_count_min.zip(m.wave_lane_count_max)),
+            None => (String::new(), None),
+        },
+        None => (String::new(), None),
+    };
+    if let Err(e) = log.write_shaders_json(shaders_header(&run_id, range)) {
+        crate::xlog_warn!("telemetry: shaders.json not written in {}: {e}", log.dir.display());
+    }
+}
+
+/// A VS / PS / CS the call returned: the first time its key comes, it is queued for analysis.
+/// `start` is None unless the tier is `pass`; refusals (`r` an error) are not records.
+pub fn telemetry_shader(blob: &[u8], stage: Stage, split_wave64: bool, windows: u32, start: Option<Instant>, r: Result<Compiled, String>) -> Result<Compiled, String> {
+    let Some(start) = start else { return r };
+    let Ok(c) = &r else { return r };
+    let kind = match stage {
+        Stage::Vertex => Kind::Vs,
+        Stage::Pixel => Kind::Ps,
+        Stage::Compute => Kind::Cs,
+        Stage::Mesh => Kind::Ms,
+    };
+    if let Some(log) = shape_log() {
+        log.admit(Job::new(kind, blob, None, split_wave64, windows, &c.dxil, c.dispatch_chain.as_deref(), start.elapsed().as_secs_f64() * 1000.0));
+    }
+    r
+}
+
+/// A mesh program (its compute pass is the record's DXIL).
+pub fn telemetry_mesh(blob: &[u8], split_wave64: bool, windows: u32, start: Option<Instant>, r: Result<TwoPass, String>) -> Result<TwoPass, String> {
+    let Some(start) = start else { return r };
+    let Ok(t) = &r else { return r };
+    if let Some(log) = shape_log() {
+        log.admit(Job::new(Kind::Ms, blob, None, split_wave64, windows, &t.cs, None, start.elapsed().as_secs_f64() * 1000.0));
+    }
+    r
+}
+
+/// A geometry (ES + GS) program (its compute pass is the record's DXIL).
+pub fn telemetry_geometry(vs: &[u8], gs: &[u8], split_wave64: bool, start: Option<Instant>, r: Result<TwoPass, String>) -> Result<TwoPass, String> {
+    let Some(start) = start else { return r };
+    let Ok(t) = &r else { return r };
+    if let Some(log) = shape_log() {
+        log.admit(Job::new(Kind::Gs, gs, Some(vs), split_wave64, crate::gpu::recomp::pso::mem_windows(), &t.cs, None, start.elapsed().as_secs_f64() * 1000.0));
+    }
+    r
+}
+
+#[cfg(test)]
+mod shape_glue_tests {
+    use super::*;
+    use crate::gpu::rdna2::encode;
+
+    fn shape_tmp(name: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!("xcl-report-shapes-{name}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// T1's program: two `ds_bpermute_b32`, a `v_readlane_b32`, `s_endpgm`.
+    fn t1_code() -> Vec<u8> {
+        let one = |n: &str, e: &str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap();
+        let mut code = one("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 3), ("ADDR", 1), ("DATA0", 2)]);
+        code.extend(one("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 4), ("ADDR", 1), ("DATA0", 2)]));
+        code.extend(one("V_READLANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", 256 + 1), ("SRC1", 128 + 5)]));
+        code.extend(one("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)]));
+        code
+    }
+
+    /// An FSPX driver container (an `ACCC` part) holding `code`, 64 x 1 x 1 threads
+    /// (`recomp::tests::fspx_compute_user_sgprs_from_rsrc2`).
+    fn fspx_container(code: &[u8]) -> Vec<u8> {
+        let total = 0x70 + code.len();
+        let mut part = Vec::from(*b"FSPX");
+        for word in [1u32, 2, total as u32, 0, 0x30, 0x1c, 0, 6, 0x4c, (0x24 + code.len()) as u32, 0] {
+            part.extend_from_slice(&word.to_le_bytes());
+        }
+        part.resize(total, 0);
+        part[0x3c..0x42].copy_from_slice(&[64, 0, 1, 0, 1, 0]);
+        part[0x70..].copy_from_slice(code);
+        crate::gpu::xbox::tests::container(&[(b"ACCC", &part)])
+    }
+
+    /// DXIL of the direct translator, made on the CPU.
+    fn direct_dxil() -> Vec<u8> {
+        let mut code = encode("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 256)], None).unwrap();
+        code.extend(encode("S_ENDPGM", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
+        crate::gpu::dxil::kernel::translate(&code, crate::gpu::dxil::kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 }).expect("direct translate")
+    }
+
+    fn cs_job(blob: &[u8], windows: u32, dxil: &[u8], compile_ms: f64) -> Job {
+        Job::new(Kind::Cs, blob, None, true, windows, dxil, None, compile_ms)
+    }
+
+    fn json_lines(dir: &Path) -> Vec<Value> {
+        std::fs::read_to_string(dir.join("shaders.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    #[test]
+    fn g1_a_record_does_not_depend_on_who_translated_the_program() {
+        let blob = fspx_container(&t1_code());
+        let dxil = direct_dxil();
+        // a fresh process state: nothing translated this blob yet
+        let first = shape_job(cs_job(&blob, 1, &dxil, 1.0));
+        // the translator ran on it (a cache miss), then the same job again (a hit)
+        assert!(crate::gpu::recomp::pso::console_translation(&blob, Stage::Compute, 0, 1, true).is_ok());
+        let second = shape_job(cs_job(&blob, 1, &dxil, 2.0));
+        let (mut a, mut b) = (first, second);
+        for v in [&mut a, &mut b] {
+            v.as_object_mut().unwrap().remove("compile_ms");
+        }
+        assert_eq!(a, b);
+        assert_eq!(a["record"], format!("{:016x}", crate::gpu::shader::fnv64(&blob)));
+        assert_eq!((a["stage"].as_str(), a["wave64"].as_bool(), a["split"].as_bool(), a["windows"].as_u64()), (Some("cs"), Some(true), Some(true), Some(1)));
+        assert_eq!(a["dxil_bytes"].as_u64(), Some(dxil.len() as u64));
+        assert_eq!(a["scratch_hint"]["group_threads"], 64);
+        // `XCL_DIRECT_DXIL` in the environment of the test run routes the stage to the direct backend
+        if a["backend"] == "hlsl" {
+            assert_eq!(a["shape_status"], "ok", "{a}");
+            assert_eq!((a["exchanges"]["total"].as_u64(), a["exchanges"]["paid"].as_bool()), (Some(4), Some(true)), "{a}");
+            assert_eq!(a["register_arrays"], json!([]));
+        }
+    }
+
+    #[test]
+    fn g2_one_program_is_one_record_per_key() {
+        let dir = shape_tmp("dedupe");
+        let log = ShapeLog::create(&dir, SHAPE_QUEUE_BYTES, true).unwrap();
+        let blob = fspx_container(&t1_code());
+        log.admit(cs_job(&blob, 1, &[], 1.0));
+        log.admit(cs_job(&blob, 1, &[], 2.0));
+        assert!(log.wait_idle(Duration::from_secs(120)));
+        let count = |lines: &[Value], ev: &str| lines.iter().filter(|l| l["ev"] == ev).count();
+        let lines = json_lines(&dir);
+        assert_eq!((count(&lines, "seen"), count(&lines, "shape")), (1, 1), "{lines:?}");
+        log.admit(cs_job(&blob, 2, &[], 3.0));
+        assert!(log.wait_idle(Duration::from_secs(120)));
+        let lines = json_lines(&dir);
+        assert_eq!((count(&lines, "seen"), count(&lines, "shape")), (2, 2), "{lines:?}");
+        let merged = merge_shape_lines(&std::fs::read_to_string(dir.join("shaders.jsonl")).unwrap());
+        let mut windows: Vec<u64> = merged.records.iter().filter_map(|r| r["windows"].as_u64()).collect();
+        windows.sort_unstable();
+        assert_eq!(windows, [1, 2]);
+        drop(log);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn g3_off_returns_the_result_untouched_and_opens_nothing() {
+        let compiled = || Ok(Compiled { dispatch_chain: None, dxil: vec![1, 2, 3], samplers: vec![] });
+        let r = telemetry_shader(&[9, 9], Stage::Compute, false, 1, None, compiled());
+        assert_eq!(r.unwrap().dxil, [1, 2, 3]);
+        let e = telemetry_shader(&[9, 9], Stage::Compute, false, 1, Some(Instant::now()), Err("refused".into()));
+        assert_eq!(e.err().as_deref(), Some("refused"));
+        let two = TwoPass { cs: vec![7], ms: vec![8], record: Default::default(), mesh_groups_per_record: 1, samplers: vec![] };
+        assert_eq!(telemetry_mesh(&[1], false, 1, None, Ok(two)).unwrap().cs, [7]);
+        assert_eq!(telemetry_geometry(&[1], &[2], false, None, Err("x".into())).err().as_deref(), Some("x"));
+        // telemetry is not open in a unit test: even with a start time no sink is made
+        assert!(telemetry_shader(&[9, 9], Stage::Compute, false, 1, Some(Instant::now()), compiled()).is_ok());
+        assert!(SHAPE_LOG.get().is_none());
+    }
+
+    #[test]
+    fn g4_a_full_queue_drops_the_job_and_says_so() {
+        let dir = shape_tmp("bounds");
+        let log = ShapeLog::create(&dir, 1, true).unwrap();
+        let blob = fspx_container(&t1_code());
+        log.admit(cs_job(&blob, 1, &[], 1.0));
+        let lines = json_lines(&dir);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!((lines[0]["ev"].as_str(), lines[0]["shape"].as_str()), (Some("seen"), Some("dropped")));
+        assert_eq!(log.state.counts.dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(log.state.outstanding.load(Ordering::Relaxed), 0);
+        let m = merge_shape_lines(&std::fs::read_to_string(dir.join("shaders.jsonl")).unwrap());
+        assert_eq!((m.dropped, m.records[0]["shape_status"].as_str()), (1, Some("dropped")));
+        drop(log);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn g5_the_final_file_merges_seen_and_shape_lines() {
+        let dir = shape_tmp("final");
+        let log = ShapeLog::create(&dir, SHAPE_QUEUE_BYTES, false).unwrap();
+        log.state.lines.write("seen", &[("key", "aa".into()), ("record", "00000000000000aa".into()), ("stage", "cs".into()), ("windows", 1.into()), ("split", true.into()), ("wave64", Value::Null)]);
+        log.state.lines.write("seen", &[("key", "bb".into()), ("record", "00000000000000bb".into()), ("stage", "ps".into()), ("windows", 1.into()), ("split", false.into()), ("wave64", Value::Null)]);
+        log.state.lines.write("shape", &[("key", "bb".into()), ("record", "00000000000000bb".into()), ("stage", "ps".into()), ("windows", 1.into()), ("wave64", true.into()), ("shape_status", "ok".into())]);
+        // a torn last line is skipped
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(dir.join("shaders.jsonl")).unwrap();
+            f.write_all(b"{\"ev\":\"seen\",\"key\":\"cc\"").unwrap();
+        }
+        log.write_shaders_json(shaders_header("run-x", Some((32, 64)))).unwrap();
+        // again: the same file
+        log.write_shaders_json(shaders_header("run-x", Some((32, 64)))).unwrap();
+        let text = std::fs::read_to_string(dir.join("shaders.json")).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!((v["schema"].as_u64(), v["run_id"].as_str(), v["split_reason"].as_str()), (Some(1), Some("run-x"), Some(if crate::gpu::recomp::pso::split_wave64_forced() { "XCL_SPLIT_WAVE64=1" } else { "device waves 32-64" })));
+        assert_eq!((v["wave_lane_count_min"].as_u64(), v["wave_lane_count_max"].as_u64()), (Some(32), Some(64)));
+        let records = v["records"].as_array().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!((records[0]["record"].as_str(), records[0]["shape_status"].as_str()), (Some("00000000000000aa"), Some("pending_at_exit")));
+        assert_eq!((records[1]["record"].as_str(), records[1]["shape_status"].as_str()), (Some("00000000000000bb"), Some("ok")));
+        assert!(records.iter().all(|r| r.get("key").is_none() && r.get("ev").is_none() && r.get("t").is_none()));
+        assert_eq!((v["counts"]["records"].as_u64(), v["counts"]["pending_at_exit"].as_u64(), v["counts"]["analysed"].as_u64()), (Some(2), Some(1), Some(1)));
+        assert!(!dir.join("shaders.json.tmp").exists());
+        drop(log);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn g6_the_backend_is_read_from_the_dxil() {
+        assert_eq!(dxil_backend(&direct_dxil()), Some(Backend::Direct));
+        assert_eq!(dxil_backend(&[1, 2, 3]), None);
+        if crate::gpu::recomp::dxc::create_instance().is_none() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let dxc = crate::gpu::recomp::dxc::compile("[numthreads(1, 1, 1)] void main() {}", "main", "cs_6_6", &[]).expect("DXC compile");
+        assert_eq!(dxil_backend(&dxc), Some(Backend::Hlsl));
+    }
+
+    #[test]
+    fn the_backend_follows_the_routing_and_the_size_of_the_hlsl() {
+        let (d, h) = (Some(Backend::Direct), Some(Backend::Hlsl));
+        if !crate::gpu::dxil::kernel::enabled() && !crate::gpu::dxil::kernel::enabled_graphics() {
+            assert_eq!(pick_backend(Kind::Cs, Some(10), d), h);
+            assert_eq!(pick_backend(Kind::Cs, Some(crate::gpu::recomp::dxc::UNOPTIMISED_ABOVE as u64 + 1), d), d);
+            assert_eq!(pick_backend(Kind::Ps, Some(crate::gpu::recomp::dxc::UNOPTIMISED_ABOVE as u64 + 1), None), h);
+            assert_eq!(pick_backend(Kind::Cs, None, d), d);
+            assert_eq!(pick_backend(Kind::Cs, None, None), None);
+        }
     }
 }

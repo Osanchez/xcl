@@ -155,7 +155,7 @@ fn shader_cache() -> &'static Mutex<ShaderCache> {
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
-        return compile_one().map(|(c, _)| c);
+        return crate::report::telemetry_shader(blob, stage, split_wave64, windows, crate::log::telemetry_on(crate::log::Tier::Pass).then(std::time::Instant::now), compile_one().map(|(c, _)| c));
     }
     let key = ShaderKey {
         hash: crate::gpu::shader::fnv64(blob),
@@ -168,7 +168,7 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
     // direct translator version, routing mode): never mixed with the HLSL path's entries
     let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
-    cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
+    crate::report::telemetry_shader(blob, stage, split_wave64, windows, crate::log::telemetry_on(crate::log::Tier::Pass).then(std::time::Instant::now), cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone()))
 }
 
 /// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run
@@ -1167,9 +1167,9 @@ fn console_mesh_with(
 pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
     let windows = mem_windows();
     let dir = dxc::cache_dir();
-    console_mesh_with(blob, ps, split_wave64, windows, &dir, shader_cache(), |code, ms, wave64| {
+    crate::report::telemetry_mesh(blob, split_wave64, windows, crate::log::telemetry_on(crate::log::Tier::Pass).then(std::time::Instant::now), console_mesh_with(blob, ps, split_wave64, windows, &dir, shader_cache(), |code, ms, wave64| {
         compile_console_mesh(blob, code, ms, wave64, windows, split_wave64)
-    })
+    }))
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,
@@ -1247,6 +1247,7 @@ fn wave_mode_line(range: Option<(u32, u32)>, forced: bool) -> String {
 
 /// A legacy GS pipeline: the ES variant of a console VS + the GS as one program.
 pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
+    let shape_start = crate::log::telemetry_on(crate::log::Tier::Pass).then(std::time::Instant::now);
     let (code, g) = super::geometry_program(vs, gs)?;
     let record = g.record();
     // `XCL_DIRECT_DXIL=1`: the compute pass through the direct DXIL translator (HLSL fallback)
@@ -1258,13 +1259,13 @@ pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: b
                 let ps_inputs = ps.map(|p| crate::gpu::dxbc::signatures(p).0);
                 let msb = dxc::compile_cached(&super::emit::mesh_passthrough_for(&record, ps_inputs.as_deref()), "main", "ms_6_6")?.0;
                 let mesh_groups_per_record = super::emit::passthrough_split(&record, super::emit::passthrough_elements(&record, ps_inputs.as_deref()));
-                return Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers });
+                return crate::report::telemetry_geometry(vs, gs, split_wave64, shape_start, Ok(TwoPass { cs: k.dxil, ms: msb, record, mesh_groups_per_record, samplers: k.static_samplers }));
             }
             Err(e) => direct_fallback("GS", &e),
         }
     }
     let translation = super::translate_geometry(&code, g, split_wave64, mem_windows())?;
-    finish_two_pass(translation, record, ps)
+    crate::report::telemetry_geometry(vs, gs, split_wave64, shape_start, finish_two_pass(translation, record, ps))
 }
 
 /// The geometry shader (gs_6_6 DXIL) that draws a console rect list's rectangles behind the
