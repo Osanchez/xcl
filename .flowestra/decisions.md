@@ -5540,3 +5540,2402 @@ The scene start is the first graphics `pipeline` event with `wanted: true` after
 
 The run counts as partial if the title crashes for an unrelated reason. The numbers then count up
 to the crash.
+
+## 2026-11-26 Shader delivery spec v1, design 1: skip counters, must-draw waits, size classes and build timeouts (the user asked for their spec to be incorporated; orchestrator approved the design; deviations reported to the user)
+
+The requirements are the user's document "Spec - Shader Delivery & Pipeline Compilation
+Optimization (Xbox-to-PC Compat Layer) v1" (2026-11-26; kept outside the repository). The user
+said "lets incorporate this spec" on 2026-11-26. This entry is the design for its sections 7.2,
+7.4, 7.6, 7.7, 8, 9.3 (items 1, 2, 6), 11, 12.2-12.5 and 13 (AC1-AC8, AC10), drafted by an Opus
+design worker on dev at 20941768 and reviewed by the orchestrator. Units are Q1-Q10. It replaces
+unit U8 of the first stall-fix entry, which was never built. Section 11 lists every departure
+from the user's spec.
+
+Status: draft for the orchestrator's review. Nothing here is built or run. Code paths are
+`crates/xcl/src/...` on `dev` at 20941768. While this was written, pool U1 landed on `dev` as
+6c0f9b15 (`pso_async.rs` only). `pso_async.rs` line numbers below are at 20941768; the U1 names
+this design builds on (`push(lane, item)`, `take`, `worker_loop(reserved)`, `park`,
+`QueueGauges`, `queue_gauges`) were checked in 6c0f9b15 (`pso_async.rs:313-520`). Other files are
+the same in both commits. The user's spec is
+`Spec - Shader Delivery & Pipeline Compilation Optimization (Xbox-to-PC Compat Layer) v1.md`
+("the spec"); `§n` means its section n. Run data: `/Users/osanchez/xcl-pc/out/runs/runN/`.
+Helper script: `scratchpad/spec-design-tools/classes.py` (compile time per stage and size class
+from a run's `pipeline` events; `python3 -I classes.py <events.jsonl>`). Upstream PRs were read
+as text with `gh pr view -R xcl-dev/xcl` on 2026-11-26.
+
+This design sits on top of the approved pool refinement ("pipeline worker pool with lanes and a
+graphics reserve", units U1-U4 there, called **pool U1-U4** here). It assumes pool U1 (lanes,
+reserve, `queue_gauges`) and pool U2 (image-only last, `gate_gauges`) are merged, and pool U3
+(queue gauges, `pipeline_ready`) is merged before unit Q9. Units here are **Q1-Q10**.
+
+### Summary (recommendation first)
+
+**Recommendation.** Build ten small units, all our own code. Adopt no upstream PR: #2625 (skip
+causes) and #1795 (ExecuteIndirect clamp) are read and not taken (section 5).
+
+1. **Counters (decision A).** Every left-out or empty draw and dispatch is counted once, by call
+   kind and reason, as a per-frame delta on `frame` and a 2 s delta on `activity` (tier `frame`).
+   The reason comes from one read-only function, `pso_async::skipped`, called from one-line call
+   sites at the 15 skip sites of `bind.rs` and `console_list.rs`. Totals (`draw_total`,
+   `ei_draw_total`, `dispatch_total`, `ei_dispatch_total`) make the spec's ratios exact. Each
+   build gets one per-key record (extends pool U3's `pipeline_ready`), and pipelines never built
+   get a `pipeline_unbuilt` line at the run's end. A fork script, `scripts/dev/pso-summary.py`,
+   writes the per-run summary (`summary.json` plus a table) from the run folder and checks
+   AC1-AC8 and AC10. The runtime does not write a summary itself.
+2. **Must-draw (decision B).** The runtime gets a phase from the user's marks only: the phase
+   control file and `XCL_PHASE_MARK` (already parsed by telemetry), read also with telemetry off.
+   No automatic guess: in runs 10-12 the existing guess called the pre-gameplay stretch "menu" or
+   "loading" correctly, but also called gameplay "menu" whenever draws were skipped (section 3.4).
+   In a marked non-interactive phase (`boot`, `intro`, `loading`, `menu`, `cutscene`), every
+   pipeline first needed is must-draw: it waits up to 10 s from its first need (one chance), with
+   at most 10 s of such waits per frame, outside the 100 ms frame budgets. Its key is written to
+   a per-title list (`must-draw-pipelines.txt`). In later runs a listed key is must-draw without a
+   mark. Unknown phase: today's rules, except listed keys. Gameplay: listed keys wait every frame
+   inside the existing 100 ms budget. Must-draw builds go to the front of their lane. A compute
+   program known to be L or XL is never waited for. All waits stay inside `Held`, so the title's
+   own 30 s watchdog does not count them (`kernelx.rs:1529-1541`).
+3. **Size classes, timeouts, quarantine (decision C).** S < 256 KiB (ungated, as today), M up to
+   768 KiB, L up to 2 MiB, XL from 2 MiB. M and L share the existing compute lane, but L may hold
+   at most `cap - 1` of its slots, so an M build always has one. XL compute goes to the existing
+   one-slot giant lane, is never "wanted" (so it always waits for commit headroom) and is never
+   waited for. Every driver compile is watched: soft timeout logs, hard timeout marks the build
+   **abandoned** (binds stop waiting, the slot's count is freed, its commit stays reserved, a
+   replacement worker starts within U7's cap, the result is kept if the call ever returns). An XL
+   build past its hard timeout also **quarantines** its shader key for the session. The size-gate
+   skip `XCL_PSO_COMPUTE_SKIP_BYTES` exists, off by default, and is a `diagnostic` switch. The
+   out-of-process compile helper and a per-compile memory cap are deferred (section 4.4).
+4. **What is changed or deferred (decision D).** Timeouts are raised where our runs measured
+   longer good builds (graphics M cold 14-21 s, compute S 22.6 s, compute L 374 s); XL starts at
+   2 MiB, not 1.6 MB; the L cap is "lane cap minus one", not `workers/4`; priority aging, GPU
+   markers, the helper process, PCS-based checks and the runtime-written summary are deferred.
+   Full table in section 11.
+
+**Size:** ten units in eleven PRs (Q3 is two), each under 400 changed lines; about 2,400 production, test and script lines in all.
+
+### 1. Goal and scope
+
+**Goal.** Every draw or dispatch that draws or computes nothing is counted by cause in every run
+(§8.2.1, G5). Content the user marks as non-interactive is drawn even when its pipelines are late
+(§8.4, §8.5, AC8). No class of compute build can hold the scene's work indefinitely, and a build
+that runs past its limit stops blocking anyone (§7.4, §7.6, G1).
+
+**In scope (spec sections).**
+
+| Spec | What this design does with it |
+|---|---|
+| §7.2 | Priorities mapped onto pool U1's lanes; P0 = front of a wanted lane (Q7). Aging deferred. |
+| §7.4 | Size classes S/M/L/XL, L share cap, XL lane (Q4). |
+| §7.6 | Soft and hard timeouts per class, abandon, quarantine (Q5). |
+| §7.7 | Logical interface mapped onto existing functions plus `why_unbuilt` (Q1, section 4.5). |
+| §8.1-8.3 | Every skip counted by kind and reason (Q1, Q2); skip cascade counter (Q2). |
+| §8.4-8.5 | Phase from marks (Q6), must-draw list and waits (Q7). |
+| §9.3 items 1, 2, 6 | Size gate classification (Q4), opt-in size skip (Q8), memory guard by admission (Q4, section 4.4). |
+| §11.1-11.2 | Counter set (Q2, Q9), per-key log (Q9), summary (Q3). |
+| §12.2-12.5 | Decision rule and checks in the checker (Q3); unit tests per unit; acceptance runs (section 9). |
+| §13 AC1-AC8, AC10 | Evaluated by `pso-summary.py --check` (Q3). |
+
+**Out of scope (explicitly).**
+- §7.3 (U7 itself) and §7.5 (the stronger form, slot-denied requeue): not my sections. U7 stays as
+  built; `slot_denied_requeue` is not counted because nothing requeues.
+- §3-§6 (capture set, PSDB, driver prewarm, load-time precache): so `psdb_hit/miss`,
+  `driver_cache_hit_estimate`, `precache_*` and `direct_draw_generic_variant` are not built.
+- §9.3 items 3-5 (optimisation levels, EXEC bypass, direct DXIL backend).
+- §10 (wave size).
+- Containment of stale indirect counts (#1795 clamp, the GPU-stall options C1/R1). This design
+  only counts the hazard (`ei_after_skipped_dispatch`).
+- The pool's own order and reserve (pool U1-U2): used, not changed, except that a must-draw build
+  goes to the front of its lane (Q7).
+
+### 2. What exists today ("check the fork first" results)
+
+#### 2.1 §7.2, §7.4, §7.6, §7.7: queue, lanes, timeouts
+
+| Spec item | Found in the fork | Where |
+|---|---|---|
+| Priorities | Two levels only: "wanted" (a title thread waits; `need_now` puts it on `NEEDED`, ahead of the FIFO) and unwanted. Preloads run on separate lowest-priority threads. Pool U1 turns this into lanes WG > H > WC > UG > UC > S. | `pso_async.rs:283-288`, `1710-1724`, `592-640`; pool U1 |
+| Size threshold before the driver | One threshold, "huge" = 256 KiB of DXIL (`XCL_HUGE_PSO_BYTES`). A huge compute program is built in the background; a huge compile on an `xcl-pso*` thread waits at the gate. The size is known only after translation, on the worker. | `real.rs:4061-4069`, `4697-4705`, `4202-4205` |
+| Lanes | Three gate lanes: compute (`BIG_COMPILES`), graphics (`GRAPHICS_COMPILES`), giant (≥ 4 MiB, 1 slot). Slots: `min(clamp(cpus/4,1,4), RAM GiB/12)`, wanted +1 (4 and 5 on the PC). Unwanted builds also wait for commit headroom (3 GB, or 512 × DXIL above 6 MiB); wanted builds bypass it. Preloads give way. | `real.rs:4073-4109`, `4130-4177`, `4253-4294`, `4301-4311` |
+| L/XL distinction, worker-share cap | None. All compute from 256 KiB to 4 MiB shares one lane. | `real.rs:4171-4178` |
+| Parking (U7) | A worker that must wait at the gate calls `park()`; an extra worker starts while fewer than n are unparked, up to 2n threads. | `real.rs:4289-4291`; `pso_async.rs:351-393` |
+| Build timeouts, abandon, quarantine | None for builds. Bind waits are logged after 1 s (`xcl-pso-waits`), and the opt-in `XCL_PSO_COMPUTE_WAIT_MS=n` limits a bind's wait. | `pso_async.rs:1953-2037`, `1610-1627` |
+| Out-of-process compile | None. Driver blobs are kept on disk and handed back with `CachedPSO`, across runs. | `real.rs:4780-4800` |
+| Interfaces (§7.7) | `submit`, `submit_lazy`, `resolve`, `resolve_wait`, `resolve_draw`, `is_pending`, `is_spared`, `counts`, `workers`. No query of why a pipeline is not there. | `pso_async.rs:452-472`, `1521-1546`, `1776`, `2066-2088`, `396` |
+
+#### 2.2 §8: fallback
+
+| Spec item | Found in the fork | Where |
+|---|---|---|
+| Indirect skip | An ExecuteIndirect whose resolved pipeline is untranslated and `unbuilt` is skipped and counted `DRAWS_SKIPPED`, draws and dispatches together. | `bind.rs:292-299` |
+| Direct-draw stand-in | A direct draw with an untranslated pipeline goes through with the stand-in (draws nothing) or a native PC pipeline, both counted `DRAWS_PC`. | `bind.rs:571-603` |
+| 100 ms budget (run 7 vs runs 10-11) | Run 7 predates it: draws built or waited on the title thread. Now: a shared per-frame draw budget (`XCL_PSO_FRAME_WAIT_MS`, 100), a compute one (`XCL_PSO_COMPUTE_FRAME_WAIT_MS`, 100), and one chance per pipeline (the first budget after its first need), then `late`. | `pso_async.rs:1673-1704`, `1726-1737`, `1739-1771`, `1782-1804` |
+| Dispatch skip path | Exists and is counted `DISPATCHES_SKIPPED`: no translated program (late, image-only or failed), ABI error, dropped put-off. Console-list replay has its own uncounted-per-frame skip. Only the total is logged, at powers of two. | `bind.rs:897-915`, `132-134`; `console_list.rs:886-889`, `924` |
+| Must-draw or phase | None in the runtime. Phases exist only as telemetry events (schedule, control file, weak guess), written by a thread that runs only with telemetry on. | `telemetry_run.rs:474-760`; telemetry guide §5.9 |
+| Title watchdog during waits | While a bind waits, `HELD` is non-zero, so `title_held()` is true; `kernelx::Sleep` does not count held time, and the GPU-wait watchdog takes `held` into account. | `pso_async.rs:224-226`, `259-273`; `kernelx.rs:1529-1566`; `list_x.rs:1612` |
+
+#### 2.3 §9.3: size controls (items 1, 2, 6; the spec's (a)-(d) check)
+
+- (a) The #1269 768 KB compute skip patch: **absent** (no 768 KiB threshold in `real.rs`, `dxc.rs`).
+- (b) EXEC-emulation bypass: not my item.
+- (c) "> 8 MB → -O0": **present**, on HLSL source length, not DXIL: `UNOPTIMISED_ABOVE` = 8 MiB
+  (`gpu/recomp/dxc.rs:499-501`, applied at `dxc.rs:636-641`; `-O1` above 1 MiB).
+- (d) Direct DXIL backend: exists (`XCL_DIRECT_DXIL`, telemetry guide switch table); not my item.
+- Image-only skip (`XCL_PSO_IMAGE_SKIP`, on): decided at creation from console code
+  (`real.rs:5997`, `gpu/effects.rs:99-105`), built later, never waited for
+  (`pso_async.rs:1865-1906`).
+- Memory guard: admission only. Unwanted huge compiles wait for commit headroom; wanted ones
+  reserve but bypass (`real.rs:4253-4277`, `4301-4311`). No per-compile cap.
+
+#### 2.4 §11: counters
+
+- `bind.rs:41-67`: five counters (DRAWS, DRAWS_SKIPPED, DRAWS_PC, DISPATCHES,
+  DISPATCHES_SKIPPED), printed at powers of two. These produced O1 (1.29 M) and O2 (277 k).
+- `frame` (`log.rs:721-742`, `telemetry_gpu.rs:2710-2737`): `draws`, `dispatches` (only the
+  translated ones that went through), `pso_wait_ms`, `pso_wait_draw_ms`, `pso_wait_dispatch_ms`.
+- `pipeline` build event (tier `pass`, `telemetry_gpu.rs:2430-2453`): `stage`, `records`,
+  `dxil_bytes`, `compile_ms`, `waited_ms`, `source`, `blob`, `by`, `wanted`.
+- `activity` (`telemetry_run.rs:318-341`): `presents_2s`, `committed_mb`, `pso_wait_ms`,
+  `builds_title`. Pool U3 adds `pso_q`, `pso_workers`, `pso_gate` and the `pipeline_ready` event.
+- `report.json` `d3d12.background_pipelines` [built, failed, pending], `pipeline_waits`,
+  `dxil_cache` hits and misses (run 12: [2481, 0, 56287]; 4,354 hits, 154 misses).
+- Empty stub `telemetry_pipeline_wait_expired` (`telemetry_gpu.rs:2425`).
+- **Missing:** per-frame dispatch skips (O6 is unmeasured), any reason split, stand-in vs native
+  PC, totals of all issued calls, per-build hold time, cache hit at bind, must-draw outcomes.
+- **Planned and not built:** stall-fix U8 (`draws_unbuilt`, `dispatches_unbuilt`, `workers`,
+  `gate_parked`, `pso_budget_out`, the `pipeline_wait_expired` error). Q2 and Q9 replace it; see
+  the mapping in 4.1.
+
+#### 2.5 What the runs say about compile times by class
+
+From `classes.py` on run 12 (`pipeline` events; classes with this design's thresholds):
+
+| Stage | Class | Blob | Builds | p50 | Max | Largest DXIL |
+|---|---|---|---|---|---|---|
+| compute | S | no | 320 | 0.6 ms | 22.6 s | 249,088 B |
+| compute | M | no | 4 | 37.0 s | 48.0 s | 366,168 B |
+| compute | L | no | 13 | 224.0 s | **374.5 s** | 1,603,828 B |
+| compute | L | yes | 104 | 10.6 ms | 33 ms | **2,077,556 B** |
+| graphics | M | no | 29 | **14.0 s** | **21.3 s** | 422,324 B |
+| graphics | S | no | 1,438 | 0.0 ms | 8.9 s | 254,672 B |
+
+Gate waits reached 391 s (L) and 440 s (M). With a driver blob every class builds in under
+60 ms. These numbers set the timeouts in Q5.
+
+### 3. Architecture and data flow after the change
+
+#### 3.1 One build, end to end
+
+```
+title thread                         worker (pool U1 lanes)                      watchers
+------------                         ----------------------                      --------
+SetPipelineState -> resolve -> UG/UC lane (queued_at)
+draw / dispatch -> resolve_draw / resolve_wait
+   need_now: wanted, must_draw?  -> WG/WC lane (front if must_draw)
+   wait_in_frame(policy)            take -> build(): picked_at; quarantined key? -> outcome Quarantined, done
+     Normal:   100 ms budget, 1 chance       translate -> note_size(bytes): class; XL -> background, notify
+     Still:    10 s chance, 10 s/frame        size gate? (XCL_PSO_COMPUTE_SKIP_BYTES) -> outcome SizeGate
+     PlayListed: 100 ms budget each frame     driver_compile_identified:
+     stop when: built | background |            class -> lane (M/L share BIG, XL -> GIANT, never wanted)
+                abandoned | L/XL known           gate wait -> note_driver_compile(bytes, waited)
+   built? real pipeline                          compile_watch::enter ---------------> xcl-pso-watch (250 ms)
+   not? stand-in; skip site:                     build()  (uncancellable)               soft: log, event
+     telemetry_skip(kind, raw pso)               <- returns                             hard: abandon: late,
+       -> pso_async::skipped(pso)            complete(): outcome, record ->                 notify, free slot
+          (reason, must_draw, bump skips)        telemetry_pipeline_ready(&record)          count, replacement
+       -> frame/activity counters                                                          worker; XL: quarantine
+```
+
+#### 3.2 Telemetry flow
+
+- Hot-path call sites call one `crate::report::telemetry_*` function each. With telemetry off
+  each is one relaxed load (`xlog::telemetry_on`), as today.
+- `telemetry_gpu.rs` keeps one `[AtomicU64; COUNTS]` array. `Counters::now` snapshots it;
+  `FrameBook::close` takes per-frame deltas; `telemetry_activity` takes 2 s deltas.
+- Builds: `complete()` builds a `BuildRecord` (Q1) and passes it to `telemetry_pipeline_ready`.
+- End of run: `write_end` writes `pipeline_unbuilt` lines from `pso_async::unbuilt_records`.
+- Offline: `pso-summary.py` reads `events.jsonl`, `manifest.json`, `report.json`; writes
+  `summary.json` and the table; `--check` evaluates the acceptance criteria.
+
+#### 3.3 Must-draw policy table
+
+| Phase (from marks) | Pipeline is must-draw when | Wait |
+|---|---|---|
+| `Still` (boot, intro, loading, menu, cutscene, splash, credits) | always, unless it is compute of known class L or XL | `Still`: up to 10 s from first need (one chance), at most 10 s of must-draw waits per frame (own counter), stop early if it turns out L/XL, abandoned or background |
+| `Unknown` (no mark, or `auto`, or another name) | its key is in the must-draw list | listed: `Still`; others: today's `Normal` |
+| `Play` (`world`) | its key is in the must-draw list | listed: `PlayListed` (the normal 100 ms frame budget, every frame, no one-chance rule, never marked late by a wait); others: `Normal` |
+
+`XCL_MUSTDRAW=0` turns all of this off (every pipeline `Normal`, nothing listed or written).
+
+#### 3.4 Why phases come from marks only (evidence)
+
+`phase` events with `source: "auto"` in runs 10, 11 and 12 (`grep '"ev":"phase"'`):
+- Before gameplay the guess alternates `menu` and `loading` every 2-40 s. That would be right for
+  the must-draw rule.
+- After gameplay starts it keeps alternating `menu` and `loading` (run 10 after 230 s; run 12
+  after 209 s), and says `world` only briefly (run 11 at 165 s and 233 s). The rule uses
+  translated draws per frame (`telemetry_run.rs:518-534`), and skipped draws are not translated,
+  so a bad gameplay frame looks like a menu. Must-draw waits of 10 s in gameplay would follow.
+- A latch "non-interactive until the first heavy frame" fails on run 10's case: the world's draws
+  started at about 97-137 s (skipped at 744-1,091 a second) and the cards were shown at about
+  150-230 s (grey-analysis Q6). The latch would flip before the cards.
+So the guess stays telemetry-only and is not used for policy.
+
+### 4. Decisions
+
+#### 4.1 Decision A: the counter set
+
+Every counter: spec name, where it is carried, call site, tier, and kind of value.
+"Frame" = per-frame delta on `frame`; "2 s" = delta on `activity`; "gauge" = value at the sample.
+All tier `frame` unless noted. Skip fields on `frame` are written only when non-zero (absent = 0);
+totals are always written. Field names are flat (telemetry guide §5.3: "Events stay flat").
+
+| Spec counter (§11.1) | Field(s) | Event | Call site (file: function) | Value |
+|---|---|---|---|---|
+| `indirect_draw_skipped` (building / quarantined / size_gate) | `ei_draw_skip_building`, `_late`, `_abandoned`, `_quarantined`, `_failed`, `_other` | `frame` | `bind.rs: execute_indirect` at the sites now at 295, 307, 334, 343, 366 | frame |
+| (total for AC1) | `ei_draw_total` | `frame` | `bind.rs: execute_indirect`, after the put-off return (now 282) | frame |
+| `direct_draw_standin` | `draw_standin_building`, `_late`, `_abandoned`, `_quarantined`, `_failed` | `frame` | `bind.rs: graphics_bound` at 578 (`telemetry_pc_call`) | frame |
+| (direct draws that left out otherwise) | `draw_skip_other` (two-pass, ABI error) | `frame` | `bind.rs: graphics_bound` at 568, 616 | frame |
+| (native PC pipelines; they draw) | `draw_pc` | `frame` | same as `direct_draw_standin` (no reason found) and `execute_indirect` at 334 | frame |
+| `direct_draw_generic_variant` | not built (no generic variant exists, §6.3 out of scope) | - | - | - |
+| `draw_total` | `draw_total` (direct + indirect draw calls) | `frame`, `activity` | `telemetry_draw` (already called at `bind.rs:559` for every direct draw) + `ei_draw_total` | frame, 2 s |
+| `draw_no_output_ratio` | derived: (all `ei_draw_skip_*` + `draw_standin_*` + `draw_skip_other`) / `draw_total`; `activity.draw_no_output` carries the numerator | summary, `activity` | - | derived; 2 s |
+| `dispatch_total` | `dispatch_total`, `ei_dispatch_total` | `frame`, `activity` | `bind.rs: dispatch` after the put-off return (now 896); `execute_indirect` (now 282); `console_list.rs` dispatch branch (now 879); `bind.rs: dispatch_dropped` | frame, 2 s |
+| `dispatch_skipped` (by reason), per-frame histogram | `dispatch_skip_building`, `_late`, `_image_only`, `_background`, `_size_gate`, `_abandoned`, `_quarantined`, `_failed`, `_other` (direct and indirect together); `activity.dispatch_skipped` (sum) | `frame`, `activity` | `bind.rs: dispatch` at 905, 911; `execute_indirect` at 295 (dispatch signature), 324, 343, 354, 366; `dispatch_dropped` at 133; `console_list.rs` at 888, 924 | frame, 2 s; histogram in the summary |
+| skip cascade hint (§8.3) | `ei_after_skipped_dispatch`: ExecuteIndirect calls recorded in a list after a dispatch that may write memory was skipped in it since its last Reset | `frame` | inside `telemetry_indirect_issued` (no extra line) | frame |
+| `pipelines_compiled` by kind and class, per minute | `pipeline` build events (tier `pass`) gain `class` | `pipeline` | `telemetry_pipeline_built` (no new line) | per event; per minute in the summary |
+| `compile_time_ms` per kind × class | `pipeline.compile_ms` with `class` | `pipeline` | as above | summary p50/p95/max |
+| `dxil_size_bytes` per kind, per key | `pipeline.dxil_bytes`; `pipeline_ready.dxil_bytes` | both | as above | per event |
+| `queue_depth` per lane | pool U3 `activity.pso_q` (lane order WG, H, WC, UG, UC, S) | `activity` | pool U3 | gauge, 2 s (spec: 1 Hz) |
+| `queue_wait_ms` per priority | `pipeline_ready.queued_ms` (first send or need → worker took it) + `gate_ms` (gate waits); `pipeline.queued_ms` | both | `pso_async::complete` (pool U3 line, changed in Q1) | per build |
+| `worker_held_ms` (max, p95) | `pipeline_ready.held_ms` (worker took it → done) | `pipeline_ready` | as above | per build; summary max/p95 |
+| `workers_active / parked / spawned` | pool U3 `pso_workers` + flat `pso_workers_busy`, `pso_workers_abandoned`, `pso_large_held`, `pso_in_driver` | `activity` | `telemetry_activity` | gauge |
+| `slot_denied_requeue` | not built (§7.5 out of scope) | - | - | - |
+| `compile_timeout_soft / hard` | `compile_timeout` event, `kind` = `soft` / `hard` | `compile_timeout` | `real/compile_watch.rs: monitor` | per event |
+| `quarantined_keys` | `compile_timeout.quarantined: true`; `pipeline_ready.outcome = "quarantined"` | both | as above | per event |
+| `cache_hit_layer` / `cache_miss_layer` | first bind found the pipeline built / not built | `activity` | `pso_async.rs: Pending::note_use` (one line) | 2 s |
+| `psdb_hit/miss`, `driver_cache_hit_estimate`, `precache_*` | not built (§3, §5, §6 out of scope) | - | - | - |
+| `mustdraw_wait_ms` | `mustdraw_wait_ms` | `frame`, `activity` | `pso_async.rs: wait_in_frame_with` (Q7) | frame, 2 s |
+| `mustdraw_wait_timeout` | `mustdraw_wait_timeout` (waits that used up a must-draw chance) | `frame` | as above | frame |
+| `mustdraw_skipped` | `mustdraw_skipped` (left-out calls whose pipeline is must-draw) | `frame` | inside `telemetry_skip` | frame |
+| `failed_builds` | `report.json` `background_pipelines[1]`; `pipeline_ready.outcome = "failed"` | both | existing | end; per build |
+| (stall-fix U8) `pipeline_wait_expired` | `error` kind `pipeline_wait_expired`, not fatal | `error` | existing stub call `pso_async.rs:1627` | per event |
+
+**Mapping to existing and proposed names.**
+
+| This design | Existing counter | grey-options §8.1 / §8.2 | stall-fix U8 | #2625 cause |
+|---|---|---|---|---|
+| `ei_draw_skip_building` / `_late` | part of `DRAWS_SKIPPED` (`bind.rs:295`) | `ei_draw_building` / `ei_draw_late` | part of `draws_unbuilt` | "building" |
+| `dispatch_skip_*` from an EI | `DRAWS_SKIPPED` (site 1) or `DISPATCHES_SKIPPED` | `ei_dispatch_pending`, `ei_dispatch_no_shader` | `dispatches_unbuilt` | "no translation", "build failed" |
+| `ei_draw_skip_other` | `DRAWS_SKIPPED` (307, 366); uncounted (343) | `ei_two_pass`, `ei_root_args`, `ei_abi` | - | "two-pass", "arguments" |
+| `ei_draw_skip_failed` | uncounted (`bind.rs:331-336`) | `ei_pc` | - | "build failed" |
+| `draw_standin_*` | part of `DRAWS_PC` (`bind.rs:578`) | `draw_standin_building/late` | `draws_unbuilt` | - |
+| `draw_pc` | part of `DRAWS_PC` | `draw_pc` | - | - |
+| `dispatch_skip_late` / `_image_only` / `_failed` | `DISPATCHES_SKIPPED` (`bind.rs:905`) | `disp_late`, `disp_image_only`, `disp_no_shader` | `dispatches_unbuilt` | "building", "no translation" |
+| `dispatch_skip_other` | `DISPATCHES_SKIPPED` (911, 133) | `disp_abi`, `disp_dropped_submit` | - | "dropped at submit" |
+| `pso_workers_*`, `pso_q` | `workers()` | §8.2 `workers_*`, `needed`, `queued` | `workers`, `gate_parked` | - |
+
+The existing five counters and their log line stay unchanged (the source of O1 and O2).
+
+**What stays out, and why.**
+- GPU markers around skipped draws (§11.2, §12.4): deferred. A skipped draw records nothing, so
+  a marker only marks a position; the per-frame counters and pass events already place skips;
+  frame captures of this title at 2 fps are impractical now; and writing a marker must use the
+  original list function, not a hooked one, which needs its own check. Outline for later: an
+  opt-in `XCL_SKIP_MARKERS=1`, one `SetMarker` through `real::orig_fn` inside `telemetry_skip`.
+- `queue_depth` at 1 Hz: kept at the 2 s `activity` cadence (one sampler, no new thread).
+- Per-transition events (§7.7 "every state transition emits an event"): 56,000 pipelines a run
+  (report.json pending) would flood the file. Only terminal and exceptional transitions are
+  written: built or not (`pipeline_ready`), timeout (`compile_timeout`), still unbuilt at the end
+  (`pipeline_unbuilt`).
+
+**Per-run summary (§11.2).** `scripts/dev/pso-summary.py <run-dir>` (Q3), fork-only, standard
+library only, like `smoke-events.py`.
+- It writes `<run-dir>/summary.json` and prints a table. It can run during a run: `events.jsonl`
+  is written unbuffered, line by line (telemetry guide §5.1), so a partial file is valid.
+- It reads `report.json` (copy in the run folder) for `background_pipelines` and `dxil_cache`.
+- It does not touch the smoke block. `smoke-events.py` and `smoke.ps1` stay as they are.
+- `--check` evaluates AC1-AC8, AC10 and the §12.2 decision rule (section 9).
+- The runtime does not write a summary every 60 s (deviation, section 11).
+
+#### 4.2 Decision B: must-draw and phases
+
+**How the runtime knows the phase.** Options:
+
+| Option | For | Against | Decision |
+|---|---|---|---|
+| B1 Marks: phase control file and `XCL_PHASE_MARK`, read by the runtime too | Exact; a person or the run script says what the screen shows; already parsed (`telemetry_run.rs:577-685`) | Needs someone to mark; a schedule's seconds drift between runs | **chosen** (with B2) |
+| B2 Per-title list of pipeline keys captured from a marked run | Works in later unmarked runs; cheap (a hash set read once per pipeline) | Coarse: every pipeline first needed during the cards is listed, including the world's own | **chosen** |
+| B3 Existing automatic guess (`classify_phase`) | No setup | Calls gameplay "menu" when draws are skipped (3.4) | rejected for policy |
+| B4 Latch "non-interactive until the first heavy frame" | No setup | Flips before the cards in run 10 (3.4) | rejected |
+| B5 Title signals: no input read; present cadence | - | GameInput is polled always (the reading is the state at call time, `gameinput.rs:1-13`); no measured cadence difference (run 10 menus ran ~29 fps; the cards' window was a stall) | rejected |
+| B6 Content rule: draws whose render target is a presented image | Picks UI and cards | `rt0_resource` is tracked only with `XCL_TRACE_FRAME` (`present.rs:256-266`); per-draw lookups under two mutexes; the cards' content may be drawn off-screen first | rejected now |
+
+**How a pipeline becomes must-draw.** At its first need (`need_now`): listed, or the phase is
+`Still`. At creation (`submit_as`): listed. A must-draw flag never clears. In `Still`, the key of
+each newly must-draw pipeline is appended to `must-draw-pipelines.txt` (beside
+`used-pipelines.txt`, the same folder; at most 4,096 keys). Keys are the shader-set key
+`shaders_key` (`real.rs:5742-5748`), the same key `used-pipelines.txt` uses. Compute that feeds a
+must-draw draw (§8.4 bullet 3) is not detected; in `Still` all compute is must-draw anyway
+(except known L/XL).
+
+**Wait policy and how it combines with what is built.** See 3.3. In detail:
+- `Still` waits do not spend the 100 ms draw or compute frame budgets. They have their own
+  counter `MUSTDRAW_FRAME_SPENT`, budget 10 s (`XCL_MUSTDRAW_FRAME_MS`). Worst case per frame:
+  10 s + 100 ms (draws) + 100 ms (compute).
+- The one-chance rule stays, with the must-draw chance (10 s, `XCL_MUSTDRAW_WAIT_MS`) instead of
+  100 ms. A pipeline whose chance is over becomes `late` and is logged as
+  `mustdraw_wait_timeout`.
+- A frame whose must-draw budget is spent leaves the pipeline out for now, not late (as today).
+- `XCL_PSO_WAIT_MS`, when set, still caps every wait (as `cap` today).
+- A wait stops early when the pipeline is built, abandoned (Q5), background XL (Q4) or known to be
+  compute of class L/XL (spec §6.2 "never wait on L/XL compute"; size is known once the worker
+  has translated it).
+- Must-draw builds go to the **front** of their lane (P0 before P1), and listed keys go to the
+  front of the preload list.
+- **Title watchdog.** Every wait runs inside `Held` (`pso_async.rs:1758-1762`), so `title_held()`
+  is true; `kernelx::Sleep` sleeps through held time without counting it
+  (`kernelx.rs:1553-1566`), and the GPU-wait watchdog passes `held` (`list_x.rs:1612`). A 10 s
+  hold therefore does not move the title's 30 s count. The per-frame cap bounds any single hold
+  to 10 s, far below `XCL_STALL_DUMP` values in use (120 s).
+- **Default when the phase is unknown:** today's rules for every pipeline not on the list. AC8
+  then relies on the starvation fix (pool U1: graphics reserve) and on a list from an earlier
+  marked run. This is deliberate (spec §8.2.2: "starvation fixes come first").
+
+#### 4.3 Decision C: size classes, lanes, timeouts, quarantine
+
+**Classes** (by DXIL bytes, after translation; tunables):
+
+| Class | Bytes | Switch | Compute lane | Graphics lane |
+|---|---|---|---|---|
+| S | < 256 KiB | `XCL_HUGE_PSO_BYTES` (existing) | ungated (as today) | ungated |
+| M | 256 KiB - < 768 KiB | `XCL_PSO_L_BYTES` (new, default 786,432) | `BIG_COMPILES` | `GRAPHICS_COMPILES` |
+| L | 768 KiB - < 2 MiB | `XCL_PSO_XL_BYTES` (new, default 2,097,152) | `BIG_COMPILES`, at most `large_cap` slots | `GRAPHICS_COMPILES`, logged as anomaly |
+| XL | ≥ 2 MiB | - | `GIANT_COMPILES` (1 slot), never wanted, never waited for | `GRAPHICS_COMPILES` below 4 MiB, giant from 4 MiB (as today); anomaly |
+
+**L cap options.**
+
+| Option | L concurrency on the PC | For | Against | Decision |
+|---|---|---|---|---|
+| C-a Spec: `max(1, floor(n/4))`, ≤ n - 2, own lane | 3 (n = 15) | spec number | below the measured best of 4 on a 16-thread RTX 5080 (#2098, stall-fix entry); an own lane with M's 4-5 slots doubles concurrent big compiles and their 1-1.5 GB each | rejected |
+| **C-b L shares the compute lane, at most `cap - 1` of its slots (≤ n - 2)** | 3 unwanted / 4 wanted | memory envelope unchanged; M always has one slot; L throughput at the measured peak | not the spec's formula | **chosen** |
+| C-c No L cap | 4 / 5 | none | M builds wait behind L for minutes (gate waits 440 s for M in run 12, 2.5) | rejected |
+
+The spec's worker reason for the cap (no class may hold every worker, §7.4 invariant) is met by
+pool U1's graphics reserve (k = 3 on the PC) and by U7's extra workers, not by slot counts.
+
+**Timeouts** (driver time only: from just before the driver call to its return; gate waits are
+bounded by the gate's own rules):
+
+| Class / kind | Soft (log + event) | Hard (abandon) | After hard |
+|---|---|---|---|
+| S/M graphics | 2 s | 60 s | abandon |
+| S/M compute | 5 s | 120 s | abandon |
+| L (either kind) | 60 s | 450 s | abandon |
+| XL (either kind) | 60 s | 300 s | abandon and quarantine the key |
+
+`XCL_PSO_HARD_TIMEOUTS=0`: soft events and logs only.
+
+**What "abandoned" means** (the call cannot be cancelled in-process):
+- **Worker count.** The worker is counted in `ABANDONED`. U7's rule becomes
+  `extra_needed(workers, parked + abandoned, n)`, so a replacement starts within the 2n cap. Only
+  general pool workers count (as `park`). A reserved graphics worker is not replaced (the other
+  k - 1 and the general workers still take graphics).
+- **Slot.** The slot's count is given back at once, so the lane goes on. Its commit reservation
+  stays until the call returns, so admission of unwanted builds still sees the memory.
+- **Pipeline.** `late` and `abandoned` are set and waiters are woken: binds stop waiting and its
+  calls are left out with reason `abandoned`. If the call returns a valid pipeline it is kept and
+  used; if not, the build counts as failed.
+- **Telemetry.** A `compile_timeout` event (`kind: "hard"`), a warning, `pipeline_ready.abandoned`.
+
+**Quarantine.** A session set of shader keys (`QUARANTINE`), filled by an XL hard timeout. A
+pipeline whose key is quarantined is never built: at pickup the worker drops its job and completes
+it with outcome `quarantined`. Its calls are left out with reason `quarantined`. Key 0 (unknown)
+is never quarantined. Not persisted (spec: session only).
+
+**Size-gate skip (§9.3.2).** `XCL_PSO_COMPUTE_SKIP_BYTES=<bytes>` (unset or 0: off). On a pool or
+preload worker, a compute program whose translated DXIL is at least that size is not compiled:
+outcome `size_gate`, its dispatches are left out with reason `size_gate`, one log line per key
+(first 16, then powers of two). Listed in `manifest.diagnostic` and so in `compare_key`.
+How it differs from the image-only skip:
+
+| | Image-only skip (`XCL_PSO_IMAGE_SKIP`, on) | Size gate (`XCL_PSO_COMPUTE_SKIP_BYTES`, off) |
+|---|---|---|
+| Decided | at creation, from console code: ≥ 16 KiB and writes no buffer | after translation, from DXIL size |
+| What it may leave out | images only, never counts an ExecuteIndirect reads | anything, including culling counts: a GPU hang risk (`pso_async.rs:1857-1864`) |
+| Built? | yes, last and one at a time (pool U2) | never in the session |
+| Purpose | normal operation | diagnostic and stability lever (#1269) |
+
+**Memory guard (§9.3.6).** In-process we cannot cap one compile's memory. What this design does:
+XL is never wanted, so it never bypasses the commit-headroom check (3 GB, or 512 × DXIL above
+6 MiB: a 14 MB program needs about 7 GB free), and only one XL compile runs at once. A per-compile
+4 GB cap needs the helper process (4.4).
+
+#### 4.4 The out-of-process compile helper: deferred
+
+**What it would take.**
+- A helper mode of the `xcl` binary (`xcl pso-helper`) that creates its own D3D12 device on the
+  same adapter (by LUID), takes requests over a pipe (DXIL, serialized root signature, the
+  pipeline description), compiles, and returns `GetCachedBlob()`.
+- The main process creates the pipeline from that blob (`CachedPSO`), which takes milliseconds.
+  The fork already does this with blobs kept on disk across runs (`real.rs:4785-4800`), so blobs
+  from another process of the same driver are known to work.
+- A job object per helper with a memory limit (4 GB), killed on hard timeout.
+- Process lifetime, crash handling, a second device's video memory, the pipe protocol, and tests
+  that start the helper.
+
+**Why not now.** Over 800 lines across a new process mode and IPC; it changes the runtime's
+process model; and in-process abandon already removes the blocking effect of a stuck build. The
+remaining cost of a stuck build is one thread and its memory. Revisit if a run shows an abandoned
+compile still running at run end, or commit growth above the guard (AC11, not in this design).
+
+#### 4.5 §7.7 interface mapping
+
+| Spec | Here |
+|---|---|
+| `Submit(request) → ticket` | `submit` / `submit_lazy`; the ticket is the stand-in pointer |
+| `Query(ticket)` | new `why_unbuilt(pso) -> Option<Unbuilt>` (None = built or not ours); `is_pending` |
+| `WaitFor(ticket, max_ms)` | `wait_in_frame_with` under the must-draw policy (Q7) |
+| `SetLaneLimits(lane, slots)` | environment switches only (`XCL_HUGE_PSO_*`, `XCL_PSO_L_BYTES`, `XCL_PSO_XL_BYTES`) |
+| `Drain(deadline)` for tests | tests use `wait_built` (`pso_async.rs:779`) |
+| events per transition | terminal and exceptional only (4.1) |
+
+### 5. Dependencies
+
+#### 5.1 Upstream PRs
+
+| PR | State (2026-11-26) | Size | What it does | Decision |
+|---|---|---|---|---|
+| #2625 "count skipped draws and dispatches by cause" | open, MERGEABLE against upstream main | +403 -28, `bind.rs`, `list_x.rs`, `pso_async.rs` | A `Cause` enum, `skip(total, cause)` replacing every `count(..._SKIPPED)`, causes appended to the power-of-two log line; mostly about why a call could not be put off (bundle, predicated, no wrapper); `build_state(pso)`. One behaviour change: a replayed put-off ExecuteIndirect whose stand-in was released is skipped. | **Do not adopt.** No per-frame values, no building/late split, no stand-in vs native split; it rewrites every skip site our one-line call sites need, and its put-off causes rarely occur in frame mode (U5b decision 5: nothing is put off by default). Reuse its cause words where they match ("building", "build failed", "no translation", "dropped at submit", "two-pass"). Its replay fix matters only with `XCL_PSO_COMPUTE_WAIT_MS` set; note it for the GPU-stall workstream. |
+| #1795 "clamp ExecuteIndirect argument records and total work on the GPU" | open, CONFLICTING | +573 -11, 6 files | GPU clamp of indirect counts | Not part of this design (containment belongs to the GPU-stall options C1). Q2 only counts `ei_after_skipped_dispatch`. |
+| #2726, #2628, #628 | open | - | gate 128-256 KiB, give the worker back, graphics first | already decided against in the pool refinement entry |
+| Searches "pipeline timeout", "quarantine pipeline", "compile timeout", "must-draw", "intro cards pipeline", "size class compile", "abandon compile" | - | - | nothing that does a part of this design | - |
+
+#### 5.2 Files
+
+| Unit | Files |
+|---|---|
+| Q1 | `hle/d3d12x/pso_async.rs`; one line each in `hle/d3d12x/real.rs` (`translated_compute_pso_once`, `driver_compile_identified`); `telemetry_gpu.rs` (two stubs and pool U3's function signature) |
+| Q2 | `telemetry_gpu.rs`, `telemetry_run.rs`, `log.rs` (appended part); one-line call sites in `hle/d3d12x/bind.rs`, `hle/d3d12x/console_list.rs` |
+| Q3 | `scripts/dev/pso-summary.py`, `scripts/dev/test_pso_summary.py` |
+| Q4 | `hle/d3d12x/real.rs`, `hle/d3d12x/pso_async.rs` |
+| Q5 | `hle/d3d12x/real/compile_watch.rs` (new), `hle/d3d12x/real.rs`, `hle/d3d12x/pso_async.rs`, `telemetry_gpu.rs` (one stub) |
+| Q6 | `telemetry_run.rs` |
+| Q7 | `hle/d3d12x/pso_async.rs` |
+| Q8 | `hle/d3d12x/pso_async.rs`, `hle/d3d12x/real.rs` |
+| Q9 | `telemetry_gpu.rs`, `telemetry_run.rs`, `log.rs` (appended part), `crates/xcl/tests/telemetry_e2e.rs`; one line in `hle/d3d12x/real/compile_watch.rs` |
+| Q10 | `README.md`, `docs/guide/telemetry.md` |
+
+#### 5.3 Order
+
+- All units come after pool U1 and pool U2 are merged into `dev` (they replace `NEEDED`, the
+  channel and `worker_loop`, which Q1, Q5 and Q7 edit).
+- Q1 after pool U3 too (it changes U3's `telemetry_pipeline_ready` signature).
+- Q2 and Q4 after Q1. Q5 after Q4 (classes). Q6 after Q2 (same file). Q7 after Q2, Q4, Q5, Q6.
+  Q8 after Q7 (same file). Q9 after Q5 and Q8's predecessors (reads Q4/Q5 gauges; fills Q5's
+  stub). Q3 any time (it reads field names fixed here). Q10 last.
+
+### 6. Constraints and considerations
+
+- **Hot draw path.** About 400 draws and 4,000 dispatches a frame at about 2 fps in the scene.
+  With telemetry off each call site costs one relaxed load. With it on: one `fetch_add` per issued
+  call; a skip also takes `pso_async::skipped`, which locks `PENDING` once (the same lock
+  `entry()` takes in every bind today). Must-draw adds work only when a pipeline is not built: a
+  relaxed load of the phase class and two atomic flags. The list is read once per pipeline at its
+  first need and creation (an `RwLock` read).
+- **Event volume.** Skip fields are written only when non-zero; a healthy frame line grows by the
+  four totals and two must-draw fields. `pipeline_ready` is written for needed or exceptional
+  builds only (run 12: about 2,500 builds in all). `pipeline_unbuilt`: at most 2,000 lines once.
+- **The title's watchdog.** Covered in 4.2. Abandon never holds a title thread: it only wakes
+  waiters. Quarantine and the size gate leave dispatches out, as late ones are today.
+- **Memory.** No more concurrent big compiles than today for M+L (shared lane). XL: one slot,
+  always behind the headroom check (it was in the giant lane already from 4 MiB). An abandoned
+  compile keeps its commit reservation. Replacement workers: 64 MB stack each, virtual, within 2n.
+- **Edge cases.**
+  - A pipeline needed during `Still` and bound again in `Play`: stays must-draw; in `Play` only
+    listed keys use `PlayListed`. A `Still`-marked pipeline is listed when first needed, so in the
+    same run it is also listed.
+  - An abandoned build that later returns: `complete()` stores the pipeline; skips stop; the record
+    says `abandoned: true, outcome: "built"`.
+  - An abandoned build on a preload thread: counted for telemetry, no replacement (preloads are not
+    pool workers).
+  - A quarantined key that is already built for another stand-in: that pipeline stays.
+  - `XCL_ASYNC_PSO=0`: no `Pending`, no worker: classes still pick lanes, timeouts still log (no
+    pipeline to abandon), the size gate does nothing (it applies only on pool or preload workers).
+  - `XCL_LAZY_PSO=0`: unchanged; must-draw marks apply at first need.
+  - `XCL_PSO_COMPUTE_WAIT_MS` set (limit or wait mode): must-draw applies only in frame mode
+    (`wait_in_frame`); the opt-in modes keep their meaning.
+  - Two waiters on one must-draw pipeline: each waits within its own chance; the frame cap is
+    shared.
+- **Failure modes.**
+  - Phase file never marked `world` after gameplay starts: every new pipeline waits up to 10 s
+    (chance) and at most 10 s per frame. Slow, bounded, watchdog-safe. The checker flags it
+    (`mustdraw_wait_ms` > 0 after the scene start).
+  - A stale must-draw list (a title update): unknown keys never match; harmless.
+  - A hard timeout on a build that would have finished: abandoned, result kept; cost one extra
+    thread and one extra slot of concurrency for the overlap.
+- **Open risks.**
+  - Cold graphics M builds take 14-21 s (2.5): a card whose pipelines are cold misses its 10 s
+    chance and draws late. Driver blobs make it about 13 ms. AC8 in a blob-cold run may fail for
+    this reason alone; the checker reports per-pipeline must-draw waits so the cause is visible.
+  - The graphics reserve covers P0/P1 graphics; P1 compute has no hard reservation (pool spec
+    5.4 open risk). The checker measures it (AC7 second half).
+  - XL never waited for: if a needed memory-writing program is XL, its dispatches are left out
+    until it is built, as today after 100 ms; the stale-count hazard is unchanged.
+
+### 7. Work breakdown
+
+Line numbers are on `dev` 20941768; pool U1/U2 change `pso_async.rs`, so find code by function
+name. Every unit: `cargo build --workspace` and `cargo test --workspace -- --test-threads=4` on
+the PC with counts and SKIPPED lines; never `cargo fmt`; telemetry code in the fork-only files.
+
+#### Q1. Build facts and skip reasons (`pso_async.rs`, two lines in `real.rs`, stubs)
+
+- **Inputs:** pool U1-U3 merged.
+- **Outputs:** `Facts` on every `Pending`; `Unbuilt`, `Skipped`, `why_unbuilt`, `skipped`;
+  `BuildRecord` and `record`; `note_size`, `note_driver_compile`; `queued_here`,
+  `must_draw_here`; `unbuilt_records`; `GENERAL_BUSY`.
+- **Changes in `pso_async.rs`:**
+  1. Add to `Pending` a field `facts: Facts`:
+     ```rust
+     #[derive(Default)]
+     struct Facts {
+         /// binds left out for it (`skipped`)
+         skips: std::sync::atomic::AtomicU32,
+         /// µs title threads waited for it, all binds together
+         waited_us: AtomicU64,
+         /// the largest DXIL its build translated or compiled (0: not known yet)
+         dxil_bytes: AtomicUsize,
+         /// µs its driver compiles waited at the gate
+         gate_us: AtomicU64,
+         /// first sent to the workers or needed (`enqueue`, `need_now`)
+         queued_at: Mutex<Option<std::time::Instant>>,
+         /// a worker took it (`build`)
+         picked_at: Mutex<Option<std::time::Instant>>,
+         /// how it ended (OUTCOME_*), set before `complete`
+         outcome: std::sync::atomic::AtomicU8,
+         /// must-draw (set by Q7; read by `skipped` and the record)
+         must_draw: std::sync::atomic::AtomicBool,
+         /// its driver compile ran past its hard limit (set by Q5)
+         abandoned: std::sync::atomic::AtomicBool,
+     }
+     const OUTCOME_BUILT: u8 = 0; const OUTCOME_FAILED: u8 = 1;
+     ```
+     `submit_as` initialises it with `Default::default()`.
+  2. `pub enum Unbuilt { Building, Late, ImageOnly, Failed }` with `pub fn name(self) -> &'static str`
+     (`building`, `late`, `image_only`, `failed`), and `pub struct Skipped { pub why: Option<Unbuilt>, pub must_draw: bool }`.
+  3. `fn why_of(p: &Pending) -> Option<Unbuilt>` (pure on the flags): `real != 0` → None; `done` →
+     `Failed`; `spared` → `ImageOnly`; `late` → `Late`; else `Building`.
+  4. `pub fn why_unbuilt(pso: usize) -> Option<Unbuilt>`: `entry(pso)` then `why_of`; None when no
+     entry.
+  5. `pub fn skipped(pso: usize) -> Skipped`: with an entry, bumps `facts.skips`, returns
+     `why_of` and `must_draw`; without one, `Skipped { why: None, must_draw: false }` (the caller
+     counts `None` as `failed`: a console pipeline with no translation).
+  6. Set `queued_at` once (`get_or_insert_with(Instant::now)`) in `enqueue` and in `need_now`; set
+     `picked_at` at the start of `build` (`pso_async.rs:76`).
+  7. Add `facts.waited_us` the elapsed µs at each place `note_blocked` is called for a pipeline
+     (`wait_in_frame`, `resolve_wait_inner` twice).
+  8. `pub(super) fn note_size(bytes: usize)`: for the `BUILDING` pending of this thread (None: do
+     nothing), `facts.dxil_bytes.fetch_max(bytes)`. Q4 extends it.
+  9. `pub(super) fn note_driver_compile(bytes: usize, gate_wait: std::time::Duration)`: same
+     thread rule; `dxil_bytes.fetch_max`, `gate_us.fetch_add`.
+  10. `pub fn queued_here() -> Option<std::time::Duration>`: for the `BUILDING` pending,
+      `picked_at - queued_at` when both are set. `pub fn must_draw_here() -> bool`.
+  11. ```rust
+      pub struct BuildRecord {
+          pub compute: bool, pub key: u64,
+          pub need: Option<std::time::Duration>,   // first need → now
+          pub queued: Option<std::time::Duration>, // first send or need → picked
+          pub held: Option<std::time::Duration>,   // picked → now
+          pub waited: std::time::Duration, pub gate: std::time::Duration,
+          pub dxil_bytes: usize, pub skips: u32,
+          pub late: bool, pub must_draw: bool, pub abandoned: bool,
+          pub outcome: &'static str,               // "built", "failed", later "size_gate", "quarantined", "pending"
+      }
+      fn record(p: &Pending, real: usize) -> BuildRecord
+      ```
+      `outcome`: `real != 0` → `built`; else the name of `facts.outcome`. `need` from
+      `demand.needed_at` (locked alone).
+  12. In `complete` (`pso_async.rs:133`), the pool U3 line becomes
+      `crate::report::telemetry_pipeline_ready(&record(p, real));` (same place: after the `done`
+      block, before the orphan release).
+  13. `pub fn unbuilt_records(limit: usize) -> Vec<BuildRecord>`: entries of `PENDING` not done,
+      with `skips > 0` or `needed_at` set, sorted by `skips` descending, first `limit`
+      (`outcome: "pending"`). It clones the `Arc`s under the `PENDING` lock and reads facts after.
+  14. `Pending::note_use` (`pso_async.rs:116`): after computing `e`, add
+      `crate::report::telemetry_first_use(self.real.load(Ordering::Acquire) != 0);` before the
+      `note_first` call. It runs once per pipeline (inside the existing `used` once-guard: place it
+      inside the `if super::pso_manifest::note_first(...)` branch).
+  15. `static GENERAL_BUSY: AtomicUsize`, `+1`/`-1` around running an item in `worker_loop` when
+      `!reserved` (pool U1's loop). Add `pub busy: usize` to pool U1's `QueueGauges`, filled in
+      `queue_gauges()`.
+- **Changes in `real.rs`:**
+  - `translated_compute_pso_once`, right after `let dxil = compiled.dxil;` (now 4697):
+    `super::pso_async::note_size(dxil.len());`
+  - `driver_compile_identified`, right after `let waited = waited.elapsed();` (now 4206):
+    `super::pso_async::note_driver_compile(bytes, waited);`
+- **Changes in `telemetry_gpu.rs`:**
+  - `pub fn telemetry_first_use(_ready: bool) {}` (stub; Q2 fills it).
+  - Pool U3's `telemetry_pipeline_ready(compute, need, late, ok)` becomes
+    `telemetry_pipeline_ready(r: &crate::hle::d3d12x::pso_async::BuildRecord)`, writing exactly
+    U3's four fields from `r` (`stage`, `need_ms`, `late`, `ok` = `outcome == "built"`), same
+    early return when `r.need` is None. U3's test `pipeline_ready_fields_carry_stage_and_need`
+    is updated to build a `BuildRecord`.
+- **Tests (`pso_async` test modules):**
+  - `a_skip_names_why_the_pipeline_is_not_there`: lazy compute stand-in with a blocking job,
+    `resolve`d: `why_unbuilt` = Building; set `late` → Late; a second one marked `image_only` →
+    ImageOnly; a job returning 0 after `wait_built` → Failed; a built one → None; an unknown
+    pointer → None. Four calls of `skipped` on the first → `facts.skips` = 4 and `why` = Late.
+  - `a_build_record_carries_its_times`: `submit_lazy` a graphics job that sleeps 50 ms; `resolve`;
+    `wait_built`; capture the record by calling `record(&p, real)` on the entry: `queued` Some,
+    `held` ≥ 50 ms, `outcome` "built", `skips` 0.
+  - `driver_compile_facts_go_to_the_build_on_this_worker`: a job that calls
+    `note_driver_compile(300 << 10, 5 ms)` and `note_driver_compile(200 << 10, 5 ms)` and
+    `note_size(250 << 10)`: the record has `dxil_bytes` 307,200 and `gate` 10 ms.
+  - `unbuilt_records_list_needed_pipelines_by_skips`: two blocking stand-ins, one needed
+    (`need_by_submit`) and skipped 3 times, one only `resolve`d: the list has the first only.
+- **Acceptance:** `cargo test -p xcl --lib -- pso_async:: telemetry` passes; whole suite passes.
+  No behaviour change (no switch, no wait or order change).
+- **Size:** about 150 production and 120 test lines.
+
+#### Q2. Skip and total counters per frame and per 2 s (telemetry files, one-line call sites)
+
+- **Inputs:** Q1 committed.
+- **Outputs:** frame and activity fields of 4.1; `error` kind `pipeline_wait_expired`.
+- **Changes in `telemetry_gpu.rs`:**
+  1. Counter indices and names, in one table:
+     ```rust
+     /// Counted calls, in this order; frame and activity fields take these names.
+     pub const COUNT_NAMES: [&str; 33] = [
+         "draw_total", "ei_draw_total", "dispatch_total", "ei_dispatch_total",            // 0-3 totals
+         "ei_draw_skip_building", "ei_draw_skip_late", "ei_draw_skip_abandoned",          // 4-6
+         "ei_draw_skip_quarantined", "ei_draw_skip_failed", "ei_draw_skip_other",         // 7-9
+         "draw_standin_building", "draw_standin_late", "draw_standin_abandoned",          // 10-12
+         "draw_standin_quarantined", "draw_standin_failed", "draw_skip_other", "draw_pc", // 13-16
+         "dispatch_skip_building", "dispatch_skip_late", "dispatch_skip_image_only",      // 17-19
+         "dispatch_skip_background", "dispatch_skip_size_gate", "dispatch_skip_abandoned",// 20-22
+         "dispatch_skip_quarantined", "dispatch_skip_failed", "dispatch_skip_other",      // 23-25
+         "ei_after_skipped_dispatch", "mustdraw_skipped", "mustdraw_wait_timeout",        // 26-28
+         "mustdraw_wait_us", "cache_hit_layer", "cache_miss_layer", "reserved_0",         // 29-32
+     ];
+     static COUNTS: [AtomicU64; 33] = [const { AtomicU64::new(0) }; 33];
+     ```
+     `reserved_0` is never written (keeps the array size stable for Q4/Q5/Q8 reasons that map to
+     existing names). Q1's `Unbuilt` gains variants in later units; their names
+     (`abandoned`, `quarantined`, `background`, `size_gate`) already have slots here.
+  2. `pub enum Call { Draw, Indirect(bool /* dispatches */), Dispatch }`.
+  3. Pure `fn skip_index(call: Call, why: Option<&str>) -> usize`: draw kinds map `building`,
+     `late`, `abandoned`, `quarantined`, `failed` (and `None` → failed) to the `draw_standin_*` or
+     `ei_draw_skip_*` slot; dispatch kinds (direct or `Indirect(true)`) map every reason name to
+     `dispatch_skip_<name>` and `None` to `dispatch_skip_failed`. `image_only`/`background`/
+     `size_gate` on a draw kind map to the `_failed` slot (cannot happen; safe).
+  4. `pub fn telemetry_skip(list: *mut c_void, call: Call, pso: usize)`: returns unless tier
+     `frame`; `let s = crate::hle::d3d12x::pso_async::skipped(pso);` bump
+     `skip_index(call, s.why.map(|w| w.name()))`; if `s.must_draw` bump `mustdraw_skipped`; if the
+     call is a dispatch kind and the reason is not `image_only`, insert `list as usize` into
+     `static SKIPPED_WRITER: Mutex<HashSet<usize>>` (skip when `list` is null).
+  5. `pub fn telemetry_skip_other(list: *mut c_void, call: Call)`: bump `ei_draw_skip_other`,
+     `draw_skip_other` or `dispatch_skip_other`; dispatch kinds insert into `SKIPPED_WRITER` too.
+  6. `pub fn telemetry_pc_call(list: *mut c_void, call: Call, pso: usize)`: `skipped(pso)`; if
+     `why` is Some → as `telemetry_skip`; else, for a draw kind, bump `draw_pc` (for
+     `Indirect(true)` nothing).
+  7. `pub fn telemetry_indirect_issued(list: *mut c_void, dispatches: bool)`: bump `ei_dispatch_total`
+     + `dispatch_total`, or `ei_draw_total` + `draw_total`; if `SKIPPED_WRITER` contains `list`,
+     bump `ei_after_skipped_dispatch`.
+  8. `pub fn telemetry_dispatch_issued()`: bump `dispatch_total`.
+  9. `pub fn telemetry_dispatch_dropped()`: bump `dispatch_total` and `dispatch_skip_other`.
+  10. `telemetry_draw` (`telemetry_gpu.rs:2205`): before its tier-`pass` return, at tier `frame`
+      bump `draw_total` (it runs once per direct draw, `bind.rs:559`).
+  11. `telemetry_list_reset` (`telemetry_gpu.rs:2195`): remove `list` from `SKIPPED_WRITER`.
+  12. Fill Q1's stub: `telemetry_first_use(ready)` bumps `cache_hit_layer` or `cache_miss_layer`.
+  13. `pub fn telemetry_mustdraw_wait(took: std::time::Duration, timed_out: bool)`: add µs to
+      `mustdraw_wait_us`; bump `mustdraw_wait_timeout` when `timed_out`. (No caller until Q7.)
+  14. `pub fn counts_now() -> [u64; 33]` (relaxed loads).
+  15. `Counters` gets `counts: [u64; 33]` from `counts_now()`; `FrameRec` gets `counts: [u64; 33]`
+      (deltas, in `FrameBook::close`); `frame_facts` fills `FrameFacts.counts` with
+      `frame_count_fields(&deltas)`.
+  16. Pure `fn frame_count_fields(d: &[u64; 33]) -> Vec<(&'static str, u64)>`: indices 0-3
+      always; 4-31 only when non-zero; `mustdraw_wait_us` is written as `mustdraw_wait_ms`
+      (`d / 1000`, as f64 3 decimals, via a separate entry: see log.rs change); index 32 never.
+  17. Fill `telemetry_pipeline_wait_expired(compute, ms)`: `telemetry_error(ErrKind::PipelineWaitExpired,
+      "pso_async", "a compute pipeline was not built in time", None, false, &[("stage", ..), ("ms", ms.into()), ("n", n.into())])`
+      with the volume rule of `io_failed` (first 100, then every 1,000th).
+- **Changes in `log.rs` (appended part):** `FrameFacts` gets
+  `pub counts: Vec<(&'static str, u64)>` and `pub mustdraw_wait_ms: f64`. `frame_fields` appends
+  each `counts` pair as a number and `mustdraw_wait_ms` always (`ms_val`), before `sampled`. The
+  test helper `frame()` gets `counts: vec![], mustdraw_wait_ms: 0.0`.
+- **Changes in `telemetry_run.rs`:** `ErrKind::PipelineWaitExpired` (`pipeline_wait_expired`);
+  `telemetry_activity` appends pure `activity_count_fields(now: &[u64; 33], prev: &[u64; 33])`:
+  `draw_total`, `draw_no_output` (sum of indices 4-15), `dispatch_total`, `dispatch_skipped`
+  (sum of 17-25), `cache_hit_layer`, `cache_miss_layer`, `mustdraw_wait_ms`; `prev` kept in a
+  `static ACTIVITY_COUNTS: Mutex<[u64; 33]>`.
+- **Call sites (one line each; add or change only these lines):**
+
+  | File: function (line now) | Line |
+  |---|---|
+  | `bind.rs: execute_indirect`, after the put-off `if … { return … }` (after 282) | `crate::report::telemetry_indirect_issued(this, signature_dispatches(sig));` |
+  | same, after `count(DRAWS_SKIPPED)` (295) | `crate::report::telemetry_skip(this, crate::report::Call::Indirect(signature_dispatches(sig)), raw_pso);` |
+  | same, after `count(DRAWS_SKIPPED)` (307) | `crate::report::telemetry_skip_other(this, crate::report::Call::Indirect(false));` |
+  | same, after `count(DISPATCHES_SKIPPED)` (324) | `crate::report::telemetry_skip(this, crate::report::Call::Indirect(true), raw_pso);` |
+  | same, before `let rs = with(this, \|s\| s.rs_gfx)` (334) | `crate::report::telemetry_pc_call(this, crate::report::Call::Indirect(signature_dispatches(sig)), raw_pso);` |
+  | same, before `return;` of the root-argument branch (343) | `crate::report::telemetry_skip_other(this, crate::report::Call::Indirect(signature_dispatches(sig)));` |
+  | same, after `count(DISPATCHES_SKIPPED)` (354) | `crate::report::telemetry_skip_other(this, crate::report::Call::Indirect(true));` |
+  | same, after `count(if gfx …)` in `Err` (366) | `crate::report::telemetry_skip_other(this, crate::report::Call::Indirect(!gfx));` |
+  | `bind.rs: graphics_bound`, after `count(DRAWS_SKIPPED)` (568) | `crate::report::telemetry_skip_other(this, crate::report::Call::Draw);` |
+  | same, after `count(DRAWS_PC)` (578) | `crate::report::telemetry_pc_call(this, crate::report::Call::Draw, pso);` |
+  | same, after `count(DRAWS_SKIPPED)` (616) | `crate::report::telemetry_skip_other(this, crate::report::Call::Draw);` |
+  | `bind.rs: dispatch`, after the put-off `if … { return … }` (after 896) | `crate::report::telemetry_dispatch_issued();` |
+  | same, change `let pso = super::pso_async::resolve_wait(pso);` (897) | `let (raw, pso) = (pso, super::pso_async::resolve_wait(pso));` |
+  | same, after `count(DISPATCHES_SKIPPED)` (905) | `crate::report::telemetry_skip(this, crate::report::Call::Dispatch, raw);` |
+  | same, after `count(DISPATCHES_SKIPPED)` (911) | `crate::report::telemetry_skip_other(this, crate::report::Call::Dispatch);` |
+  | `bind.rs: dispatch_dropped` (133) | `crate::report::telemetry_dispatch_dropped();` |
+  | `console_list.rs`, after `at += 4;` in the dispatch branch (880) | `crate::report::telemetry_dispatch_issued();` |
+  | same, before `continue;` after `out.skipped_dispatches += 1` (888) | `crate::report::telemetry_skip(list.as_raw(), crate::report::Call::Dispatch, (*p).pc);` |
+  | same, `_ => out.skipped_dispatches += 1,` (924) | `_ => { out.skipped_dispatches += 1; crate::report::telemetry_skip(list.as_raw(), crate::report::Call::Dispatch, 0) }` |
+
+  Put-off calls are counted once, at their replay (the replay goes through the same functions).
+- **Tests:**
+  - `telemetry_gpu`: `skip_index_follows_call_and_reason` (table over every `Call` × reason,
+    including `None`).
+  - `telemetry_gpu`: `frame_count_fields_keep_totals_and_drop_zero_skips` (totals 0 still
+    written, a zero skip absent, a non-zero one present, `reserved_0` never).
+  - `telemetry_gpu`: `frame_book_takes_count_deltas` (two `close` calls with `Counters` whose
+    `counts` differ: the second frame's `counts` hold the differences).
+  - `telemetry_gpu`: `a_skipped_dispatch_marks_its_list_until_reset` (with tier forced in the
+    test helper as other tests do: `telemetry_skip(list A, Dispatch, 0)`, then
+    `telemetry_indirect_issued(A, false)` bumps `ei_after_skipped_dispatch`;
+    `telemetry_list_reset(A)`; the next does not). If the tier cannot be forced in unit tests,
+    test the pure `fn writer_hit(set, list)` and `fn writer_mark(set, list, why)` instead.
+  - `log`: `frame_fields_append_counts_flat` (a `FrameFacts` with two counts: both keys present,
+    flat numbers; `mustdraw_wait_ms` present).
+  - `telemetry_run`: `activity_count_fields_are_deltas_and_sums` (`draw_no_output` = sum of
+    4-15, `dispatch_skipped` = sum of 17-25).
+  - `telemetry_e2e`: extend `telemetry_frame_events_match_the_run` to assert every `frame` has
+    `draw_total ≥ draws` and `dispatch_total ≥ dispatches`; extend
+    `activity_events_mirror_the_log` to assert `draw_total`, `dispatch_total`, `dispatch_skipped`
+    exist.
+- **Acceptance:** tests pass. On the PC, a 120 s retail run at tier `frame`: frame lines carry the
+  totals; in the world `draw_total` exceeds `draws`; the "console code so far" log line is
+  unchanged.
+- **Size:** about 230 production and 110 test lines.
+
+#### Q3. Run summary and acceptance checker (`scripts/dev/`)
+
+- **Inputs:** the field names of Q2 and Q9 (fixed in this document). Can be written before them;
+  tests use synthetic files.
+- **Outputs:** `scripts/dev/pso-summary.py`, `scripts/dev/test_pso_summary.py`.
+- **Command:** `python scripts/dev/pso-summary.py <run-dir> [--scene-start S] [--config cold|warm|prewarmed]
+  [--still-span A-B ...] [--check] [--out FILE] [--quiet]`. `--still-span` (seconds, repeatable)
+  replaces the marked non-interactive windows, for a run without marks. Python 3.9+, standard library only, read with
+  `encoding="utf-8", errors="replace"`; malformed lines are counted and skipped.
+- **Definitions it uses:**
+  - Times in seconds = event `t` / 1000.
+  - **Scene start:** `--scene-start`; else the first `phase` event with `name` `world` and
+    `source` `mark` or `schedule`; else the first `frame` with `draw_total` ≥ 400; else none
+    (post-warmup checks are N/A). The summary records which rule was used.
+  - **Post-warmup:** `t` ≥ scene start + 60 s (§13).
+  - **Non-interactive windows:** spans between `phase` marks (`mark`/`schedule`) whose name maps to
+    `Still` (Q6's table).
+  - **No-output draws:** sum of `ei_draw_skip_*`, `draw_standin_*`, `draw_skip_other`.
+  - **Direct draws:** `draw_total - ei_draw_total`.
+  - **Dispatch skips:** sum of `dispatch_skip_*`.
+- **`summary.json`** (schema 1): `run_id`, `adapter`, `config`, `scene_start_s` and its rule;
+  `totals` and `post_warmup` objects with every count field summed; ratios
+  (`ei_draw_skip_ratio`, `draw_standin_ratio`, `draw_no_output_ratio`, `dispatch_skip_ratio`);
+  `dispatch_skips_per_frame` {p50, p95, max, buckets `0`, `1-9`, `10-99`, `100-999`, `1000+`}, total
+  and post-warmup; `pipelines_per_minute` after the scene start by stage × class (from `pipeline`
+  events); `compile_ms` p50/p95/max by stage × class × blob; `dxil_bytes` p50/p95/max by stage;
+  `queue_wait_ms` (`queued_ms + gate_ms` of `pipeline_ready` with `need_ms` set) p50/p95/max by
+  stage and must-draw; `worker_held_ms` max/p95 by class; `compile_timeouts` by kind × class;
+  `quarantined_keys`; `abandoned` count; `cache_hit_layer_rate`; must-draw totals and the largest
+  per-pipeline must-draw wait; `failed_builds` (report.json `d3d12.background_pipelines[1]`, and
+  `pipeline_ready` with `outcome` `failed`); `unbuilt` count and the top 20 keys by skips;
+  `malformed_lines`.
+- **Table:** one line per summary group, human-readable.
+- **`--check`:** prints one line per criterion: `AC<n> PASS|FAIL|N/A measured=… target=… (reason)`
+  and the §12.2 rule as `RUN12 U7-SUFFICIENT|STRONGER-FORM|N/A`. Exit 0 when no line is FAIL, 1
+  when one is, 2 on usage or unreadable input. The rules are in section 9's table.
+- **Tests (`test_pso_summary.py`, `unittest`, synthetic run folders in a temp dir):**
+  - `test_scene_start_rules` (override, mark, heavy frame, none).
+  - `test_ratios_and_post_warmup_sums` (three frames before and two after the warm-up).
+  - `test_dispatch_histogram_buckets`.
+  - `test_check_ac1_cold_and_warm` (0.05 % passes cold; 1 skip post-warmup fails warm).
+  - `test_check_ac7_available_workers` (an `activity` sample with 1 available fails).
+  - `test_check_ac8_uses_marks_and_pipeline_ready` (a must-draw `pipeline_ready` with
+    `waited_ms` 10,500 fails; `mustdraw_skipped` in a `Still` window fails).
+  - `test_check_ac10_reads_report_json`.
+  - `test_malformed_lines_are_counted`.
+  - `test_exit_codes`.
+- **Acceptance:** `python -m unittest scripts/dev/test_pso_summary.py` passes on the Mac and the
+  PC; on the run 12 folder it runs without error and reports N/A for fields run 12 lacks.
+- **Size:** about 330 lines of script and 180 of tests: over the limit, so two commits/PRs:
+  **Q3a** summary and table (`summary.json`, about 200 + 90 lines; tests `test_scene_start_rules`,
+  `test_ratios_and_post_warmup_sums`, `test_dispatch_histogram_buckets`,
+  `test_malformed_lines_are_counted`) and **Q3b** `--check`, `--still-span` and exit codes (about
+  130 + 90 lines; the other five tests). Q3b after Q3a; both in wave 1-2.
+
+#### Q4. Size classes on the gate (`real.rs`, `pso_async.rs`)
+
+- **Inputs:** Q1 committed.
+- **Outputs:** `SizeClass`, `size_class`, the L share cap, XL to the giant lane and background,
+  `large_held()`, `in_driver()`, graphics anomaly log.
+- **Changes in `real.rs`:**
+  1. `fn large_pso_bytes() -> usize` (`XCL_PSO_L_BYTES`, default `768 << 10`, via `env_count`,
+     min `huge_pso_bytes()`); `fn xl_pso_bytes() -> usize` (`XCL_PSO_XL_BYTES`, default `2 << 20`,
+     min `large_pso_bytes()`).
+  2. ```rust
+     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+     pub(crate) enum SizeClass { S, M, L, Xl }
+     impl SizeClass { pub(crate) fn name(self) -> &'static str { /* "S","M","L","XL" */ } }
+     fn size_class_for(bytes: usize, huge: usize, large: usize, xl: usize) -> SizeClass
+     pub(crate) fn size_class(bytes: usize) -> SizeClass  // with the three switches
+     ```
+  3. `compile_slots(bytes, graphics)` (`real.rs:4171`): giant when `bytes >= GIANT_DRIVER_COMPILE`,
+     or when `!graphics && bytes >= xl_pso_bytes()`; else as today.
+  4. `Slots` gets `large: AtomicUsize` (changed under `n`'s lock); every `Slots` literal (three
+     statics and the test ones) gets `large: AtomicUsize::new(0)`.
+  5. `fn large_cap(cap: usize, workers: usize) -> usize { cap.saturating_sub(1).max(1).min(workers.saturating_sub(2).max(1)) }`.
+  6. `big_compile_turn(slots, need, commit_free, wanted, preload, large: bool)`: the admission
+     test becomes `*n < cap && !gives_way && (!large || slots.large.load(SeqCst) < large_cap(cap, crate::gpu::recomp::dxc::compile_threads()))`;
+     on admission, `if large { slots.large.fetch_add(1) }`. `SlotGuard` gets a fourth field
+     `large: bool`; `Drop` does `large.fetch_sub(1)` when set. All existing callers pass `false`.
+  7. `driver_compile_identified`: `let class = size_class(bytes); let graphics = !kind.contains("compute");`
+     - `let large = !graphics && class == SizeClass::L;`
+     - wanted: `if !graphics && class == SizeClass::Xl { never wanted } else { build_is_wanted }`
+       (pass `|| false` or `super::pso_async::build_is_wanted`; the `impl Fn` parameter takes a
+       boxed or two-arm closure: `let xl = …; move || !xl && super::pso_async::build_is_wanted()`).
+     - Gauges: `static LARGE_HELD: AtomicUsize` (+1 from just before the gate to just after the
+       driver call, when `class >= L` and the thread is `xcl-pso*`), `static IN_DRIVER: AtomicUsize`
+       (+1 around `build()`), with guards so a panic decrements. `pub(crate) fn large_held() -> usize`,
+       `pub(crate) fn in_driver() -> usize`.
+     - Graphics anomaly: when `graphics && class >= SizeClass::L`, warn
+       `"D3D12.X: a graphics pipeline of {bytes} B DXIL (class {}): expected S or M"` for the first
+       8 and then powers of two.
+- **Changes in `pso_async.rs`:**
+  1. `Facts` gets `background: AtomicBool`. `note_size(bytes)` (Q1) also: if the pending is
+     compute and `real::size_class(bytes) == Xl`, set `background` and `p.cv.notify_all()` under
+     `p.done`'s lock (so a waiter re-checks).
+  2. `Unbuilt::Background` (`background`), checked in `why_of` after `Failed` and before
+     `ImageOnly`.
+  3. `fn stop_waiting(p: &Pending) -> bool { p.facts.background.load(Acquire) }` (Q5 adds
+     `abandoned`). Every `wait_timeout_while` / `wait` loop on `p.done` for a bind uses
+     `!*d && !stop_waiting(p)` as the condition (`wait_in_frame`, both loops of
+     `resolve_wait_inner`, `resolve_within`).
+  4. `resolve_wait_inner` (`pso_async.rs:1560`): `if p.spared.load(Acquire) || p.facts.background.load(Acquire) { return resolve_spared(&p, pso); }`.
+     In `resolve_spared`, the "writes only images" info line is logged only when `p.spared` is set.
+  5. `pub(crate) fn large_known(p: &Pending) -> bool`: compute and
+     `real::size_class(p.facts.dxil_bytes.load()) >= SizeClass::L` (bytes 0 → false). Used by Q7.
+- **Tests:**
+  - `real::big_compile_tests::size_classes_follow_the_thresholds`: `size_class_for` with 256 KiB /
+    768 KiB / 2 MiB: 100,000 → S; 262,144 → M; 786,431 → M; 786,432 → L; 1,603,828 → L;
+    2,077,556 → L; 2,097,152 → XL.
+  - `large_builds_leave_a_slot_for_medium_ones`: a test `Slots { most: 3, wanted_most: 3 }`: two
+    `large` turns admitted; a third `large` turn on another thread is not admitted within 150 ms;
+    an M turn is admitted at once; dropping one L guard admits the waiting L.
+  - `large_cap_keeps_a_slot_and_two_workers`: `large_cap(4, 15)` = 3; `(5, 15)` = 4; `(1, 15)` = 1;
+    `(5, 3)` = 1; `(64, 6)` = 4.
+  - `xl_compute_takes_the_giant_lane`: `compile_slots(2 << 20, false)` is `GIANT_COMPILES`;
+    `compile_slots(2 << 20, true)` is `GRAPHICS_COMPILES`; `compile_slots((2 << 20) - 1, false)` is
+    `BIG_COMPILES`; `(4 << 20, true)` is giant.
+  - `pso_async`: `an_xl_program_is_not_waited_for_once_its_size_is_known`: lazy compute job that
+    calls `note_size(3 << 20)`, then blocks 2 s; a test thread calls `resolve_wait` (test mode
+    waits until built): it returns the stand-in within 300 ms of the job's `note_size`;
+    `why_unbuilt` = Background.
+- **Acceptance:** tests pass; existing `big_compile_tests` pass unchanged except the new field in
+  literals. Retail run: no `pipeline` event with `class` L shows overlapping driver intervals
+  above `large_cap` (Q3 reports the maximum concurrent L from `t - compile_ms` intervals).
+- **Size:** about 150 production and 110 test lines.
+
+#### Q5. Per-build timeouts, abandon, quarantine (`real/compile_watch.rs`, `real.rs`, `pso_async.rs`)
+
+- **Inputs:** Q4 committed.
+- **Outputs:** the `xcl-pso-watch` monitor; abandon and quarantine; replacement workers;
+  `Unbuilt::Abandoned`, `Unbuilt::Quarantined`; outcome `quarantined`; `telemetry_compile_timeout`
+  stub.
+- **New file `hle/d3d12x/real/compile_watch.rs`** (declared in `real.rs` next to
+  `pub(super) mod dispatch_chain;` at 4767 as `pub(super) mod compile_watch;`):
+  ```rust
+  //! Driver compiles past their time: a soft limit logs, a hard one abandons the build (its waiters
+  //! go on, its slot's count is freed, its worker is replaced); an XL one also quarantines its key.
+  pub(crate) struct Limits { pub soft: Duration, pub hard: Duration, pub quarantine: bool }
+  pub(crate) fn limits(class: SizeClass, compute: bool) -> Limits   // table of 4.3
+  pub(crate) fn hard_timeouts_on() -> bool                           // XCL_PSO_HARD_TIMEOUTS, default on, "0" off
+  pub(super) struct SlotRelease { pub slots: &'static Slots, pub preload: bool, pub large: bool, pub released: Arc<AtomicBool> }
+  pub(super) struct Watched(u64);                                    // Drop: remove; if abandoned, pso_async::worker_returned(is_worker)
+  pub(super) fn enter(class, compute: bool, bytes: usize, record: Option<u64>, slot: Option<SlotRelease>) -> Watched
+  #[derive(Debug, PartialEq)] enum Due { Soft(u64), Hard(u64) }
+  fn due(entries: &mut BTreeMap<u64, Entry>, now: Instant, hard_on: bool) -> Vec<Due>   // pure on the map; marks them
+  fn monitor()                                                       // thread "xcl-pso-watch", every 250 ms while entries exist (Condvar like OPEN_CV)
+  ```
+  `Entry { started, class, compute, bytes, record, build: Option<pso_async::BuildHandle>, is_worker: bool, soft_done, hard_done, slot: Option<SlotRelease> }`.
+  - Soft: `xlog_info!` (first 32, then powers of two)
+    `"D3D12.X: a {class} {kind} driver compile ({bytes} B, record …) has run {ms} ms"`;
+    `crate::report::telemetry_compile_timeout(false, compute, class.name(), bytes, record, ms, false)`.
+  - Hard (when `hard_timeouts_on()`): `xlog_warn!` (first 32) "… past its hard limit of {s} s: its
+    calls go on without it and its worker is replaced{, its key is quarantined}"; release the slot
+    count (`release_count`, below); `build.abandon(quarantine)`; `pso_async::worker_abandoned(is_worker)`;
+    telemetry with `hard = true`, `quarantined`.
+- **Changes in `real.rs`:**
+  1. `SlotGuard` gets `released: Arc<AtomicBool>`. `fn release_count(slots: &Slots, preload: bool, large: bool, released: &AtomicBool)`:
+     if `!released.swap(true)`: lock `n`, `preloads -= 1` if preload, `large -= 1` if large,
+     `*n -= 1`, `cv.notify_all()`. `SlotGuard::drop` calls it, then subtracts its commit
+     reservation (always, as today).
+  2. `driver_compile_identified`: after the gate, build `SlotRelease` from the guard (when
+     gated); right before `let started = …`:
+     `let _watch = compile_watch::enter(class, !graphics, bytes, record.map(|r| r.0), slot_release);`
+     dropped right after `build()` returns.
+- **Changes in `pso_async.rs`:**
+  1. `pub(crate) struct BuildHandle(Arc<Pending>)`; `pub(crate) fn current_build() -> Option<BuildHandle>`
+     (clone of `BUILDING`); `pub(crate) fn is_worker() -> bool` (`IS_WORKER`).
+  2. `impl BuildHandle { pub(crate) fn abandon(&self, quarantine: bool) }`: set `facts.abandoned`,
+     `late`; under `p.done`'s lock `p.cv.notify_all()`; if `quarantine && key != 0`, insert into
+     `static QUARANTINE: Mutex<Option<HashSet<u64>>>`.
+  3. `static ABANDONED: AtomicUsize`; `pub(crate) fn worker_abandoned(is_worker: bool)`: if
+     `is_worker`: `ABANDONED += 1`, then the spawn loop of `park()` with
+     `extra_needed(w, PARKED + ABANDONED, n)`. Refactor: move `park`'s spawn loop into
+     `fn top_up()`, called by `park` and `worker_abandoned`. `pub(crate) fn worker_returned(is_worker)`:
+     `ABANDONED -= 1` when `is_worker`.
+  4. `stop_waiting` also returns true when `facts.abandoned`.
+  5. `Unbuilt::Abandoned` (`abandoned`) and `Unbuilt::Quarantined` (`quarantined`); `why_of`: not
+     done and `abandoned` → Abandoned (before Late); done and outcome quarantined → Quarantined.
+  6. `const OUTCOME_QUARANTINED: u8 = 3;` `static GATED: AtomicUsize`. In `build()` before running
+     the job: if `p.key != 0` and the key is quarantined: set outcome, drop the job, mark done
+     (as `drop_unstarted_job` does, plus `GATED += 1`), return. `complete()`: when `real == 0` and
+     the outcome is not `FAILED`, count `GATED`, not `FAILED`.
+  7. `pub fn gated() -> usize`. `QueueGauges` gets `pub abandoned: usize`.
+  8. `BuildRecord.abandoned` from `facts.abandoned`.
+- **Changes in `telemetry_gpu.rs`:** stub
+  `pub fn telemetry_compile_timeout(_hard: bool, _compute: bool, _class: &str, _bytes: usize, _record: Option<u64>, _ms: u64, _quarantined: bool) {}`.
+- **Tests:**
+  - `compile_watch`: `limits_follow_class_and_kind` (the 4.3 table, eight rows).
+  - `compile_watch`: `due_gives_soft_then_hard_once` (an L entry: at 59 s nothing; 61 s Soft;
+    61.5 s nothing; 451 s Hard; 460 s nothing; with `hard_on` false only Soft).
+  - `real::big_compile_tests`: `a_released_slot_count_is_given_back_once` (`most: 1`: take a
+    guard; `release_count` through its flag; a second turn is admitted; dropping the first guard
+    leaves `n` = 1, not 0, and no underflow).
+  - `pso_async`: `an_abandoned_worker_is_replaced` (takes `WORKER_SATURATION_LOCK`): fill every
+    general worker with compute jobs that call `worker_abandoned(true)` and block (5 s timeout);
+    submit one more compute job; it runs within 2 s; release; `ABANDONED` returns to its value
+    before.
+  - `pso_async`: `an_abandoned_pipeline_is_not_waited_for`: a blocking lazy compute job; a test
+    thread in `resolve_wait`; from another thread `BuildHandle(p).abandon(false)`; the wait returns
+    the stand-in within 300 ms; `why_unbuilt` = Abandoned.
+  - `pso_async`: `a_quarantined_key_is_not_built_again`: quarantine key K; `submit_lazy` with key K
+    and a job that sets a flag; `resolve`; wait until done (2 s): the flag is not set;
+    `why_unbuilt` = Quarantined; `gated()` grew by 1; `counts().1` (failed) did not.
+- **Acceptance:** tests pass. Retail run: no `pipeline` compute L event with `compile_ms` above
+  450,000 without a matching `compile_timeout` hard event; `activity.pso_workers_abandoned`
+  returns to 0 after each abandoned compile returns.
+- **Size:** about 230 production and 150 test lines.
+
+#### Q6. Phase marks for the runtime (`telemetry_run.rs`)
+
+- **Inputs:** Q2 committed (same file).
+- **Outputs:** `phase_mark_class()`, `phase_class_of`, a mark-only poller.
+- **Changes:**
+  1. `pub const PHASE_UNKNOWN: u8 = 0; pub const PHASE_STILL: u8 = 1; pub const PHASE_PLAY: u8 = 2;`
+  2. Pure `pub fn phase_class_of(name: &str) -> u8`: `world` → PLAY; `boot`, `intro`, `loading`,
+     `menu`, `cutscene`, `splash`, `credits` → STILL; `auto` and anything else → UNKNOWN.
+  3. `static MARK_CLASS: AtomicU8`; `fn set_mark(name: &str)` stores `phase_class_of(name)`.
+  4. In `telemetry_poll_thread`: where `file.poll()` returns `Some(name)`, call `set_mark(&name)`
+     (for `auto` too, which clears it); where a schedule entry is due, `set_mark(name)`.
+  5. `pub fn phase_mark_class() -> u8`: a `static START: Once` that, when
+     `!telemetry_on(Tier::Frame)`, spawns `xcl-phase-mark`: the same `PhaseFile` and schedule
+     parsing as `telemetry_poll_thread`, every 250 ms, calling `set_mark` only (no events, no
+     warnings beyond the existing ones). The logs folder comes from
+     `crate::state::boot().map(|b| b.logs_dir())`; with none, only `XCL_PHASE_FILE` and the
+     schedule are used. Then returns `MARK_CLASS.load(Relaxed)`.
+- **Tests (`telemetry_p5c_tests`):** `phase_names_map_to_classes` (every name above, `auto`,
+  `bench1`); `a_mark_sets_the_class_and_auto_clears_it` (`set_mark("intro")` → STILL,
+  `set_mark("world")` → PLAY, `set_mark("auto")` → UNKNOWN).
+- **Acceptance:** tests pass; on the PC with telemetry off, writing `intro` to the phase file is
+  seen by `phase_mark_class()` (Q7's log line "must-draw: phase still" at the first must-draw
+  wait proves it in a run).
+- **Size:** about 70 production and 30 test lines.
+
+#### Q7. Must-draw waits (`pso_async.rs`)
+
+- **Inputs:** Q2, Q4, Q5, Q6 committed.
+- **Outputs:** the policy of 3.3; the must-draw list; must-draw builds first in their lane.
+- **Changes:**
+  1. Switches, each read once (`OnceLock`), pure parsers for tests:
+     `fn mustdraw_on() -> bool` (`XCL_MUSTDRAW`, on unless `0`);
+     `fn mustdraw_chance() -> Duration` (`XCL_MUSTDRAW_WAIT_MS`, default 10,000);
+     `fn mustdraw_frame_cap() -> Duration` (`XCL_MUSTDRAW_FRAME_MS`, default 10,000).
+     `fn list_on() -> bool` (`XCL_MUSTDRAW_LIST`, on unless `0`).
+  2. `mod must_list` (like `mod used`): file `must-draw-pipelines.txt` in
+     `crate::gpu::recomp::dxc::cache_dir()`; `parse` (shared with `used::parse`), `known(key)`,
+     `note(key)` (append when new, at most 4,096 keys, then silently stop); in-memory under
+     `cfg!(test)`; does nothing when `!list_on()`.
+  3. ```rust
+     #[derive(Clone, Copy, PartialEq, Debug)] enum Phase { Unknown, Still, Play }
+     fn phase() -> Phase  // from crate::report::phase_mark_class()
+     #[derive(Clone, Copy, PartialEq, Debug)] enum Policy { Normal, Still, PlayListed }
+     fn policy_for(on: bool, phase: Phase, must_draw: bool, listed: bool, large_known: bool) -> Policy
+     ```
+     `policy_for`: `!on || large_known` → Normal; `Still` and `must_draw` → Still; `Unknown` and
+     `listed` → Still; `Play` and `listed` → PlayListed; else Normal. (`listed` = the key is in the
+     list; `must_draw` = the flag.)
+  4. `Facts` gets `listed: AtomicBool`. `submit_as`: if `mustdraw_on() && must_list::known(key)`:
+     set `listed` and `must_draw`; when it goes to the preload list, `push_front` instead of
+     `push_back`.
+  5. `need_now` (first need, inside the `first` branch): if `mustdraw_on() && phase() == Phase::Still`
+     and the pipeline is not `large_known`: set `must_draw`; if `key != 0` and not listed,
+     `must_list::note(key)` and set `listed`. Push into the lane with `front = must_draw` (pool U1's
+     `push(lane, item)` gets a `front: bool`; `true` uses `push_front`; every existing caller passes
+     `false`).
+  6. `static MUSTDRAW_FRAME_SPENT: Mutex<(u64, u64)>`.
+  7. `wait_in_frame` becomes a wrapper over
+     `fn wait_in_frame_with(p, pso, frame, budget, counter, cap, policy: Policy, chance: Duration, frame_cap: Duration) -> Option<bool>`,
+     called with `policy_for(mustdraw_on(), phase(), must_draw, listed, large_known(p))`,
+     `mustdraw_chance()`, `mustdraw_frame_cap()`. Behaviour:
+     - `Normal`: exactly today's body.
+     - `Still`: `need_now`; `late` → None; `chance_left(p, chance)` zero → set `late`, log (first
+       32) `"D3D12.X: a must-draw {kind} pipeline was not built {ms} ms after it was first needed: drawn without it"`,
+       `telemetry_mustdraw_wait(0, true)`, None; allowance =
+       `frame_allowance(&MUSTDRAW_FRAME_SPENT, frame, frame_cap)` zero → None (not late); then
+       `allowance.min(chance_left)`, `.min(cap)` when set; wait inside `Held` and `OpenWait` with
+       condition `!*d && !stop_waiting(p) && !large_known(p)`; `frame_spend(&MUSTDRAW_FRAME_SPENT, …)`;
+       `note_blocked`; `telemetry_mustdraw_wait(took, timed_out)` where `timed_out` = not done
+       and the chance is now zero; set `late` only when `timed_out`. Return `Some(done)`.
+     - `PlayListed`: today's body with the chance check removed and `late` never set by a timed-out
+       wait; it spends the normal `counter`; `telemetry_mustdraw_wait(took, false)`.
+     - The first `Still` wait of a run logs once: `"D3D12.X: must-draw: phase still: pipelines wait up to {chance} ms"`.
+  8. `skipped` (Q1) already returns `must_draw`: no change.
+- **Tests (`pso_async` test modules; use `wait_in_frame_with` / a `resolve_draw_with_policy`
+  inner fn, no environment):**
+  - `must_draw_policy_follows_phase_and_list`: every row of 3.3 through `policy_for`, plus
+    `on = false` and `large_known = true`.
+  - `a_must_draw_pipeline_waits_past_the_frame_budget`: graphics job sleeping 300 ms; policy
+    Still, budget 50 ms, chance 2 s, frame cap 2 s: returns the real pipeline after about 300 ms;
+    `late` false; the normal draw counter for that frame unchanged.
+  - `a_must_draw_wait_ends_at_its_chance`: blocking job, chance 200 ms: returns the stand-in after
+    about 200 ms, `late` true; the next call returns in under 15 ms.
+  - `must_draw_waits_share_their_frame_cap`: two blocking jobs, frame cap 200 ms, chance 2 s:
+    first waits about 200 ms; second returns in under 15 ms, not late; in the next frame the
+    second waits again.
+  - `a_listed_pipeline_waits_every_frame_in_play`: PlayListed, budget 50 ms, blocking job: frame
+    1 waits about 50 ms, not late; frame 2 waits about 50 ms again.
+  - `must_draw_builds_go_to_the_front_of_their_lane`: with the pool's lanes locked, push a wanted
+    graphics item A, then a must-draw wanted graphics item B (`front = true`): the lane's front is
+    B. (Test the lane deque directly under the lock; no worker runs.)
+  - `a_large_compute_program_is_not_waited_for_as_must_draw`: compute job that calls
+    `note_size(1 << 20)` after 100 ms and then blocks; Still: the wait returns within 300 ms.
+  - `the_must_draw_list_is_noted_once`: `must_list::note(K)` twice → `known(K)`, one line in the
+    in-memory list.
+- **Acceptance:** tests pass, and `cargo test -p xcl --lib -- pso_async:: bind:: list_x::` and the
+  whole suite. Retail run R1 (section 9): AC8's telemetry checks.
+- **Size:** about 200 production and 170 test lines.
+
+#### Q8. Size-gate skip switch (`pso_async.rs`, `real.rs`)
+
+- **Inputs:** Q7 committed (same file).
+- **Outputs:** `XCL_PSO_COMPUTE_SKIP_BYTES`; outcome `size_gate`; `Unbuilt::SizeGate`.
+- **Changes:**
+  1. `pso_async.rs`: `fn skip_bytes() -> Option<usize>` (`XCL_PSO_COMPUTE_SKIP_BYTES`, a whole
+     number of bytes; unset, 0 or unparsable → None; read once). `fn size_gated_for(bytes, threshold: Option<usize>, building: bool) -> bool`
+     (pure: `building && threshold.is_some_and(|t| bytes >= t)`).
+     `pub(super) fn size_gated(bytes: usize) -> bool`: `size_gated_for(bytes, skip_bytes(), building_here())`;
+     when true, sets the `BUILDING` pending's outcome `OUTCOME_SIZE_GATE = 2` and logs (first 16,
+     then powers of two) `"D3D12.X: a compute program of {bytes} B DXIL is not built (XCL_PSO_COMPUTE_SKIP_BYTES={t}): its dispatches are left out ({n} so far)"`.
+  2. `Unbuilt::SizeGate` (`size_gate`); `why_of`: done and outcome size gate → SizeGate.
+     `complete()` counts it in `GATED` (Q5's rule already does: outcome not FAILED).
+  3. `real.rs: translated_compute_pso_once`, right after Q1's `note_size` line:
+     `if super::pso_async::size_gated(dxil.len()) { return Some(Err(())); }`
+     (before the warm, chain and whole paths; `build_compute` then returns false, the job returns 0,
+     `complete` sees the outcome).
+- **Tests (`pso_async`):** `the_size_gate_is_off_unless_set_and_only_on_workers`
+  (`size_gated_for` table: None; Some(786,432) with 786,431 and 786,432; `building` false);
+  `a_size_gated_program_is_left_out_not_failed` (lazy compute job that calls `size_gated` via a
+  test seam `size_gated_with(bytes, Some(1))` and returns 0: `why_unbuilt` = SizeGate, `gated()`
+  +1, failed unchanged).
+- **Acceptance:** tests pass. Diagnostic run (not an acceptance run):
+  `XCL_PSO_COMPUTE_SKIP_BYTES=786432` gives `dispatch_skip_size_gate` > 0, `pipeline_ready` with
+  `outcome` `size_gate` for every such key, and `manifest.compare_key` naming the switch (Q9).
+- **Size:** about 50 production and 50 test lines.
+
+#### Q9. Per-build record, gauges, timeout events, unbuilt at the end (telemetry files)
+
+- **Inputs:** Q5 committed; Q4's `large_held`, `in_driver`, `size_class`; Q1's getters.
+- **Outputs:** the `pipeline_ready` extension, `pipeline` fields, `compile_timeout`,
+  `pipeline_unbuilt`, flat worker gauges, the diagnostic switch.
+- **Changes in `telemetry_gpu.rs`:**
+  1. `telemetry_pipeline_ready(r)`: write when `r.need.is_some() || r.outcome != "built" || r.skips > 0 || r.abandoned`.
+     Fields from pure `fn pipeline_ready_fields(r: &BuildRecord, class: &str) -> Vec<(&'static str, Value)>`:
+     U3's `stage`, `need_ms` (null when None), `late`, `ok`, plus `key` (16 hex), `class`,
+     `dxil_bytes`, `queued_ms`, `held_ms` (null when None), `gate_ms`, `waited_ms`, `skips`,
+     `must_draw`, `abandoned`, `outcome`. All ms with 3 decimals.
+  2. `telemetry_pipeline_built`: add `class` (`size_class(dxil_bytes).name()`), `queued_ms`
+     (`pso_async::queued_here()`, null when None) and `must_draw` (`must_draw_here()`) to the
+     `pipeline` event. `log.rs`'s `PipelineFacts` is in the appended part: add the three fields
+     there and in `pipeline_fields_built`. (This makes Q9 touch `log.rs` too; Q8 does not touch it.)
+  3. Fill Q5's stub, with one more parameter `worker: bool` (the monitor thread writes the event,
+     so the builder cannot be read from the thread name; Q5's entry keeps `is_worker`):
+     `telemetry_compile_timeout(hard, compute, class, bytes, record, ms, quarantined, worker)`.
+     Event `compile_timeout` (tier `frame`): `kind` (`soft`/`hard`), `stage`, `class`,
+     `dxil_bytes`, `record` (16 hex or null), `driver_ms`, `quarantined`, `worker`. Q9 changes
+     Q5's one call in `real/compile_watch.rs` to pass `entry.is_worker` (one line).
+- **Changes in `telemetry_run.rs`:**
+  1. `telemetry_activity` appends flat gauges: `pso_workers_busy` (`queue_gauges().busy`),
+     `pso_workers_abandoned` (`.abandoned`), `pso_large_held` (`real::large_held()`),
+     `pso_in_driver` (`real::in_driver()`), `pso_gated` (`pso_async::gated()`), from pure
+     `fn activity_worker_fields(busy, abandoned, large_held, in_driver, gated)`.
+  2. `write_end`: after `loop_counters_end()`, `pipelines_unbuilt_end()`: once (an `AtomicBool`),
+     at tier `frame`, `for r in pso_async::unbuilt_records(2000)` write `pipeline_unbuilt` with
+     `pipeline_ready_fields(&r, class)`.
+  3. `diagnostic_switches`: add `XCL_PSO_COMPUTE_SKIP_BYTES` to the valued switches (listed when
+     non-empty and not `0`).
+- **Tests:**
+  - `telemetry_gpu`: `pipeline_ready_fields_carry_the_build_record` (a hand-made record: every key,
+    `need_ms` null when None, `key` 16 hex).
+  - `telemetry_gpu`: `compile_timeout_fields` (pure fields fn).
+  - `telemetry_run`: `activity_worker_fields_are_flat`; `unbuilt_lines_are_written_once`
+    (call the once-latch twice with a counter sink, pure seam).
+  - `telemetry_run`: extend the diagnostic test with `XCL_PSO_COMPUTE_SKIP_BYTES=786432` listed
+    and `=0` not listed.
+  - `log`: `pipeline_fields_built_carry_class_and_queue_time`.
+  - `telemetry_e2e::activity_events_mirror_the_log`: the five new `activity` keys exist.
+- **Acceptance:** tests pass; in the acceptance run `pipeline_ready`, `pipeline.class` and
+  `pipeline_unbuilt` exist; `pso-summary.py` has no N/A for fields this unit provides.
+- **Size:** about 150 production and 100 test lines.
+
+#### Q10. Docs (`README.md`, `docs/guide/telemetry.md`)
+
+- `README.md`, the huge-pipeline paragraph: two sentences on classes and timeouts; the switches
+  `XCL_MUSTDRAW`, `XCL_MUSTDRAW_WAIT_MS`, `XCL_MUSTDRAW_FRAME_MS`, `XCL_MUSTDRAW_LIST`,
+  `XCL_PSO_L_BYTES`, `XCL_PSO_XL_BYTES`, `XCL_PSO_HARD_TIMEOUTS`, `XCL_PSO_COMPUTE_SKIP_BYTES`;
+  the phase file now also steers must-draw waits.
+- `docs/guide/telemetry.md`: §5.3 `frame` new fields (rule "absent = 0" for skip fields); §5.5
+  `pipeline` new fields, `pipeline_ready` (with pool U4's text), `pipeline_unbuilt`,
+  `compile_timeout`; §5.8 `activity` fields, `error` kind `pipeline_wait_expired`; §5.9 marks
+  steer the runtime; §6 `pso-summary.py`.
+- PR note: `HANDOFF.md` or `docs/specs/` statements that every compute build in the background
+  shares one lane, or that a build cannot be given up on, become wrong; say so, do not edit them.
+- **Acceptance:** review only.
+
+### 8. Concurrency plan
+
+| Wave | Units | Files written | Why they can run together |
+|---|---|---|---|
+| 1 | Q1, Q3 | Q1: `pso_async.rs`, `real.rs` (2 lines), `telemetry_gpu.rs` (stub, U3 signature). Q3: `scripts/dev/*` | no shared file |
+| 2 | Q2, Q4 | Q2: `telemetry_gpu.rs`, `telemetry_run.rs`, `log.rs`, `bind.rs`, `console_list.rs`. Q4: `real.rs`, `pso_async.rs` | no shared file |
+| 3 | Q5, Q6 | Q5: `real/compile_watch.rs`, `real.rs`, `pso_async.rs`, `telemetry_gpu.rs` (stub). Q6: `telemetry_run.rs` | no shared file |
+| 4 | Q7 | `pso_async.rs` | needs Q5, Q6 |
+| 5 | Q8, Q9 | Q8: `pso_async.rs`, `real.rs`. Q9: `telemetry_gpu.rs`, `telemetry_run.rs`, `log.rs`, `tests/telemetry_e2e.rs`, one line in `real/compile_watch.rs` | no shared file (Q8 does not touch `compile_watch.rs`) |
+| 6 | Q10 | `README.md`, `docs/guide/telemetry.md` | last |
+
+Each runtime unit (Q1, Q2, Q4, Q5, Q7, Q8; Q6 and Q9 only touch fork files) needs a
+`scripts/smoke.ps1` pair before any upstream PR (CONTRIBUTING.md item 3). These are fork units on
+`dev`; the pair is still the regression check.
+
+### 9. Acceptance runs on the retail title
+
+**Build.** `dev` with pool U1-U4 and Q1-Q9, clean tree, release, on the PC (RTX 5080, driver
+32.0.16.2140, 16 logical CPUs, 63 GB). Same input as run 12, then a static scene.
+
+**R1 "blob-cold", marked.** Before the run, move aside XCL's driver-blob folder and the driver's
+own shader cache; keep the DXIL cache (otherwise DXC alone takes hours; see deviations). No
+`must-draw-pipelines.txt`.
+- Switches: `XCL_TELEMETRY=pass XCL_TELEMETRY_SAMPLE=30 XCL_ACTIVITY=1 XCL_RUN_SECONDS=1200
+  XCL_THREAD_DUMP_AT=300,600 XCL_UMA_MB=4095 XCL_STALL_DUMP=120`. No other `XCL_PSO_*`.
+- Marks: the run script writes `intro` to `<logs>\phase` 2 s after launch (the content at start is
+  ignored), and `world` when the HUD is on screen. Who decides "HUD on screen": a screenshot sent
+  to the user (memory rule: label from a screenshot, do not guess). Screenshots every 10 s from
+  launch to 300 s for AC8, then every 60 s.
+- Duration 1,200 s: 13+ minutes after the scene start (O5 window).
+**R2 "warm", unmarked.** Right after R1, same switches, no marks. It uses R1's
+`must-draw-pipelines.txt` and driver blobs. Screenshots as R1.
+**Evaluate:** `python scripts/dev/pso-summary.py <run> --check --config cold` (R1) and
+`--config warm` (R2).
+
+| AC (§13) | How the checker evaluates it | R1 (cold) target | R2 (warm) target |
+|---|---|---|---|
+| AC1 | sum `ei_draw_skip_*` / `ei_draw_total` | ≤ 0.1 % whole run | 0 post-warmup |
+| AC2 | sum `draw_standin_*` / (`draw_total - ei_draw_total`) | ≤ 0.1 % | 0 post-warmup |
+| AC3 | no-output draws / `draw_total` | ≤ 1 % whole run; ≤ 0.1 % post-warmup | same |
+| AC4 | dispatch skips per frame measured (fields present → "measured" with p50/p95/max) | measured | 0 `dispatch_skip_*` except `image_only` post-warmup ("no culling pass skipped" proxy: none outside image-only) |
+| AC5 | no PCS exists: proxy = every graphics `pipeline_ready` with `t - need_ms` in [scene, scene+120 s] has `t ≤ scene + 120 s`, and no graphics `pipeline_unbuilt` first needed in that window; P0/P1 = `pipeline_ready` with `need_ms` set: p95 of `queued_ms + gate_ms` ≤ 100 ms | as stated | as stated |
+| AC6 | `activity.pso_q` lanes UG + UC + S (P2+P3) = 0 at some sample ≤ scene + 600 s; report the number of increases after that (allowed: new pipelines) | as stated | as stated |
+| AC7 | (a) every `pipeline` compile_ms ≤ the hard limit of its class, or a `compile_timeout` hard event for it exists (abandoned workers are not counted as held); (b) every `activity` sample: `pso_workers.reserved + pso_workers.general - pso_workers.parked - pso_workers_abandoned - pso_large_held` ≥ 2 | both | both |
+| AC8 | in `Still` windows: `mustdraw_skipped` = 0; every must-draw `pipeline_ready` with `waited_ms` ≤ 10,000; report the share ≤ 2,000; plus all intro cards seen in the screenshots (person checks) | marked windows (R1) | the same time span as R1's marks (R2 has none: pass `--still-span a-b` copied from R1) |
+| AC10 | `report.json` `d3d12.background_pipelines[1]` = 0 and no `pipeline_ready` `outcome: "failed"` | 0 | 0 |
+| §12.2 rule | U7-sufficient if: P0/P1 queue-wait p95 ≤ 100 ms, AC1 and AC2 post-warmup pass, and no 3 consecutive `activity` samples (≥ 5 s) with `pso_large_held ≥ pso_workers.general` | reported | reported |
+| Safety | no device removal, no crash; `builds_title` 0; peak `committed_mb` ≤ 125 % of run 12's | as stated | as stated |
+
+A run that crashes for an unrelated reason counts up to the crash and is marked partial. `--check`
+lines that need a field the build lacks print N/A, never PASS. For R2, pass R1's marked spans
+with Q3's `--still-span`.
+
+### 10. Alternatives considered and dropped
+
+- Adopting #2625 for cause counting (5.1).
+- An automatic phase guess or latch for policy (3.4, 4.2 B3/B4); input or present cadence (B5);
+  presented-target draws as must-draw (B6).
+- A separate must-draw frame budget inside 100 ms in `Still` (would not have drawn the cards that
+  went missing at 100 ms in runs 10-11).
+- A dedicated L lane with `n/4` slots (4.3 C-a), and no L cap (C-c).
+- Releasing an abandoned build's commit reservation with its slot (would admit compiles into memory
+  the stuck one still uses).
+- Discarding an abandoned build's late result (the pipeline is valid; throwing it away costs a
+  rebuild).
+- Size hints from earlier runs so reserved workers could take small compute (would cover the
+  compute half of the P0/P1 reservation; deferred until the checker shows AC7 (b) or AC5 failing
+  for compute).
+- A runtime-written summary every 60 s (duplicates the script in Rust; `events.jsonl` already
+  survives a killed run).
+
+### 11. Deviations from the user's spec
+
+| Spec | The spec says | This design does | Why |
+|---|---|---|---|
+| §7.2 | Four priorities P0-P3 with deadlines | P0 = must-draw at the front of the wanted lanes; P1 = wanted lanes (WG, WC); P2 = `resolve`-sent lanes (UG, UC) and preloads; P3 = UC, image-only (S), preloads | pool U1's lanes are the approved queue; no new queue |
+| §7.2 | Priority aging: P3 promoted after 60 s | not built | it would break pool U2's invariant I4 (no image-only build while a wanted build waits); image-only dispatches are left out by design |
+| §7.4 | XL > 1.6 MB | XL ≥ 2 MiB (`XCL_PSO_XL_BYTES`) | run 12 built a 2,077,556 B program normally (blob, 33 ms) and the observed slow programs reach 1,603,828 B; at 1.6 MB the boundary would make known-good programs XL |
+| §7.4 | L lane: at most `max(1, floor(workers/4))`, ≤ workers - 2 | L shares the compute lane, at most `cap - 1` slots (3 unwanted / 4 wanted on the PC), ≤ workers - 2 | measured peak at 4 slots on a 16-thread RTX 5080 (#2098); memory envelope unchanged; the worker reason is met by the graphics reserve |
+| §7.4 | XL: quarantine lane, at most 1, background only | the existing giant lane (1 slot), never wanted (always behind commit headroom), never waited for | reuses the lane; "background only" made concrete |
+| §7.4 | Graphics L/XL logged | logged; lanes unchanged (graphics lane below 4 MiB) | run 12: three graphics L builds, 6-8 ms each |
+| §7.4 | Hard invariant: ≥ 2 workers for P0/P1 | hard for graphics (pool U1 reserve, k = 3); for compute only U7's extra workers; measured by AC7 (b) | size is known only after pickup, so a reserved worker cannot safely take compute |
+| §7.6 | S/M graphics 1 s / 10 s | 2 s / 60 s | run 12 cold graphics M builds took 14.0-21.3 s and succeeded |
+| §7.6 | S/M compute 2 s / 20 s | 5 s / 120 s | run 12 cold compute S up to 22.6 s, M up to 48.0 s |
+| §7.6 | L 60 s / 300 s | 60 s / 450 s | run 12 cold compute L up to 374.5 s (spec's 245 s is from run 10) |
+| §7.6 | Timeouts per build | per driver compile, driver time only | the driver call is the uncancellable part; gate waits have their own rules |
+| §7.6 | Abandon: replacement within cap; keep or discard | keep a valid late result always; free the slot's count, keep its commit reservation | see section 10 |
+| §7.5 / §7.6 | Out-of-process helper preferred for L/XL | deferred | section 4.4 |
+| §7.7 | `Submit/Query/WaitFor/SetLaneLimits/Drain`; every transition emits an event | mapped onto existing functions plus `why_unbuilt`; lane limits by switch; events only for terminal and exceptional transitions | event volume (56 k pipelines a run) |
+| §8.3 | Direct draw: stand-in or fast generic variant | stand-in only; `direct_draw_generic_variant` not built | §6.3 is out of scope |
+| §8.3 | Dependent compute passes must-draw | not detected; all compute is must-draw in `Still` (except known L/XL); the cascade is counted (`ei_after_skipped_dispatch`) | no cheap producer-consumer tracking; containment is the GPU-stall work (#1795, option R1) |
+| §8.4 | Phase "detected" (by phase or capture tag) | phase from marks only (file, schedule); per-title list keyed by shader-set key, not `PipelineKey` | the guess misclassifies gameplay (3.4); `PipelineKey` (§3.4) is not built; the shader-set key is the fork's existing per-title key |
+| §8.5 | Non-interactive: no 100 ms cap, 10 s per pipeline | as stated, plus at most 10 s of must-draw waits per frame | bounds a frame's hold when many must-draw pipelines arrive in one frame |
+| §8.5 | Gameplay: 100 ms per frame for must-draw | listed pipelines wait every frame inside the existing 100 ms draw budget (no one-chance rule); no separate budget | keeps the frame cost of gameplay as today |
+| §8.5 | Default when unknown | not specified; here: today's rules except listed keys | no reliable automatic phase |
+| §9.3.1 | XL to the quarantine lane, never on the gameplay path | XL never waited for; nothing compiles on title threads already (stall-fix U4/U5) | - |
+| §9.3.2 | `compute_skip_threshold_bytes`, default off, 768 KB diagnostic | `XCL_PSO_COMPUTE_SKIP_BYTES` in bytes, off, `diagnostic`; only on pool and preload workers | fork's switch naming; tools and `XCL_ASYNC_PSO=0` unaffected |
+| §9.3.6 | Memory guard 4 GB per compile, kill and quarantine | admission only (XL never bypasses headroom; one XL at a time); no per-compile cap | needs the helper process (4.4) |
+| §11.1 | Counter names | spec names kept where they are single values; reason-split counters become `<name>_<reason>` fields; `draw_no_output_ratio` derived in the summary | flat events (telemetry guide §5.3) |
+| §11.1 | `queue_depth` sampled at 1 Hz | 2 s (`activity`) | one sampler |
+| §11.1 | `psdb_*`, `driver_cache_hit_estimate`, `precache_*`, `direct_draw_generic_variant`, `slot_denied_requeue` | not built | their sections (§3, §5, §6, §7.5) are out of scope |
+| §11.1 | `cache_hit_layer` = layer pipeline cache hit at bind | = the pipeline was built at its first bind (from any source: preload, blob, DXIL cache) | the fork's bind-time notion of "ready" (`pso_manifest` `ready`) |
+| §11.1 | Per-scene breakdown | scenes = mark spans; per minute after the scene start, in the summary | no scene id in the runtime |
+| §11.2 | Summary written by the runtime at exit and every 60 s | offline script, any time during or after a run | `events.jsonl` is durable line by line; no second implementation in Rust |
+| §11.2 | GPU markers around skipped draws | deferred | 4.1 "What stays out" |
+| §12.1 / §13 | Cold = layer and driver caches cleared | "blob-cold": driver blobs and the driver's cache cleared, DXIL cache kept | a full DXC rebuild takes hours; the driver compile is the measured cost (O4) |
+| §12.2 | "every worker held by L/XL" | every **general** worker (`pso_large_held ≥ general`) | the reserve never takes compute |
+| §12.3 | Nsight / RenderDoc confirmation of O6 | layer-side counts and per-key attribution only (`dispatch_skip_*`, `pipeline_ready.skips`, `pipeline_unbuilt`) | captures at 2 fps are not practical now; do them once frames are healthy |
+| §12.5 | Tests: aging, slot-denied requeue | not written (features not built); synthetic stress uses ms-scale stand-ins for 60-300 s compiles | - |
+| §13 AC5 | "full predicted (PCS) graphics set" | proxy: graphics pipelines first needed in the first 120 s are built by scene + 120 s | no PCS (§3 out of scope) |
+| §13 AC7 | "No worker held longer than the hard timeout" | no worker **counted as available** is held past it; abandoned workers are replaced | an in-process driver call cannot be stopped |
+| §13 AC8 | "All intro cards drawn" | telemetry proxy plus a person's screenshot check | telemetry cannot see a card |
+
+### 12. What I could not check
+
+- Nothing was built or run; the Mac cannot build the crate.
+- Pool U1 is on `dev` (6c0f9b15) and matches the names used here. Pool U2 and U3 are not; U3's
+  `telemetry_pipeline_ready` signature and U2's `gate_gauges` are taken from the approved entry.
+- Pool U3, as approved, writes `pso_workers` and `pso_gate` on `activity` as nested JSON objects.
+  The telemetry guide says events stay flat, with arrays of plain numbers only (§5.3,
+  `docs/guide/telemetry.md:142-145`). This design adds only flat fields. The orchestrator should
+  decide whether U3 flattens them (`pso_workers_general`, …); Q3's checker reads either form.
+- Whether the cards' pipelines are cold graphics M builds (14-21 s) is unknown; AC8 on a
+  blob-cold run depends on it.
+- Whether #2625 merges into `dev` was not tried (not adopted anyway).
+
+## 2026-11-26 Shader delivery spec v1, design 2: capture set, cache store, prewarm, precache, measurements, run configurations (the user asked for their spec to be incorporated; orchestrator approved the design; deviations reported to the user)
+
+Same requirements document as design 1. This entry is the design for its sections 3, 4, 5, 6,
+9.3 (items 3-5, as measurement), 10 (as measurement), 12.1 and AC5, AC6, AC9, AC11, drafted by an
+Opus design worker on dev at 20941768 and reviewed by the orchestrator. Its units are named
+U1-U13 inside this entry (they are not the U-numbers of the stall-fix entries); refer to them as
+"capture U<n>". Section 10 lists every departure from the user's spec. The ASD export and PSDB
+consumption of the spec's section 3 are not designed: the build and test PC has no network.
+
+Status: draft for the orchestrator's review. Nothing here is built or run. Code citations are
+`crates/xcl/src/...` on `dev` at 20941768. Upstream PRs were read as text only
+(`gh pr view/diff -R xcl-dev/xcl`, 2026-11-26). The user's spec is "Spec - Shader Delivery &
+Pipeline Compilation Optimization v1"; section numbers below are the spec's ("spec 3.3").
+The one measurement in this file that is new was made with a helper script on existing run
+folders (run 12 and run 13, RTX 5080): `scratchpad/spec-capture-tools/dxil_breakdown.py`
+(`python3 -I dxil_breakdown.py <run folder>`). It prints aggregates only.
+
+---
+
+### Summary (recommendation first)
+
+**Recommendation.** Build "ready before use" on what XCL already has. Do not add a second
+store or a second key. Add four things, in this order:
+
+1. **Measure first (small).** A `xcl cache --clear-driver` command and a fork-only run script
+   give repeatable Cold, Warm and Prewarmed runs. Cold uses a fresh XCL cache folder (the user's
+   caches are never deleted) and clears the driver's cache through the D3D12 API for `xcl.exe`
+   only. A telemetry check proves each Cold run was cold. (U1, U12)
+2. **Fix the store contract (small).** Driver blobs move under a folder named by the adapter and
+   driver identity, and each blob file gets a checksum header. A driver change then leaves the
+   DXIL and the capture untouched and starts a new blob folder. (U3)
+3. **Capture what a title uses (medium).** Each pipeline a run builds is recorded once, with
+   its full pipeline description and its console shaders, in the title's data folder
+   (`%LOCALAPPDATA%\XCL\<title>\pipelines\capture.bin`). Each first use adds a small record:
+   scene, time since scene start, frames shown. A new capture key (shaders plus state) and a
+   pipeline key (capture key plus translator identity) appear on telemetry events. On by default;
+   `XCL_CAPTURE=0` turns it off. (U4, U5)
+4. **Use the capture twice (medium).**
+   - **Prewarm runner:** `xcl prewarm <game>` replays the capture through the runtime's own
+     pipeline builders, on threads the runtime's compile gate treats like its own workers. It
+     fills the translated-shader cache, the DXC cache, XCL's driver blobs and the driver's own
+     cache. It builds graphics too, because the capture holds the full state. It writes a
+     prewarm manifest. (U6, U7, U8)
+   - **Load-time precache:** the existing preload (`xcl-pso-pre-*`) takes its order from the
+     capture (earliest needed first, per scene) instead of creation order, and counts per scene
+     how each first use went: precached and ready, precached but late, missed, or served from a
+     prior run's cache. (U9, U9b)
+
+Measurements of DXIL size and compile cost come from existing telemetry plus two missing fields,
+an offline report and one adopted upstream tool (#1830). No translator change. (U10, U11)
+
+**Staged order (most readiness for the least code first).**
+
+| Stage | Units | Changed lines (est.) | What it gives |
+|---|---|---|---|
+| 0 | adopt #2613 through the gate (orchestrator's decision) | 290 (upstream) | every VS/PS of the pack warmed into the translated cache offline: the DXC share (64 % of a cold graphics build on our runs) leaves the title's path for the common case |
+| 1 | U1, U12a | 150 + 200 (script) | repeatable Cold / Warm / Prewarmed runs; nothing below can be judged without them |
+| 2 | U3 | 220 | the spec 4.3 contract; safe reuse across driver updates |
+| 3 | U4, U5 | 330 + 390 | the capture set (spec 3.3) and keys on telemetry |
+| 4 | U9, U9b | 300 + 150 | precache ordered by the capture, the spec 6.2 validation counts, eviction detection |
+| 5 | U6, U7, U8 | 220 + 330 + 330 | `xcl prewarm`, graphics included (spec 5.2) |
+| 6 | U10, U11, U12b, U13 | 120 + scripts + docs | spec 9.3 / 10 measurements, AC evaluation, docs |
+
+Why this order: on our PC a Warm run already makes most graphics pipelines from caches (run 13:
+1,565 small graphics builds without an XCL blob took 0 ms at the median, which means the
+driver's own cache served them). What Warm runs lack is order and the slow compute tail. The
+capture plus precache fixes the order at runtime; prewarm moves the tail out of play. The first
+launch on a machine (true Cold) needs prewarm, which comes last because it is the largest.
+
+**Deferred (section "Deviations"):** ASD SODB export and PSDB consumption, crowdsourced caches,
+idle-time compile, automatic prewarm at first launch and after a driver change, "fast variant
+first", stage linking, NVIDIA Auto Shader Compilation detection, mesh/stream pipelines in the
+capture, a per-compile memory guard.
+
+---
+
+### 1. Goal and scope
+
+**Goal.** Most pipelines a title binds are ready, or buildable from caches in milliseconds, when
+first bound (spec G2). Each run shows how far from that it is (spec G5, AC5, AC6, AC9, AC11).
+
+**In scope (spec sections).**
+
+| Spec | What this design does |
+|---|---|
+| 3.3 capture | records every built pipeline: keys, full description, shader references, translator identity and flags, first-use context, size class, measured build time |
+| 3.4 pipeline key | defines capture key and pipeline key on top of the existing shader-set key |
+| 4.2 local precompile | `xcl prewarm` with a blocking set (must-draw and scene-start) and a background set (L/XL compute only here) |
+| 4.3 store key, invalidation | adapter and driver identity in the native blob folder; checksums; DXIL and capture kept across driver changes |
+| 5.2 prewarm runner, 5.4 eviction | `xcl prewarm`, the prewarm manifest, an eviction counter at runtime |
+| 6.2 load-time precache, validation | preload ordered by the capture; per-scene classification |
+| 6.3 stage-level caching | exists (per-stage translated cache); recorded, no change |
+| 9.3 items 3-5, 10, Q5, Q6 | measurement only: report and form timing |
+| 12.1 run configurations | `xcl cache --clear-driver`, `scripts/dev/run-config.ps1` |
+| AC5, AC6, AC9, AC11 | definitions computed from telemetry (`scripts/dev/ac-eval.py`) |
+
+**Out of scope (explicitly).**
+- Worker pool lanes, priorities, slots, per-build timeouts at runtime, must-draw waits (spec 7,
+  8). Another design owns them (`scratchpad/worker-pool-spec.md` and the sibling design for spec
+  7-8). This design only reads their results where an AC needs them.
+- Translator code generation (spec 9.3 items 1, 2, 4 code changes; 10.2 control).
+- ASD export, PSDB consumption, crowdsourced caches, idle compile (section "Deviations").
+- Mesh and stream pipelines (`OwnedDesc::Stream`, `real.rs:5735`) in the capture (counted, not
+  recorded).
+- Ray-tracing state objects.
+
+---
+
+### 2. What exists today ("check the fork first" results)
+
+#### 2.1 Keys
+
+| Key | Where | Inputs | Notes |
+|---|---|---|---|
+| **K0 shader-set key** | `shaders_key`, `hle/d3d12x/real.rs:5740-5748`; computed at creation `real.rs:5988` | FNV-1a over `fnv64` of each console shader blob, in stage order | no pipeline state, no translator. One K0 covers every state variant of the same shaders |
+| **K1 translated store** | `gpu/recomp/pso.rs:174-298` | folder: `identity()` `pso.rs:247-283` = translator source hash (`XCL_TRANSLATOR_SOURCE_ID`, build.rs:73) + DXC toolchain identity + backend switches; file: `fnv64(blob)_stage_samplerbase_windows_split.bin` `pso.rs:293-298` | header checks input length and a second hash `pso.rs:300-306`; output checked with `valid_dxil_container` `pso.rs:331`; written whole then renamed `pso.rs:372-379` |
+| **K2 DXC cache** | `gpu/recomp/dxc.rs:682-705`, file `<key>.dxil` `dxc.rs:965` | XCL version, toolchain identity, profile, entry, HLSL text | structural check only `dxc.rs:848-856` |
+| toolchain identity | `dxc.rs:647-680` | DLL names, sizes **and modification times** (`dxc.rs:668-676`) | makes K1 and K2 machine-dependent |
+| **K3 driver blobs** | `driver_cache`, `real.rs:4841-4960` | compute: `fnv64(dxil)-len-flags.pso` (`real.rs:4867-4870`); graphics: `gfx-<graphics_blob_key>-<bytes>.pso` (`real.rs:4873-4876`) where `graphics_blob_key` (`real.rs:5213-5331`) hashes the DXIL of each stage, static samplers and every state field one by one | no adapter or driver identity, no checksum; kept only if the build took 250 ms or more (`KEEP`, `real.rs:4856`, `4953-4960`) and the DXIL is 16 KiB or more (`COMPUTE_BLOB_MIN_DXIL`, `real.rs:5048`, used `5169`, `5199`); a refused blob is deleted and the pipeline rebuilt (`real.rs:4810-4816`, `4900-4916`) |
+
+**Does it satisfy spec 3.4 / 4.3?**
+
+| Contract | K0 | K1 | K2 | K3 |
+|---|---|---|---|---|
+| stable across runs | yes | yes | yes | yes |
+| stable across machines | yes | **no** (DLL mtime) | **no** (DLL mtime) | yes, given the same DXIL |
+| changes with translator output | n/a (not a pipeline key) | yes (source hash) | yes (HLSL) | yes (content-addressed DXIL digests) |
+| device identity only in the store key | yes | yes (the split flag is a translator flag) | yes | **no device identity at all** |
+| a driver change invalidates native entries, keeps DXIL | n/a | kept | kept | works only through driver refusal: one failed create per entry, then delete; no record of which driver a blob belongs to |
+
+There is no `ID3D12PipelineLibrary` store. The title's `CreatePipelineLibrary` is forwarded to
+the PC (`real.rs:2883`, `3663`). `shader_cache_session.rs` is a fallback for the title's own
+`ID3D12ShaderCacheSession` objects, not a pipeline cache.
+
+**Important:** `dxc::cache_dir()` (`dxc.rs:698-705`, `%LOCALAPPDATA%\xcl\dxil`) is one folder for
+all titles. `used-pipelines.txt` lives there too, so it mixes titles. The title's own data folder
+is `%LOCALAPPDATA%\XCL\<title>\` (`launcher.rs:9-16`, `296`); its `cache\` is the loader's
+(`config.rs:313-315`, `host.rs:197`).
+
+#### 2.2 Recording modes
+
+- `used-pipelines.txt` (`pso_async.rs:503-581`): K0 of each pipeline at its first use, appended,
+  always on. Read at start to drive the preload.
+- `XCL_PSO_MANIFEST=1` (`pso_manifest.rs:1-17`): per run, first uses (`use`, K0, ready or cold),
+  driver builds and present milestones, in order. No descriptions; nothing is replayable from it.
+- Telemetry (`docs/guide/telemetry.md` 5.5, 5.6, 5.9): `pipeline` build events
+  (`telemetry_gpu.rs:2430-2453`, fields `log.rs:948-962`: stage, one record hash, `dxil_bytes`,
+  `compile_ms`, `waited_ms`, `source`, `blob`, `by`, `wanted`); `pipeline_bind`
+  (`telemetry_gpu.rs:2384-2401`: id, stages, record per stage); `shaders.jsonl` per program shape;
+  `phase` events (`telemetry_run.rs:687-698`). The graphics `pipeline` event names only the PS
+  record (`real.rs:5612`, `5637`). No event carries a pipeline key.
+- No capture of full pipeline descriptions exists on `dev`. Upstream #758 proposes one (below).
+
+#### 2.3 Warmup, precompile, cache controls
+
+- `xcl shaders <pack> --precompile` (`shaders.rs:979-985`, `1593-1745`): translates and compiles
+  VS, PS, MS and CS into the DXIL cache. VS/PS go through `recomp::translate` + `compile_cached`
+  (`shaders.rs:1673-1705`), not through `console_to_dxil_in`, so the translated cache (K1) is not
+  filled for them. Upstream #2613 fixes that (sampler base 0 only).
+- `--pipelines` (`shaders.rs:1198-1224`, `make_one` from `1478`): compute only, on its own device,
+  its own concurrency (`XCL_PIPELINE_THREADS`, 4) and its own cap (`XCL_PIPELINE_MAX_KB`, 8 MiB,
+  `shaders.rs:1226-1231`). It does not use the runtime's gate. Writes K3 blobs.
+- `--used-only` (`shaders.rs:1587-1591`): compute programs whose K0 is in `used-pipelines.txt`.
+- `--measure-pso HEX` (`shaders.rs:1126-1185`): one compute record, cold, with
+  `ShaderCacheControl(DISABLE)` on two implicit kinds (`shaders.rs:1139-1142`). Needs Developer
+  Mode.
+- Switches: `XCL_TRANSLATED_CACHE=0`, `XCL_DXIL_CACHE`, `XCL_PSO_DISK_CACHE=0`, `XCL_PSO_PRELOAD=0`,
+  `XCL_LAZY_PSO=0`, `XCL_PSO_TRACE=1`. Several diagnostic switches bypass the translated cache
+  entirely (`cache_allowed`, `pso.rs:922-935`, includes `XCL_DXIL_NO_OPT`).
+- No CLI command clears any cache.
+
+#### 2.4 Prediction and variants
+
+- **Preload exists** (`pso_async.rs:583-641`). With lazy pipelines (`pso_async.rs:461-466`;
+  `real.rs:5560-5562` returns before translating, so every translated pipeline goes through
+  `go_background`, `real.rs:5955-6014`), a pipeline whose K0 an earlier run used is queued at
+  creation (`pso_async.rs:495-499`) for 2-4 threads `xcl-pso-pre-*` (`pso_async.rs:605`) at the
+  lowest OS priority (`608-611`), first in first out. The gate makes a preload give way to wanted
+  builds (`real.rs:4242-4252` doc, `big_compile_turn` `4253`). This is the spec 6.2 "source 1"
+  analogue, without scene order.
+- Whoever takes a pipeline's job first builds it; the others find nothing (`pso_async.rs:404-416`,
+  `624-627`). This is the spec's de-duplication.
+- The title creates its pipelines with their full description at load (about 51,000 in 30 s,
+  `pso_async.rs:456-460` doc). That is where XCL learns each pipeline's state.
+- **Stage-level caching exists** (spec 6.3): per-stage translated entries (K1) and DXC entries
+  (K2). A new state combination of cached shaders reruns only the driver.
+- **No two-tier variant scheme.** A pipeline not ready gets a stand-in that draws nothing
+  (`standin.rs`). The direct DXIL backend (`XCL_DIRECT_DXIL`) is an alternative output, not a fast
+  first tier.
+
+#### 2.5 Compile gate the prewarm runner must share
+
+`driver_compile_identified` (`real.rs:4202-4230`) gates a build of `huge_pso_bytes()` (256 KiB,
+`real.rs:4061-4069`) or more only on threads whose name starts with `xcl-pso`. Slots:
+`BIG_COMPILES`, `GRAPHICS_COMPILES`, `GIANT_COMPILES` (4 MiB, one at a time)
+(`real.rs:4166-4178`). Commit headroom per compile (`big_compile_headroom`, `real.rs:4301`).
+`xcl shaders --precompile` lowers the memory reserve when no title runs
+(`dxc::set_memory_reserve(2)`, `shaders.rs:1617`).
+
+#### 2.6 Device facts already available
+
+UMD driver version, VRAM and wave lane range: `device_facts`, `report.rs:427-455`. OS version:
+`kernelx::host_os_version`, `hle/kernelx.rs:1708-1715`.
+
+#### 2.7 Upstream PRs
+
+| PR | State | Size | What | Decision |
+|---|---|---|---|---|
+| #757 | open, CONFLICTING | +42 -25 | PC desc of a translated VS/PS pipeline in its own function | not needed: U6 calls the runtime builders unchanged |
+| #758 | open, CONFLICTING, stacked on #757 | +647 -25, `pso_journal.rs`, `real.rs` | journal of every pipeline queued to `pso_async` at creation, desc field by field, shaders written once, `U` mark at first build; 123 MB for 57,807 pipelines in a 60 s run | **not adopted** (conflicts, over 400 lines, no first-use context, records every created pipeline). Its format ideas are reused in U5 and credited |
+| #759 | open, CONFLICTING, stacked on #758 | +1341 -31 | `xcl pipelines`: builds a journal's pipelines outside the title; own concurrency; VS/PS and compute only | **not adopted** (size, conflicts, not the runtime gate). Its lessons are used in U6/U8: memory windows come from the record; `.trying` marks |
+| #898 | open, CONFLICTING, stacked on #758 | +638 -35 | journal mark at first bind instead of first build | idea used (U5 marks first use, not build) |
+| #1006 | open, MERGEABLE | +1064 -12 | `ID3D12PipelineLibrary1` store plus unrelated descriptor staging | **not adopted**: a second store (spec 4.3 says extend the existing one), bundles two changes |
+| #2001 | open, CONFLICTING | +2152 -132 | pipeline library plus many `pso_async` changes | **not adopted**: same reasons, overlaps the worker pool design |
+| #2613 | open, MERGEABLE | +290 -19, `pso.rs`, `shaders.rs`, `shaders_e2e.rs` | `--precompile` warms the runtime's translated VS/PS variants (sampler base 0) | **adopt through the gate (stage 0)**: offline DXC removal for the common case, independent of everything here |
+| #2577 | open, CONFLICTING | +75 -5 | no driver blobs on disk on AMD (blobs are 954-byte references; a stale one removed the device) | **not adopted**: uses a vendor ID check, which our rule forbids. Recorded as a cross-vendor risk (section 6) |
+| #1830 | open, MERGEABLE | +273 -4, `shaders.rs`, `pso.rs` | `xcl shaders --time-forms`: four compute forms timed cold, driver cache off with all three implicit kinds; two processes in a row stayed cold on RTX 4090 | **adopt through the gate** for spec 9.3/10 measurement (U10 depends on it only for the form matrix) |
+| #2438 | open, CONFLICTING | +424 -37 | `--measure-pso` for pixel shaders and direct DXIL | later; graphics form timing waits for it |
+| #1849 | open, CONFLICTING | +277 -27 | NVIDIA application profile to turn the driver cache off | **not adopted**: vendor-specific |
+| #1113, #2635 | open | small | `used-pipelines.txt` hygiene | unaffected; compatible |
+
+---
+
+### 3. Architecture and data flow after the change
+
+```
+                         title run (xcl run)                                         offline
+ CreateGraphics/ComputePipelineState
+      │ go_background (real.rs)
+      │   K0 = shaders_key, CK = capture_key(desc, windows), PK = pipeline_key(CK, identity, flags)
+      ├─► Pending{K0, CK, PK, predicted}
+      │      predicted? ── capture index (U9) ─► preload heap (earliest first) ─► xcl-pso-pre-*
+      │                    else K0 in used list ─► preload heap (last)
+      │
+      ├─ first use (note_use) ─► used-pipelines.txt (K0)           [unchanged]
+      │                         ├─► capture U frame (CK, scene, ms in scene, frames)   (U5)
+      │                         └─► telemetry pipeline_use (CK, PK, ready, predicted)  (U4)
+      │
+      └─ build (job on a worker) ─► translate (K1) ─► DXC (K2) ─► driver (+K3 blob from
+                                      driver\<store_id>\, checksummed)           (U3)
+                                 ├─► capture G/C frame once + S frames once + B frame  (U5)
+                                 └─► telemetry pipeline {…, key: PK, capture: CK}       (U4)
+
+ %LOCALAPPDATA%\XCL\<title>\pipelines\
+     capture.bin  ◄──────────────────────── xcl prewarm <game> ──► reads capture, plans sets (U7)
+     must-draw.txt (optional, hand-kept)          replays each record through the runtime
+     prewarm-manifest.json ◄──────────────────── builders on xcl-pso-pw-* (U6, U8):
+                                                  fills K1, K2, K3 and the driver's own cache
+ runtime start: reads prewarm-manifest.json (U9b) → telemetry only (prewarmed flag, eviction)
+```
+
+**Runtime lookup order for one pipeline (unchanged in kind):** in-memory translated cache →
+K1 file → translate (+K2 DXC cache → DXC) → in-memory blob → K3 file in the current store folder
+→ driver. The capture and the prewarm manifest are never consulted to pick a pipeline. They only
+order the preload and label telemetry. So the runtime is identical with or without a prewarm
+(spec 5.2), apart from cache hit rates.
+
+---
+
+### 4. Decisions A-G
+
+#### A. Pipeline key and cache store key
+
+**Recommendation: keep K0-K3. Add two derived keys and one store folder. No new store.**
+
+- **Capture key (CK)** = FNV-1a 64 of: the tag `"xcl-ck1"`, the kind (graphics or compute), K0,
+  the pipeline state hashed field by field (the same field list and order as
+  `graphics_blob_key` uses for state, `real.rs:5244-5328`, applied to the title's description;
+  compute: `Flags`, `NodeMask`), and the memory windows (`pso::mem_windows()`, `pso.rs:82-89`).
+  Never 0 (`| 1`). It is translator-independent and machine-independent. It is what the capture
+  set merges and de-duplicates on.
+- **Pipeline key (PK)** = FNV-1a 64 of: `"xcl-pk1"`, CK, the translated-cache identity
+  (`pso.rs:247-283`), the compute split flag and the graphics split flag of the device. It
+  changes whenever the translator output can change (spec 3.4). It names a pipeline in telemetry,
+  in the capture's build records and in the prewarm manifest. It is not a storage key.
+- **Native store key (spec 4.3 CacheStoreKey).** Blob files keep their content-addressed names
+  (K3 already changes with the DXIL and the full state, which is stronger than a version bump).
+  They move under `<DXIL cache>\driver\<store_id>\` where `store_id` = 16 hex of FNV-1a 64 over:
+  adapter vendor id, device id, subsystem id, revision, UMD driver version, Windows major build
+  number, and `BLOB_FORMAT = 1`. A driver update or another adapter gives another folder. DXIL
+  (K1, K2) and the capture are untouched (spec 4.3 first bullet). Old flat files in `driver\` are
+  ignored (a one-time loss of blobs; the driver's own cache still holds most). `xcl cache
+  --prune-stores` deletes folders other than the current one.
+- **Corruption.** New blob files start with a 24-byte header: magic `XCLBLOB1`, FNV-1a 64 of the
+  payload, payload length. A load that fails the header, the length or the checksum deletes the
+  file and returns none, so the pipeline is compiled (never handed to the driver). The capture
+  file has a checksum on every frame (B). K1 and K2 keep their structural checks: the D3D12
+  runtime refuses DXIL whose container hash is wrong, and the existing refusal path rebuilds. A
+  payload checksum for K1/K2 would invalidate both caches once; it is a possible follow-up, not
+  part of this design.
+- **Not changed:** the DLL modification time in the toolchain identity (`dxc.rs:668-676`). The
+  capture is the cross-machine artefact, and it does not depend on K1/K2. Fixing K1/K2 portability
+  would invalidate every user's caches once for no v1 benefit (deviation D5).
+
+Alternatives:
+- (A2) Make PK the storage key of a new index file over K1/K2/K3. Rejected: a second key path
+  that must agree with the content keys; drift serves a wrong pipeline.
+- (A3) Leave the store as is and rely on driver refusal. Rejected: no record of the driver a blob
+  belongs to (needed by the manifest and eviction detection), a failed create per entry after
+  each driver update, and two GPUs on one machine delete each other's blobs.
+
+#### B. The capture set
+
+**Recommendation: an append-only binary file per title, on by default for pipelines a run
+builds, with full descriptions and shader bytes stored once.**
+
+- **Where:** `<data dir>\pipelines\capture.bin`, data dir as `xcl run` resolves it
+  (`launcher.rs:296`), reached in the runtime through `crate::state::boot()` (`state.rs:14`).
+  `XCL_CAPTURE_DIR` overrides the folder (the run script and tests use it). No boot (CLI, unit
+  tests): no capture. Title-derived; never in the repository.
+- **Switch:** `XCL_CAPTURE` unset or `used`: record pipelines when built; `0`: off; `all`: also
+  record every pipeline at creation (spec's QA mode; about 123 MB per first 60 s, per #758's
+  measurement).
+- **Format** (little-endian). File header: 8 bytes `XCLPCS01`. Then frames:
+  `tag u8, 0 u8 ×3, len u32, key u64, payload [len], check u64`, where `check` = FNV-1a 64 of the
+  16 header bytes and the payload.
+
+| Tag | key | payload | written |
+|---|---|---|---|
+| `S` shader | `fnv64(bytes)` | console shader bytes | once per key ever |
+| `G` graphics pipeline | CK | `windows u32`; stage refs `vs, ps, gs, hs, ds` as `fnv64` (0 = none); every state field of `D3D12_GRAPHICS_PIPELINE_STATE_DESC` that `graphics_blob_key` hashes, each written explicitly (no struct copy, no padding); input layout as `count u32` then per element `name_len u16, name, index u32, format u32, slot u32, offset u32, class u32, step u32` | once per key ever |
+| `C` compute pipeline | CK | `windows u32`, `cs ref u64`, `flags u32`, `node_mask u32` | once per key ever |
+| `U` first use | CK | `run u64` (FNV of process start time and pid), `scene_len u8, scene`, `ordinal u16`, `ms_in_scene u32`, `ms_in_run u32`, `presents u64`, `ready u8`, `must_draw u8` (0 now; the spec 8 design may set it) | once per key per run |
+| `B` build | CK | `run u64`, `pk u64`, `identity u64`, `dxil_total u32`, `driver_ms u32`, `blob u8`, `source u8` (0 unknown, 1 cache, 2 dxc, 3 direct), `by u8` (0 title, 1 worker, 2 extra, 3 preload, 4 prewarm), `outcome u8` (0 built, 1 refused) | once per key per run per PK |
+
+- **What spec 3.3 asks for, and where it is:** key (CK in frames, PK in `B`); DXIL per stage
+  (by reference: the K1 entry is found from the shader bytes plus identity; not copied, to keep
+  the file small); root signature (XCL's ABI root signature, derived from the static samplers of
+  the translation, so the translator identity plus shader sources determine it; the title's
+  console root signature is replaced and not recorded); full description (`G`/`C`); translator
+  version and flags (`identity`, windows, split flags inside PK); source shader identity (`S`
+  keys); first-use context (`U`); size class (derived from `dxil_total`, below); measured build
+  time (`B.driver_ms`, with `blob` telling cold from warm).
+- **Size class** (spec 7.4 thresholds, Proposed there, kept): S < 256 KiB, M < 768 KiB,
+  L < 1,638,400 B, XL at or above, of the pipeline's total DXIL. Defined once as `SizeClass` in
+  `capture.rs` (U5) for prewarm, precache and reports.
+- **Merge and de-duplication:** the writer reads the frame headers of the existing file on its
+  own thread at open (as #758 does) and keeps a set of `(tag, key)` for S/G/C and of `(key, run)`
+  for U. Frames noted while it opens wait in memory (at most 64 MiB, then dropped and counted).
+  `xcl prewarm --merge <other capture.bin>` appends the frames of another file that are new by the
+  same rules (spec 3.3 merge across runs and machines). `xcl prewarm --compact` keeps per key the
+  newest 8 runs' U and B frames and rewrites the file (temporary file, then rename).
+- **Torn or bad frames:** the reader stops at a frame whose length runs past the end (a torn
+  tail; the writer truncates there before appending). A frame whose checksum fails is skipped.
+- **Relation to existing records:** `used-pipelines.txt` stays written as today (upstream
+  feature; `--used-only` reads it). Precache prefers the capture when it exists (U9). The `U`
+  frame mirrors a new `pipeline_use` event; the `B` frame mirrors the `pipeline` event, which gains
+  `key` and `capture` fields so run folders join to the capture.
+- **Cost when on:** on the title's creation thread, one more FNV over about 300 bytes of state per
+  created pipeline (K0 is already computed there). On the worker after a build: building the
+  frames (a few hundred bytes plus shader bytes the first time) and a channel send. Disk writes on
+  thread `xcl-capture`. After the first run of a title, only U and B frames are new (about 60 bytes
+  each, a few thousand per run). Checked by the acceptance runs' `xcl-smoke` frames and peak commit
+  (within 2 %).
+- **Opt-in or always on:** always on for built pipelines (deviation D1). The local path needs a
+  capture from ordinary play; the spec's opt-in mode is `XCL_CAPTURE=all`.
+
+Alternatives:
+- (B2) Adopt #758 (creation-time journal of every pipeline). Rejected for size, conflicts, no
+  first-use context, and 123 MB of mostly never-used pipelines per title.
+- (B3) JSON lines plus a shader folder. Rejected: thousands of small files, no per-record
+  checksum, slower to index at runtime start.
+- (B4) Merge by PK as the spec says. Rejected: PK changes with every translator source edit, so
+  the file would grow a copy of every pipeline per XCL build (deviation D2).
+
+#### C. The prewarm runner
+
+**Recommendation (C1): a new subcommand `xcl prewarm` that replays the capture through the
+runtime's own builders (`build_graphics`, `build_compute`, `real.rs:6020-6028`), on threads named
+`xcl-pso-pw-{k}` so the runtime gate (`real.rs:4203`) applies to them unchanged.**
+
+- **Why not extend `xcl shaders --precompile --pipelines`:** it is pack-driven and has no
+  pipeline state, so it cannot build graphics; it uses its own concurrency and cap, not the
+  runtime gate; and its compute root signature path is a second copy of the runtime's
+  (`shaders.rs:1480-1497` against `real.rs:4006-4030`). Graphics needs the full description
+  (blend, rasterizer, depth-stencil, input layout, render-target and depth formats, sample desc,
+  topology, flags). The runtime has it in `OwnedDesc::Graphics` (`real.rs:5732-5736`,
+  `own_graphics` `5802`); the capture's `G` frame gives it back. `--precompile --pipelines` stays
+  as the pack-wide compute warmer for titles without a capture.
+- **Steps:**
+  1. Resolve the data dir from the game folder (`launcher::resolve_target`, `launcher.rs:253`,
+     then `data_root().join(title)`).
+  2. Read the capture (U5 reader), plan the sets (U7), write `prewarm-trying.txt` handling.
+  3. Create the process device as the runtime does (`real::init`, `real.rs:476`; `XCL_ADAPTER`
+     and the title's `xcl.toml` adapter apply). `dxc::set_memory_reserve(2)` as `--precompile` does.
+  4. For each planned record, rebuild an `OwnedDesc` from the frames and call the runtime builder
+     with the record's memory windows forced (`pso::with_mem_windows`, U6). The builder translates
+     (fills K1/K2), builds through the gate and keeps K3 blobs as the runtime does. A prewarm build
+     also keeps blobs of builds under 250 ms (`driver_cache::keep_always`, U6), so the next run
+     gets a blob for every captured pipeline of 16 KiB DXIL or more.
+  5. Write the manifest every 30 s and at the end.
+- **Same lanes and caps as the runtime:** the gate's slots, commit headroom and the 4 MiB giant
+  lane apply because the threads are `xcl-pso*`. A prewarm build is never "wanted" and never a
+  preload, so it waits for commit headroom and does not get the preload give-way rule.
+- **Timeouts (no hang on one build):** a watchdog thread checks running builds every second.
+  Soft timeout: log `slow`. Hard timeout: the entry is marked `abandoned`, the worker is no longer
+  counted, a replacement thread starts (at most `n` replacements), and the build's result is kept
+  if it returns (spec 7.6 in-process wording). At the end the runner waits `--grace-s` (default 30)
+  for abandoned builds, writes the manifest and exits the process, which ends any driver call
+  still running. Table (Proposed; deviation D10):
+
+| Class | Soft | Hard |
+|---|---|---|
+| S/M graphics | 1 s | 30 s |
+| S/M compute | 2 s | 60 s |
+| L compute | 60 s | 600 s |
+| XL compute | 60 s | 900 s |
+
+  Reason for longer hard timeouts than spec 7.6: run 12 measured M graphics cold builds up to
+  21.3 s and L compute builds up to 374.5 s in the driver (helper script, 29 and 6 builds). A
+  prewarm has no frame to protect, and an abandoned build keeps running anyway.
+- **XL skip policy:** XL compute is planned only in the background set, at most one XL build at a
+  time in the runner (in addition to the gate). Programs over `XCL_PIPELINE_MAX_KB` (8 MiB,
+  `shaders.rs:1226-1231`) are skipped unless `--include-huge`, the same cap `--pipelines` uses.
+- **Sets (spec 4.2):** the blocking set is the must-draw set plus the scene-start set; the
+  background set is everything else. L/XL compute go to the background set unless must-draw. The
+  CLI runs `--set blocking`, `--set background` or `--set all` (default `all`, blocking first).
+- **Prewarm manifest** (spec 5.2 item 4): `<capture dir>\prewarm-manifest.json`, schema 1, with
+  `xcl_version`, `translator_identity`, `split_compute`, `split_graphics`, `store_id`, adapter
+  `{vendor, device, driver}`, start and end time, counts per outcome, and `entries`:
+  `{capture, key, kind, class, set, outcome, ms, dxil_bytes}`. Outcomes: `built`, `reused`
+  (a K3 blob was accepted), `refused`, `translation_failed`, `abandoned`, `built_late` (finished
+  after its hard timeout), `skipped_cap`, `skipped_stream`, `replay_failed`, `crashed_before`.
+- **Crash safety:** before a build, its CK is appended to `prewarm-trying.txt`; after it, removed
+  (the file is rewritten every 30 s from memory). Keys found there at start are moved to the end of
+  the background set and marked `crashed_before` unless `--retry-crashed` (idea from #759).
+- **When it runs:** on demand in v1. Automatic runs at first launch and after a driver change
+  (store id changed) are a later unit (U14, deviation D6).
+- **Identical runtime:** prewarm changes caches only. The runtime reads the manifest for telemetry
+  only (U9b).
+
+Alternatives:
+- (C2) Extend `shaders.rs` `Pipelines` with graphics. Rejected: duplicates the runtime's graphics
+  description building (`real.rs:5570-5622`) and its keys; any drift makes prewarm fill keys the
+  runtime never asks for.
+- (C3) An in-title prewarm (`xcl run` holds the title while the preload builds). Rejected for v1:
+  the title must run to create its pipelines; it reuses U6/U8's code later as U14.
+- (C4) Adopt #759. Rejected (section 2.7).
+
+#### D. Load-time precache and validation mode
+
+**Recommendation: keep the existing preload as the precache lane; give it the capture's order and
+more threads; classify every first use per scene.**
+
+- **Prediction (spec 6.2 source 1):** at the first `submit_lazy`, the runtime reads the capture's
+  index (U and G/C headers only, S payloads skipped by seeking) into a map CK → rank. Rank =
+  (earliest scene ordinal of first use over the newest 8 runs, then the smallest `ms_in_scene`).
+  A pipeline whose CK is in the map goes to the preload queue at that rank. A pipeline whose CK is
+  unknown but whose K0 is in `used-pipelines.txt` goes in at the lowest rank (today's behaviour,
+  the "same shaders, other state" tier, the closest analogue of spec 6.2 source 2). Others stay
+  lazy.
+- **Why prediction happens at creation, not at "scene load begins":** the title creates the
+  pipelines of what it loads, with their full state, while it loads (section 2.4). Queueing at
+  creation is the earliest moment XCL can build them. Building all created pipelines
+  speculatively is what lazy mode exists to avoid (commit; `pso_async.rs:456-460`).
+- **Priority below frame-critical (P2):** unchanged mechanism. Preload threads are separate from
+  the pool, at the lowest OS priority, and give way at the gate. The worker pool design's lanes do
+  not change this.
+- **Queue:** the `VecDeque` (`pso_async.rs:588`) becomes a `BinaryHeap` ordered by rank, then by
+  arrival.
+- **Threads:** `XCL_PSO_PRELOAD_THREADS`, default `clamp(compile_threads / 2, 2, 8)` (7 on the
+  16-thread PC; today `clamp(n / 4, 2, 4)` = 3). Proposed. Reason: AC5 asks for a few hundred
+  graphics pipelines within 120 s on Cold; at 1.5-5 s each cold, 300 × 3 s / 3 threads = 300 s, /
+  7 threads = 130 s. On Warm they take about 13 ms each. To be validated by the Cold run.
+- **De-duplication:** unchanged (whoever takes the job builds; section 2.4). Cached entries build
+  in milliseconds from K1/K2/K3.
+- **Validation classification (spec 6.2):** each pipeline's first use gets one class, counted per
+  scene:
+  - `precache_hit`: predicted (CK or K0 tier) and ready at first use;
+  - `precache_late`: predicted, not ready at first use;
+  - `prior_cache`: not predicted; its build was served from caches (`source` = cache and either a
+    blob was supplied or the driver took under 250 ms);
+  - `missed`: not predicted; its build needed DXC/translation or a cold driver compile, or it was
+    never built before the run ended.
+  The first two are decided at first use; the last two when the build completes. The counts go to a
+  `precache` event at each scene change (for the scene that ends) and at the end, and to one
+  `xcl.log` line at the end. Always computed when telemetry tier `pass` is on (deviation D14).
+- **Load completion held for must-draw (spec 6.2, 10 s cap):** belongs to the spec 8.5 design.
+  Not here.
+- **Fast variant first (spec 6.3):** deferred. Any D3D12 graphics variant is a full driver PSO
+  build; for driver-bound pipelines a second variant doubles driver work. The only "fast" output
+  XCL has is the direct DXIL backend, whose NVIDIA driver cost is unmeasured
+  (freeze-analysis Q4) and whose VS/PS output differs from the HLSL path's. Revisit after U10
+  measures direct against HLSL for VS/PS (#2438).
+
+#### E. Measurements (spec 9.3 items 3-5, 10, Q5, Q6)
+
+**Recommendation: one offline report over a run folder from existing telemetry plus two new
+fields; controlled form timing through adopted #1830 plus a records filter and a DXC level option.**
+
+- **Already measurable today** (prototype run on run 12, cold builds without an XCL blob):
+
+| Stage | Class | Form (backend/split/windows) | n | DXIL KB p50 | driver ms p50 | ms max | DXIL instr per console instr p50 |
+|---|---|---|---|---|---|---|---|
+| compute | L | hlsl/whole/switch | 6 | 1,215 | 227,576 | 374,461 | 9.0 |
+| compute | M | hlsl/whole/switch | 4 | 302 | 36,964 | 48,016 | 10.6 |
+| compute | S | hlsl/split/switch | 237 | 15 | 1 | 14,996 | 12.0 |
+| compute | S | hlsl/whole/switch | 81 | 20 | 1 | 22,581 | 9.8 |
+| graphics | M | hlsl/whole/switch | 29 | 306 | 13,967 | 21,253 | 8.4 |
+| graphics | S | hlsl/whole/switch | 1,425 | 15 | 0 | 8,897 | 5.3 |
+
+  Cold builds over 200 ms joined to a shape: compute n = 40, correlation of driver ms with DXIL
+  bytes 0.93 and with switch count 0.93; graphics n = 38, 0.87 and 0.71. Every L program was a
+  whole (not split) form. Split forms appear only in small programs here. This supports the
+  existing finding that DXIL size follows console program size and is not mainly split inflation
+  (spec 10.2 hypothesis not supported on this data; one run, correlation only).
+- **Missing fields (U10):** the `shaders.jsonl` `seen` line gets `hlsl_bytes` and `dxc_opt`
+  (`O3`, `O1` or `O0`, from the same size rule as `dxc.rs:628-640`), so the DXC level of every
+  program is known. The `pipeline` event gets `key`/`capture` (U4) so builds join to the capture.
+- **Form matrix (controlled):** adopt #1830 (`--time-forms`, compute: per-lane, per-instruction,
+  HLSL switch windows, HLSL heap windows; driver cache off) and add `--records FILE` (a list of
+  record hashes from the report) so the slowest programs of a run are timed in every form. Add
+  `--dxc-opt 0|1|3|auto` to `--measure-pso` (passes `-O0`/`-O1`/`-O3`; `compile_whole` honours an
+  explicit level, `dxc.rs:629`) for spec 9.3 item 3. Split against whole: `--split 0|1` exists in
+  both tools. Direct backend (item 5): the per-instruction and per-lane columns of #1830.
+- **Q5 (wave sizes):** already answered by every run's `manifest.json` (`wave_lane_count_min/max`,
+  `report.rs:434-438`). No work.
+- **Q6:** split against whole, optimisation level, heap against switch windows and direct
+  against HLSL are measurable as above. The EXEC-emulation share is not measurable without a
+  translator switch that removes EXEC masking; none exists, and adding one is a translator change
+  (deviation D20).
+- **The report (U11, fork-only script):** `scripts/dev/pipeline-report.py <run folder>` writes
+  `pipeline-report.csv` (one row per cold build: stage, class, form, dxil bytes, console
+  instructions, DXIL instructions, switches, DXC level, DXC ms, driver ms, blob) into the run
+  folder (never the repository) and prints the aggregate table above, per-class p50/p95/max and the
+  correlations.
+
+#### F. Run configurations (spec 12.1)
+
+**Recommendation: isolate XCL's caches per series with `XCL_DXIL_CACHE`, clear the driver cache
+through the D3D12 API for `xcl.exe` only, and prove coldness from telemetry.**
+
+- **Our folders.** A series is `<RunRoot>\<series id>\` with `dxil\` (passed as
+  `XCL_DXIL_CACHE`; holds `translated\v2\`, `*.dxil`, `driver\<store_id>\`, `used-pipelines.txt`,
+  `pso-manifest.txt`) and `capture\` (passed as `XCL_CAPTURE_DIR`; a copy of the title's
+  `pipelines\` folder taken at series start, so every config of a series starts from the same
+  capture). The user's normal caches and capture are never deleted.
+- **The driver's cache.** `xcl cache --clear-driver` (U1) creates a device on the run's adapter and
+  calls `ID3D12Device9::ShaderCacheControl` with `D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR` on the
+  three implicit kinds (driver-managed, D3D cache for the driver, D3D conversions). That clears
+  the caches of the current application, which is `xcl.exe` (the title runs in an `xcl.exe` host
+  process, `launcher.rs:456-460`). It needs Windows Developer Mode; without it the command exits
+  with code 3 and says so. No driver cache folder is located or deleted: vendor folders such as
+  `%LOCALAPPDATA%\NVIDIA\DXCache`, `%LOCALAPPDATA%\D3DSCache` and AMD's are shared by every
+  application and are never touched.
+- **Fallback when Developer Mode is off:** the script copies `xcl.exe` to
+  `xcl-s<series id>.exe` in the same folder (so DLL lookup is unchanged) and runs the series
+  through that copy, which is a new application for the driver. It deletes the copy at the end of
+  the series. The driver's entries for the copy are left to its own eviction.
+- **Validity check (both methods):** a Cold run is valid only if, among its graphics `pipeline`
+  events with `blob: false` and `dxil_bytes` of 64 KiB or more, at most 5 % took under 5 ms
+  (Proposed). Run 13 shows why: small graphics builds without an XCL blob took 0 ms at the median,
+  so the driver's cache was serving them. `ac-eval.py` marks a run that fails as `not cold`.
+- **Configs:**
+
+| Config | Steps |
+|---|---|
+| Cold | new series folder; copy the capture; `xcl cache --clear-driver` (or new exe copy); run |
+| Warm | the same series folder, the same exe; run again |
+| Prewarmed | new series folder; copy the capture; clear (or new copy); `xcl prewarm <game> --set all` with the same environment; run |
+
+- **The scripted path:** `XCL_RUN_SECONDS=900` (13+ min, spec 12.1), `XCL_TELEMETRY=pass`,
+  `XCL_ACTIVITY=1`, `XCL_NETWORK=0`, `XCL_PHASE_MARK` from `-Schedule`, and `-InputScript <path>`
+  started with the run (our input automation lives outside the repository). Every run in a series
+  gets the same environment block, written to `<series>\env.txt`.
+- **AC9 is computed from** `pipeline_use` (first use per PK, `ready`) joined to the first
+  `pipeline` event with the same `key`. Definitions in section 9.
+
+#### G. What to defer or change in the spec
+
+| Spec item | Recommendation | Reason | What is lost |
+|---|---|---|---|
+| 3.3 export to SODB | defer | no Microsoft tool on an offline PC; eligibility open (Q1). The capture keeps full descriptions and shader references, so an exporter can be written later without changing it | cloud-precompiled pipelines |
+| 3.3 consume PSDB | defer | no PSDB exists for this title or configuration; offline policy | the "near-100 % hit" tier |
+| 4.1 B crowdsourced caches | defer (spec agrees) | needs distribution and trust infrastructure | cross-machine sharing |
+| 4.1 D idle precompile | defer | needs idle detection; risk of competing with play. `xcl prewarm --set background` on demand and the lowest-priority preload cover most of it | no-wait completion without a user step |
+| 4.2 automatic first-launch / driver-change prewarm | later unit U14 | measure on-demand prewarm first; the run path should not block until its cost is known | the user must run `xcl prewarm` |
+| 5.3 detect NVIDIA Auto Shader Compilation | drop | vendor-specific; our rule is capability checks only. The driver version is logged and `driver_cache_hit_estimate` counts fast builds | knowing whether the feature was on |
+| 6.2 source 2 permutations | reduce to the K0 tier | speculative permutations cost commit (lazy mode exists for that) | pipelines of new state combinations are not predicted |
+| 6.3 fast variant first | defer | doubles driver work for driver-bound pipelines; the fast output is unmeasured | a draw-something-early option |
+| 6.3 Q4 stage linking | out | no D3D12 equivalent to evaluate offline | none now |
+| 9.3 item 6 / 7.5 memory guard | later unit U15 (prewarm helper process in a job object) | in-process compiles cannot be capped | the per-compile 4 GB part of AC11 |
+
+---
+
+### 5. Dependencies
+
+#### 5.1 Upstream PRs (through `python scripts/dev/merge-pr.py <N>` only; the orchestrator decides)
+
+- **#2613** (stage 0): independent of every unit. Touches `pso.rs` and `shaders.rs`; land it
+  before U6 and U10 so they rebase on it.
+- **#1830**: needed by U10's `--records` option only. Land before U10.
+- Not adopted: #757, #758, #759, #898, #1006, #2001, #2577, #1849 (section 2.7).
+
+#### 5.2 Other designs
+
+- **Worker pool design** (`scratchpad/worker-pool-spec.md` U1-U3) edits `pso_async.rs` heavily
+  (lanes replace `queue()`). U4, U5 and U9 also edit `pso_async.rs` (`Pending`, `submit_as`,
+  `note_use`, `preload`). Land the worker pool U1 and U2 first; U4/U5/U9 rebase on them. Their U3
+  adds queue gauges to `activity`; U9 adds `preload_queue` to the same gauge, so U9 comes after
+  their U3. AC5's P0/P1 wait part reads their `pipeline_ready` event.
+- **Spec 7-8 design** (timeouts, quarantine, must-draw): `SizeClass` is defined in U5's
+  `capture.rs`; that design should reuse it rather than define a second one (orchestrator to
+  confirm). When it adds a runtime must-draw flag, the `U` frame's `must_draw` byte carries it. The
+  prewarm timeout table should become the runtime's once that design lands.
+
+#### 5.3 Order between units
+
+```
+U1 ──────────────────────────────┐
+U3 ──────────────┐               │
+U4 ──► U5 ──┬──► U9 ──► U9b      │
+            ├──► U6 ──┐          │
+            └──► U7 ──┴──► U8 ◄──┘ (main.rs after U1)
+U10 (after #1830)     U11 (any time)    U12a (after U1)   U12b (after U4, U9)   U13 (last)
+```
+
+---
+
+### 6. Constraints and considerations
+
+- **Disk.** Capture: bounded by the shader bytes of the pipelines a title builds; #758 measured
+  123 MB for every created pipeline of a 60 s run (57,807 pipelines, 5,659 shaders), so the
+  built-only capture is smaller. Driver blobs: one folder per store id; `xcl cache --status`
+  prints the size of each cache part, and the acceptance runs record them. Old store folders stay
+  until `--prune-stores`.
+- **Time.** Prewarm on Cold, estimated from our measurements: a few hundred graphics at 1.5-5 s on
+  15 threads, about 1-2 min; L compute about 13 programs × 225 s at 4 slots, about 12 min; within
+  the spec's Appendix A boot warmup range (10-25 min). Measured by the Prewarmed run.
+- **Memory per compile.** The gate's commit headroom applies to prewarm threads. The README's
+  measurement: about 0.34 GiB per additional huge build; up to about 1.5 GB for the biggest
+  (`shaders.rs:1216-1217` comment). The prewarm process also reserves the UMA address range, as the
+  runtime does, because `shader::readable` creates it (`gpu/shader.rs:215`, `uma.rs:850`); this is
+  address space plus the coherent window, measured by the run.
+- **Privacy and the repository rule.** The capture, its summary, the manifest, run folders and
+  the report CSV hold title-derived data or hashes of it. They stay under the title's data folder,
+  the series folder or the run folder. Unit tests use synthetic shader bytes only.
+- **Driver cache eviction.** The driver's own cache has a size limit outside XCL's control. U9b
+  counts `driver_cache_evicted`: a pipeline the manifest says was prewarmed that builds with
+  `blob: false` in 250 ms or more. The README recommends a large driver cache setting (docs only).
+- **Cache-key mistakes that would serve a wrong pipeline.** None of the new keys selects a
+  pipeline at runtime: the runtime always builds from the title's own description, and only the
+  content-keyed caches (K1 input bytes plus identity, K2 HLSL, K3 DXIL plus full state) feed a
+  build. A CK collision (64-bit) can only make prewarm build an extra pipeline. A prewarm run under
+  other switches than the title run produces other K1 keys: misses, not wrong pipelines; the
+  runtime logs `prewarm made for another configuration` when the manifest's identity or split flags
+  differ (U9b). Existing gap, not widened: K3 graphics keys omit the root signature, which is
+  derived from the static samplers that are in the key.
+- **Failure modes.** Capture write error: capture off for the run, one warning. Corrupt capture
+  frame: skipped. Corrupt blob: deleted, rebuilt. Prewarm crash: partial manifest (written every
+  30 s) and `prewarm-trying.txt`. A build that never returns: `abandoned`, process exits at the end.
+  Developer Mode off: fresh exe copy.
+- **Cross-vendor.** AMD blobs are references into the driver's own cache, and a stale one removed
+  the device (#2577). The store id folder and checksum do not prevent that. The cross-vendor config
+  of spec 12.1 must not be run with XCL blobs on until a vendor-neutral fix exists (for example,
+  writing a blob only after its pipeline has been used without a device removal). Open risk.
+- **Open risks.** (1) Whether the driver's per-application cache identity is the image path of
+  `xcl.exe` (assumed for both the clear and the exe-copy fallback; checked by the validity rule).
+  (2) Whether CLEAR needs Developer Mode like DISABLE does (assumed). (3) More preload threads
+  compete with the title's own threads on Cold; measured by AC5 and frame times. (4) Prewarm and
+  run must share switches; the script passes one environment to both.
+
+---
+
+### 7. Work breakdown
+
+Every unit: one logical change, under about 400 changed lines, tests in the file's
+`#[cfg(test)] mod tests` unless stated, no `cargo fmt`, GPU tests call
+`gpu::recomp::runner::skip_test` when the hardware is missing. Runtime units need the smoke pair
+(CONTRIBUTING.md). Line numbers are at 20941768; rebase on the worker pool units where noted.
+There is no U2: the run script it would have been is U12a.
+
+#### U1. `xcl cache`: status, clear the driver's cache, prune stores
+
+- **Inputs:** dev. **Outputs:** a CLI subcommand.
+- **Files:** new `crates/xcl/src/cache_cmd.rs`; `crates/xcl/src/lib.rs` (+1 `pub mod cache_cmd;`);
+  `crates/xcl/src/main.rs` (+1 arm next to `"shaders"`, `main.rs:77`: `Some("cache") =>
+  xcl::cache_cmd::run(&args[1..])`), plus the usage text where `xcl --help` lists subcommands.
+- **Changes:**
+  - `pub fn run(args: &[String]) -> i32`: parses `--status`, `--clear-driver`, `--prune-stores`
+    with `crate::cli::Parser` (as `shaders.rs:867-895`). No option: prints usage, returns 2.
+  - `fn status() -> i32`: prints `dxc::cache_dir()` and the byte totals of `translated\`, `*.dxil`
+    files, `driver\` (each subfolder with its name), `used-pipelines.txt`. Pure helper
+    `fn folder_bytes(dir: &Path) -> u64` (recursive, ignores errors).
+  - `fn clear_driver() -> i32`: picks the adapter as `shaders.rs` `Pipelines::new` does
+    (`crate::gpu::adapter::candidates`), creates a device with
+    `crate::gpu::agility::create_device`, casts to `ID3D12Device9`, calls
+    `ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED |
+    D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER |
+    D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CONVERSIONS, D3D12_SHADER_CACHE_CONTROL_FLAG_CLEAR)`.
+    Success: prints `driver shader caches of this application cleared (<adapter>)`, returns 0.
+    Failure: prints the HRESULT and `Windows Developer Mode is required`, returns 3. No device: 2.
+  - `fn prune_stores() -> i32`: until U3 lands, prints `no store folders yet` and returns 0; U3
+    fills it (U3 lists the change).
+- **Acceptance:** `xcl cache --status` prints the sizes; `xcl cache --clear-driver` returns 0 with
+  Developer Mode on (PC check, written in the PR's Tested section).
+- **Tests:** `cache_args_are_parsed_and_unknown_ones_refused` (each option, an unknown option → 2);
+  `folder_bytes_sums_nested_files` (temp folder with two files in two levels);
+  `clear_driver_returns_0_or_a_developer_mode_refusal` (GPU; skip without a GPU; asserts the code
+  is 0 or 3, never a panic).
+
+#### U3. Native store key and checksummed driver blobs (spec 4.3)
+
+- **Inputs:** dev. **Outputs:** blobs under `driver\<store_id>\` with a header.
+- **Files:** `crates/xcl/src/hle/d3d12x/real.rs` (module `driver_cache`, `4841-4960`, and its
+  callers' paths only through `path_for`/`graphics_path`); `crates/xcl/src/gpu/adapter.rs`
+  (new fn); `crates/xcl/src/report.rs` (`device_facts` calls the new fn for the driver version);
+  `crates/xcl/src/cache_cmd.rs` (`prune_stores`, if U1 landed; else this item moves to U1's follow-up).
+- **Changes:**
+  - `gpu/adapter.rs`: `pub struct AdapterIdentity { pub vendor: u32, pub device: u32, pub subsys:
+    u32, pub revision: u32, pub umd: u64 }` and `pub fn identity_of(dev: &ID3D12Device) ->
+    Option<AdapterIdentity>` (LUID → `EnumAdapterByLuid` → `GetDesc1` → `CheckInterfaceSupport`, the
+    code of `report.rs:440-452` moved here). `report.rs` `device_facts` formats `umd` from it.
+  - `driver_cache`: `const BLOB_FORMAT: u32 = 1; const MAGIC: &[u8; 8] = b"XCLBLOB1";`
+    `pub fn store_id_of(id: &AdapterIdentity, os_build: u32) -> u64` (pure; FNV-1a 64 of the six
+    fields and `BLOB_FORMAT`, `| 1`). `static STORE: OnceLock<Option<u64>>`;
+    `pub fn set_device(dev: &ID3D12Device)` sets it once from `identity_of` and
+    `kernelx::host_os_version().2`; called from `real::init` after the device is made and from
+    `shaders.rs` `Pipelines::new`. `fn dir() -> Option<PathBuf>` = `cache_dir()\driver\<16 hex>`;
+    none until `set_device` ran (then nothing is read or written: no blob is better than a blob
+    of an unknown device).
+  - `path_for` and `graphics_path` use `dir()`. `name_for`/`graphics_name` unchanged.
+  - `pub fn wrap(payload: &[u8]) -> Vec<u8>` (header + payload) and
+    `pub fn unwrap(file: &[u8]) -> Option<&[u8]>` (pure). `write` writes `wrap(bytes)`; `load`
+    reads, calls `unwrap`; on `None` deletes the file, counts `CORRUPT`, logs once, returns `None`.
+  - `pub fn keep_always(p: &Path, blob: &[u8])`: writes regardless of `KEEP` (U6 uses it).
+  - `cache_cmd::prune_stores`: deletes `driver\<x>\` folders whose name is not the current store
+    id (computed with a device as in `clear_driver`) and old flat `*.pso` files in `driver\`; prints
+    what it deleted and the bytes freed.
+- **Acceptance:** a run writes blobs only under `driver\<store_id>\`; a second run reuses them
+  (`xcl.log` "made from the driver's blob"); a corrupted file is deleted and the pipeline built.
+- **Tests:** `store_id_changes_with_each_identity_field_and_not_otherwise`;
+  `wrap_then_unwrap_returns_the_payload`; `unwrap_refuses_a_flipped_byte_a_short_file_and_a_wrong_magic`;
+  `load_deletes_a_corrupt_blob_file` (temp dir); `no_store_dir_before_set_device`;
+  existing `driver_cache` tests adjusted only where they built paths by hand (explicit paths keep
+  working because `write`/`load` are path-based).
+
+#### U4. Capture key, pipeline key, first-use context on telemetry
+
+- **Inputs:** dev after the worker pool U1/U2. **Outputs:** CK and PK on `Pending`; `pipeline`
+  events carry `key` and `capture`; a new `pipeline_use` event; a scene clock.
+- **Files:** `real.rs` (state hasher, `capture_key`, `pipeline_key`, `go_background`);
+  `pso_async.rs` (`Pending` fields, `submit_lazy`/`submit_as` signature, `note_use`);
+  `gpu/recomp/pso.rs` (`pub fn translator_identity() -> u64` returning `translated::identity()`);
+  `telemetry_gpu.rs` (thread-local build keys, `pipeline_use`); `log.rs` (fields);
+  `telemetry_run.rs` (scene clock).
+- **Changes:**
+  - `real.rs`: split the state part of `graphics_blob_key` (`5244-5328`) into
+    `fn feed_graphics_state(h: &mut u64, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC)`; `graphics_blob_key`
+    calls it at the same point, so its output is unchanged. Add
+    `pub(crate) fn capture_key(kind: u8, k0: u64, state: impl FnOnce(&mut u64), windows: u32) -> u64`
+    and `impl OwnedDesc { fn capture_key(&self) -> u64 }` (graphics: `feed_graphics_state` on the
+    owned desc; compute: `Flags`, `NodeMask`; stream: 0).
+    `pub(crate) fn pipeline_key(ck: u64, identity: u64, split_compute: bool, split_graphics: bool) -> u64`.
+    In `go_background` after `let key = owned.shaders_key();` (`real.rs:5988`): compute `ck` and
+    `pk` (device flags from `pso::wave32_only_for_device` and `graphics_wave32(this)`); pass both to
+    `submit_lazy`/`submit`; wrap the job so it runs inside
+    `telemetry_gpu::with_build_keys(ck, pk, || build(...))`.
+  - `pso_async.rs`: `Pending` gains `capture: u64, pkey: u64`; `submit_lazy(standin, compute, job,
+    key, capture, pkey)`; `submit(standin, compute, job)` passes zeros; test call sites updated.
+    `note_use` calls `crate::report::telemetry_pipeline_use(self.capture, self.pkey, self.compute,
+    ready, false)` after the manifest line, only when `capture != 0`.
+  - `telemetry_gpu.rs`: `thread_local! static BUILD_KEYS: Cell<(u64, u64)>`;
+    `pub fn with_build_keys<R>(ck: u64, pk: u64, f: impl FnOnce() -> R) -> R` (sets, runs, restores);
+    `telemetry_pipeline_built` adds `key` and `capture` (16 hex, or null when 0) to its facts.
+    `pub fn telemetry_pipeline_use(ck, pk, compute, ready, predicted)` writes `pipeline_use`
+    (tier pass): `capture`, `key`, `stage`, `ready`, `predicted`, `scene`, `ordinal`,
+    `ms_in_scene`, `presents`.
+  - `log.rs`: `PipelineFacts` gains `key: Option<u64>, capture: Option<u64>`;
+    `pipeline_fields_built` emits them.
+  - `telemetry_run.rs`: `static SCENE: Mutex<(String, u16, Instant)>` initialised to
+    `("run", 1, first call)`; `write_phase` (`687-698`) sets it to `(name, count of that name so
+    far, now)`; `pub fn scene_now() -> (String, u16, u32)` returns name, ordinal and ms since the
+    scene began.
+- **Acceptance:** a telemetry run shows `pipeline_use` events and `pipeline` events with `key`;
+  every `pipeline_use.key` that was built has a `pipeline` event with the same `key`.
+- **Tests:** `graphics_blob_key_is_unchanged_by_the_state_split` (golden value computed from the
+  pre-change function on a fixed desc, pasted as a constant in the test);
+  `capture_key_follows_shaders_state_and_windows_only` (same desc twice equal; change one blend
+  field, one RTV format, the windows, a shader byte: each differs; struct padding garbage: equal);
+  `pipeline_key_changes_with_identity_and_split_flags`; `scene_ordinal_counts_each_name`
+  (`write_phase` twice with `world`, once with `menu`); `pipeline_use_fields_are_complete`
+  (fields builder, pure); `with_build_keys_restores_the_previous_keys`.
+
+#### U5. The capture writer and reader
+
+- **Inputs:** U4. **Outputs:** `capture.bin`; a reader API for U7, U9.
+- **Files:** new `crates/xcl/src/hle/d3d12x/capture.rs`; `hle/d3d12x/mod.rs` (+1 line);
+  `real.rs` (job wrapper in `go_background`; `OwnedDesc::capture_record`); `pso_async.rs`
+  (`note_use` → `capture::first_use`); `telemetry_gpu.rs` (`take_last_build`).
+- **Changes in `capture.rs`:**
+  - `pub enum SizeClass { S, M, L, Xl }`, `pub fn size_class(dxil_total: usize) -> SizeClass` with
+    the thresholds of section 4.B.
+  - Frame encode/decode (pure): `pub fn frame(tag: u8, key: u64, payload: &[u8]) -> Vec<u8>`;
+    `pub fn for_each_frame(bytes: &[u8], f: impl FnMut(u8, u64, &[u8])) -> usize` (returns the end
+    of the last whole frame; skips bad checksums; stops at a torn tail).
+  - Records: `pub struct GraphicsRec { windows, vs, ps, gs, hs, ds: u64, state: Vec<u8>, layout:
+    Vec<Element> }` with `encode`/`decode`; `pub struct ComputeRec { windows, cs, flags, node_mask }`;
+    `pub struct UseRec { run, scene, ordinal, ms_in_scene, ms_in_run, presents, ready, must_draw }`;
+    `pub struct BuildRec { run, pk, identity, dxil_total, driver_ms, blob, source, by, outcome }`.
+    The `state` bytes are produced in `real.rs` by `fn graphics_state_bytes(d) -> Vec<u8>` writing
+    the same fields `feed_graphics_state` reads, in the same order, and read back by
+    `fn apply_graphics_state(bytes, &mut desc)` (both in `real.rs`, U5).
+  - Writer: `fn mode() -> Mode` (`Off`, `Used`, `All` from `XCL_CAPTURE`); `fn dir() ->
+    Option<PathBuf>` (`XCL_CAPTURE_DIR`, else `state::boot()?.data_dir.join("pipelines")`);
+    `static W: OnceLock<Writer>` with an `mpsc::Sender<Vec<u8>>` and thread `xcl-capture` that
+    opens the file (header check; truncate a torn tail; read existing `(tag, key)` sets), then
+    appends. Public calls: `pub fn built(ck: u64, rec: Record, shaders: &[&[u8]], b: BuildRec)`,
+    `pub fn created(ck: u64, rec: Record, shaders: &[&[u8]])` (mode `All`),
+    `pub fn first_use(ck: u64, compute: bool, ready: bool)` (builds `UseRec` from
+    `telemetry_run::scene_now()`, `present::presents()` and process time). De-duplication: S/G/C by
+    key in a `HashSet` held by the writer thread; U by `(key, run)`. Memory cap 64 MiB of queued
+    frames, then drop and count. A write error turns the writer off with one warning.
+  - Reader: `pub struct Capture { pub pipelines: HashMap<u64, Record>, pub uses: HashMap<u64,
+    Vec<UseRec>>, pub builds: HashMap<u64, Vec<BuildRec>>, shader_at: HashMap<u64, (u64, u32)> }`;
+    `pub fn read(path: &Path) -> Result<Capture, String>` (reads all; shader payload offsets
+    recorded); `pub fn shader(&self, file: &mut File, key: u64) -> Option<Vec<u8>>` (seek + read +
+    verify fnv64); `pub fn read_index(path) -> Result<Capture, String>` (skips S payloads by seeking).
+- **Changes in `real.rs`:** `impl OwnedDesc { fn capture_record(&self) -> Option<(capture::Record,
+  Vec<&[u8]>)> }` (graphics: state bytes, layout from the owned `D3D12_INPUT_ELEMENT_DESC` and
+  `CString`s, stage refs; compute: CS; stream: `None`). In `go_background`'s job wrapper (U4), after
+  a successful build: `capture::built(ck, rec, shaders, BuildRec { .. from
+  telemetry_gpu::take_last_build() .. })`. With mode `All`, `capture::created` at creation.
+- **`telemetry_gpu.rs`:** `thread_local! static LAST_BUILD: Cell<Option<(u32 dxil, u32 ms, bool
+  blob, u8 source)>>`, set in `telemetry_pipeline_built` (also when telemetry is off: move the
+  set before the early return); `pub fn take_last_build()`.
+- **Acceptance:** a run writes `capture.bin`; a second run adds only U and B frames (file growth
+  under 1 MB for a run that builds no new pipeline).
+- **Tests:** `frames_round_trip_and_a_flipped_byte_is_skipped`;
+  `a_torn_tail_is_cut_and_earlier_frames_stay`; `graphics_record_round_trips_every_state_field`
+  (`graphics_state_bytes` → `apply_graphics_state` gives a desc whose `feed_graphics_state` hash is
+  equal); `shaders_and_pipelines_are_written_once_uses_once_per_run` (writer on a temp dir, two
+  notes of the same pipeline, two runs); `size_class_thresholds`; `read_index_skips_shader_bytes`;
+  `capture_is_off_without_a_boot_or_with_xcl_capture_0`.
+
+#### U6. Replaying a capture record through the runtime builders
+
+- **Inputs:** U5 (and U3 for `keep_always`). **Outputs:** `real::replay_build`.
+- **Files:** `real.rs`; `gpu/recomp/pso.rs`.
+- **Changes:**
+  - `pso.rs`: `thread_local! static WINDOWS_OVERRIDE: Cell<Option<u32>>`;
+    `pub fn with_mem_windows<R>(w: u32, f: impl FnOnce() -> R) -> R`; `mem_windows()` (`82-89`)
+    returns the override when set (the `HEAP_WINDOWS` bit inside `w` is kept as recorded).
+  - `real.rs`: `pub(crate) struct ReplayOutcome { pub ok: bool, pub reused: bool, pub dxil_total:
+    usize, pub driver_ms: u32, pub refused: bool, pub translation_failed: bool }`.
+    `unsafe fn owned_from_record(rec: &capture::Record, shader: &dyn Fn(u64) -> Option<Vec<u8>>) ->
+    Option<OwnedDesc>`: builds the console-side description with owned shader bytes, input layout
+    and names, `pRootSignature` null, `CachedPSO` empty, `apply_graphics_state`.
+    `pub(crate) unsafe fn replay_build(rec: &capture::Record, shader: &dyn Fn(u64) ->
+    Option<Vec<u8>>) -> ReplayOutcome`: `owned_from_record`, then with the record's windows forced,
+    `build_graphics`/`build_compute` with `Dev(device_raw() as usize, orig_fn(device,
+    slot_of(device, "CreateGraphicsPipelineState" | "CreateComputePipelineState")) as usize)`;
+    releases the built pipeline; reads `telemetry_gpu::take_last_build()` for the outcome.
+  - Thread-local `PREWARM_KEEP_ALL: Cell<bool>` set by `replay_build`; `driver_cache::keep` callers
+    (`real.rs:4833`, `5644`) call `keep_always` when it is set.
+- **Acceptance:** a test replays a synthetic captured compute and graphics pipeline on the GPU and
+  gets `ok`; the second replay is `reused` for a pipeline of 16 KiB DXIL or more.
+- **Tests:** `with_mem_windows_overrides_and_restores`; `owned_from_record_rebuilds_the_desc`
+  (round trip against a desc built by hand from a synthetic console VS/PS used by existing GPU
+  tests); `replay_build_makes_a_compute_and_a_graphics_pipeline` (GPU; skip without GPU or DXC);
+  `replay_without_a_shader_is_replay_failed`.
+
+#### U7. Prewarm plan and manifest (pure)
+
+- **Inputs:** U5 reader. **Outputs:** the sets, their order, the manifest types and writer, the
+  summary export.
+- **Files:** new `crates/xcl/src/prewarm_plan.rs`; `lib.rs` (+1).
+- **Changes:**
+  - `pub struct PlanOptions { scene_start_s: u32 (30), include_huge: bool, cap_bytes: usize
+    (pipeline_cap_kb), must_draw: HashSet<u64> }`. `scene_start_s` is Proposed: the first world
+    frames meet hundreds of first uses at once (`pso_async.rs:510-516` doc); to be tuned from the
+    capture's `ms_in_scene` histogram.
+  - `pub fn must_draw(uses: &[UseRec], listed: bool) -> bool`: listed, or any use in a scene named
+    `boot`, `menu` or `loading`, or with `presents == 0`.
+  - `pub fn scene_start(uses, opts) -> bool`: any use with `ms_in_scene <= scene_start_s * 1000` in
+    a scene named `world`; if the capture has no `world` scene, in ordinal 1 of the first scene.
+  - `pub enum Set { Blocking, Background, Skip(&'static str) }`; `pub fn plan(c: &Capture, opts:
+    &PlanOptions) -> Vec<Planned>` with `Planned { ck, kind, class, set, rank }`: blocking =
+    must-draw ∪ scene-start, except L/XL compute that is not must-draw; skip `skipped_cap` over the
+    cap unless `include_huge`; background = the rest; order: blocking by (must-draw first, ordinal,
+    ms_in_scene); background L/XL compute first (long poles start early), then by (ordinal,
+    ms_in_scene). The class comes from the newest `B` frame's `dxil_total` (unknown → M).
+  - `pub fn read_must_draw(path) -> HashSet<u64>` (hex per line, `#` comments).
+  - `pub struct Manifest { .. }` (section 4.C) with serde; `pub fn write_manifest(path, &Manifest)`
+    (temporary file, then rename); `pub fn read_manifest(path) -> Option<Manifest>`.
+  - `pub fn summary(c: &Capture, opts) -> serde_json::Value`: per CK `{capture, kind, class,
+    must_draw, scenes: [[name, ordinal, ms_in_scene]], keys: [pk…]}` for `ac-eval.py`.
+- **Tests:** `must_draw_from_scene_presents_and_list`; `scene_start_uses_world_or_the_first_scene`;
+  `l_and_xl_compute_go_to_background_unless_must_draw`; `over_the_cap_is_skipped_unless_include_huge`;
+  `blocking_order_is_must_draw_then_earliest`; `manifest_round_trips`.
+
+#### U8. `xcl prewarm`: the runner
+
+- **Inputs:** U6, U7, U1 (main.rs). **Outputs:** the subcommand.
+- **Files:** new `crates/xcl/src/prewarm.rs`; `lib.rs` (+1); `main.rs` (+1 arm); `telemetry_gpu.rs`
+  (`built_by`: `xcl-pso-pw` → `"prewarm"`, before the `xcl-pso` arm at `2416`).
+- **Changes:**
+  - `pub fn run(target: &Path, args: &[String]) -> i32`: options `--set blocking|background|all`,
+    `--scene-start-s N`, `--include-huge`, `--retry-crashed`, `--grace-s N`, `--max-minutes N`,
+    `--dry-run` (print the plan counts per set and class, build nothing), `--merge FILE`,
+    `--compact`, `--summary FILE`. Resolves the data dir; `--merge`/`--compact`/`--summary` act on
+    the capture and return.
+  - Build loop: `real::init()`; `dxc::set_memory_reserve(2)`; `n = compile_threads()` threads named
+    `xcl-pso-pw-{k}` (64 MiB stacks like the pool) taking `Planned` entries from a shared index,
+    blocking set first; an XL semaphore of 1; each build calls `real::replay_build` with the
+    capture's shader reader.
+  - Watchdog thread: `running: Mutex<HashMap<thread id, (ck, class, Instant)>>`; every second,
+    soft and hard timeouts per the table in 4.C; on hard: outcome `abandoned`, start one
+    replacement thread (at most `n` in all).
+  - `prewarm-trying.txt` handling; manifest every 30 s and at the end; progress line every 5 s
+    (`done/total, per set, ETA`); at the end wait `--grace-s` for abandoned builds, then write and
+    `std::process::exit(0)` (`3` if the blocking set had a `refused` or `translation_failed`).
+- **Acceptance:** on the PC, `xcl prewarm <game> --set all` on a capture from one Cold run
+  finishes, writes the manifest, and the next run's `pipeline` events for captured keys show
+  `blob: true` or under 250 ms.
+- **Tests:** `prewarm_args_are_parsed`; `the_watchdog_marks_abandoned_and_starts_a_replacement`
+  (with a fake build closure that sleeps past a 50 ms hard timeout: the watchdog logic is a pure
+  function `fn overdue(running, now, table) -> Vec<..>` plus a small loop);
+  `trying_keys_go_last_unless_retry_crashed`; `dry_run_builds_nothing` (empty device not needed);
+  e2e in `crates/xcl/tests/` is not added (needs title data).
+
+#### U9. Precache ordered by the capture, with validation counts
+
+- **Inputs:** U5, worker pool U3 (for the gauge). **Outputs:** ranked preload, thread count,
+  classification, `precache` event, `preload_queue` gauge.
+- **Files:** `pso_async.rs` (`Preload`, `preload()`, `submit_as`, `Pending`, `note_use`, `build`);
+  `capture.rs` (`predicted`); `telemetry_gpu.rs` (event and counters).
+- **Changes:**
+  - `capture.rs`: `pub fn predicted(ck: u64) -> Option<(u16, u32)>` backed by a `OnceLock` map
+    built from `read_index` of the capture (newest 8 runs per key; min ordinal, then min
+    `ms_in_scene`); built on first call (synchronous; index only).
+  - `pso_async.rs`: `Preload.list` becomes `Mutex<BinaryHeap<Ranked>>` with `struct Ranked { rank:
+    (u16, u32), seq: u64, p: Arc<Pending> }` ordered smallest rank first, then `seq`. `submit_as`:
+    if `capture::predicted(capture)` is `Some(r)` push at `r` and set `p.predicted`; else if
+    `used::known(key)` push at `(u16::MAX, u32::MAX)` and set `p.predicted`. Preload thread count:
+    `fn preload_threads(n: usize, env: Option<&str>) -> usize` = env value (1-16) else
+    `(n / 2).clamp(2, 8)`. `Pending` gains `predicted: AtomicBool`, `class: AtomicU8` (0 none,
+    1 hit, 2 late, 3 prior, 4 missed), `scene: (String, u16)` captured at first use.
+    `note_use`: if predicted: class hit or late by `ready`; telemetry `pipeline_use` gets
+    `predicted`. In `build` (`pso_async.rs:76-98`) after `job()`: for a pending with class 0 that was
+    used before it was built, read `take_last_build()`: prior if source is cache and (blob or
+    ms < 250), else missed. A pipeline used but never built by the end counts as missed (counted
+    at the end from `PENDING`).
+  - `telemetry_gpu.rs`: per-scene counters `Mutex<Vec<((String, u16), [u64; 4])>>`;
+    `pub fn precache_count(scene, class)`; at each `write_phase` (hook from U4's scene clock) and at
+    the end, write `precache` (tier pass) for the scene that ended: `scene`, `ordinal`, `hit`,
+    `late`, `prior`, `missed`. The `activity` gauge (worker pool U3) gets `preload_queue`.
+- **Acceptance:** a Warm run's `precache` events show `hit` for most first uses; a Cold run with a
+  capture shows hit + late equal to the predicted count.
+- **Tests:** `ranked_preloads_come_out_earliest_first_then_in_arrival_order`;
+  `preload_threads_default_and_override`; `a_predicted_ready_first_use_is_a_hit_and_unready_is_late`;
+  `an_unpredicted_build_from_caches_is_prior_and_a_cold_one_missed` (fake last-build facts);
+  `precache_counts_are_kept_per_scene`.
+
+#### U9b. Prewarm manifest awareness and eviction detection (spec 5.4)
+
+- **Inputs:** U7 (`read_manifest`), U4. **Files:** `telemetry_gpu.rs`, `real.rs` (one call at
+  `init`).
+- **Changes:** at `real::init` (after U3's `set_device`), read the manifest; if its `store_id`,
+  translator identity and split flags equal the current ones, keep a `HashSet<u64>` of PKs with
+  outcome `built`/`reused`/`built_late`; else log once `prewarm made for another configuration
+  (<which field>)`. `telemetry_pipeline_built` adds `prewarmed: true` for those PKs and increments
+  `DRIVER_CACHE_EVICTED` when such a build has `blob: false` and took 250 ms or more;
+  `driver_cache_hit_estimate` counts builds with `blob: false` under 5 ms whose PK has a `B` frame
+  with a cold time over 50 ms (Proposed thresholds from spec 11.1). Both counters go into
+  `report.json` under `d3d12` and the `end` event.
+- **Tests:** `manifest_mismatch_names_the_field`; `evicted_is_counted_only_for_prewarmed_cold_builds`.
+
+#### U10. Missing measurement fields and options (spec 9.3 items 3, 5; Q6)
+
+- **Inputs:** #1830 adopted. **Files:** `report.rs` (`telemetry_shader` seen fields,
+  `report.rs:2115`); `gpu/recomp/dxc.rs` (`pub fn opt_level_for(src_len: usize) -> &'static str`,
+  the rule of `dxc.rs:628-640` moved into a function `compile_whole` calls); `shaders.rs`
+  (`--dxc-opt` for `--measure-pso`; `--records FILE` for `--time-forms`).
+- **Changes:** `seen` lines get `hlsl_bytes` (null for direct DXIL) and `dxc_opt`;
+  `measure_pso_result` passes `-O0|-O1|-O3` when `--dxc-opt` is given and prints the level used;
+  `--records FILE` restricts `--time-forms` to the listed record hashes.
+- **Tests:** `opt_level_rule_matches_the_old_thresholds` (1 MB and 8 MB boundaries);
+  `seen_line_has_hlsl_bytes_and_dxc_opt`; `dxc_opt_and_records_are_parsed`.
+
+#### U11. `scripts/dev/pipeline-report.py` (fork-only)
+
+- The prototype in `scratchpad/spec-capture-tools/dxil_breakdown.py`, extended with the CSV, the
+  `dxc_opt` column (U10) and per-PK join (U4). `scripts/dev/test_pipeline_report.py` with a
+  synthetic run folder (three events, two shapes) checks the table and the correlations.
+
+#### U12. Run configurations and AC evaluation (fork-only scripts)
+
+- **U12a `scripts/dev/run-config.ps1`:** parameters `-Config Cold|Warm|Prewarmed -Game -RunRoot
+  [-Series] [-Seconds 900] [-Schedule] [-InputScript] [-Xcl]`. Implements section 4.F: series
+  folder, capture copy, `XCL_DXIL_CACHE`, `XCL_CAPTURE_DIR`, `XCL_TELEMETRY_DIR=<series>\<config>`,
+  `xcl cache --clear-driver` or the exe copy, `xcl prewarm` for Prewarmed, the run (via
+  `ProcessStartInfo` as `smoke.ps1:40-62` does), `env.txt`, and a call to `ac-eval.py`.
+  `scripts/dev/run-config.tests.ps1`: parameter validation, the folder layout on a dry run
+  (`-WhatIf`).
+- **U12b `scripts/dev/ac-eval.py`:** reads a run folder (and the Warm baseline folder for AC11,
+  and the `--summary` JSON for AC5); writes `ac.json` and prints a table. Definitions in section 9.
+  `scripts/dev/test_ac_eval.py` with synthetic events for each AC, pass and fail.
+
+#### U13. Docs
+
+- `README.md`: `xcl prewarm`, `xcl cache`, `XCL_CAPTURE`, `XCL_CAPTURE_DIR`,
+  `XCL_PSO_PRELOAD_THREADS`, the title data folder's `pipelines\`, a note on driver cache size.
+- `docs/guide/telemetry.md`: `pipeline_use`, `precache`, new `pipeline` fields, report counters.
+- `docs/guide/d3d12x.md`: capture and prewarm data flow (section 3 of this file, shortened).
+
+#### Later (not in this design's scope of approval)
+
+- **U14:** `xcl run` runs the blocking set before the title when the manifest is missing or its
+  store id differs (first launch, driver change), with a progress line; opt out with
+  `XCL_PREWARM=0`.
+- **U15:** the prewarm runner builds XL compute in a child `xcl prewarm --one <ck>` inside a job
+  object with a 4 GB process memory limit (spec 9.3 item 6), killed at the hard timeout.
+
+---
+
+### 8. Concurrency plan
+
+| Wave | Units in parallel | Files written (no overlap within a wave) |
+|---|---|---|
+| 1 | U1; U3; U11; #2613 and #1830 through the gate (orchestrator) | U1: `cache_cmd.rs`, `main.rs`, `lib.rs`. U3: `real.rs` (`driver_cache` only), `gpu/adapter.rs`, `report.rs` (`device_facts`). U11: `scripts/dev/` |
+| 2 | U4; U10; U12a | U4: `real.rs` (`graphics_blob_key`, `go_background`), `pso_async.rs`, `pso.rs` (`translator_identity`), `telemetry_gpu.rs`, `log.rs`, `telemetry_run.rs`. U10: `report.rs` (`telemetry_shader`), `dxc.rs`, `shaders.rs`. U12a: `scripts/dev/run-config*.ps1`. U3 must be merged before U4 (both in `real.rs`) |
+| 3 | U5 | `capture.rs`, `mod.rs`, `real.rs`, `pso_async.rs`, `telemetry_gpu.rs` |
+| 4 | U6; U7; U9 | U6: `real.rs` (replay), `pso.rs` (override). U7: `prewarm_plan.rs`, `lib.rs`. U9: `pso_async.rs`, `capture.rs` (`predicted` only), `telemetry_gpu.rs`. `lib.rs` is touched by U7 only in this wave |
+| 5 | U8; U9b | U8: `prewarm.rs`, `lib.rs`, `main.rs`, `telemetry_gpu.rs` (`built_by`). U9b: `telemetry_gpu.rs` (build counters), `real.rs` (`init`). Both touch `telemetry_gpu.rs` in different functions: run them one after the other if the orchestrator prefers no shared file |
+| 6 | U12b; U13 | scripts; docs |
+
+The worker pool units that edit `pso_async.rs` go before wave 2.
+
+---
+
+### 9. Acceptance runs on the retail title
+
+**Machine:** the Windows PC (RTX 5080, driver as installed, 16 logical CPUs, 63 GB). Release
+build of one commit. Same `-Schedule` and input script for every run. `-Seconds 900`.
+
+**Series:** Cold → Warm (same series), then a new series: Prewarmed. Each gives a run folder and
+`ac.json`. A Cold run that fails the validity rule (section 4.F) is repeated, not evaluated.
+
+**Definitions computed by `ac-eval.py`:**
+
+- **AC9 (cache hit rate at bind time; Warm ≥ 99 %, Prewarmed ≥ 95 %).** Population: distinct `key`
+  values of `pipeline_use` events. Hit: `ready: true`, or the first `pipeline` event with that
+  `key` has `source: "cache"` and (`blob: true` or `compile_ms < 250`). A used key with no
+  `pipeline` event by the end is a miss. The 250 ms rule follows `KEEP` (`real.rs:4856`): XCL
+  deliberately keeps no blob for faster builds and leaves them to the driver's cache. The report
+  also gives the share of each hit kind.
+- **AC5 (scene's predicted graphics set within 120 s of scene start on Cold; P0/P1 p95 ≤ 100 ms).**
+  Predicted set: graphics CKs in the series' `--summary` with a use in a `world` scene. t0: the
+  first `phase` event named `world`. For each predicted CK that the run creates (has a
+  `pipeline_use` or `pipeline` event with that `capture`), t_built is its first graphics
+  `pipeline` event's time; before t0 counts as t0. Pass: max(t_built − t0) ≤ 120 s. Predicted CKs
+  never created in the run are reported, not counted. The wait part uses the worker pool design's
+  `pipeline_ready` events for wanted builds (p95 of need-to-built); without them, the p95 of
+  `frame.pso_wait_ms` is reported as a proxy and the criterion is marked partial.
+- **AC6 (background queue drains within 10 min of scene start on Cold).** From `activity`
+  gauges: `preload_queue` plus the unwanted lanes of the worker pool design. Pass: the sum reaches
+  0 by t0 + 600 s and, after the last `loading` phase ends, never rises by more than the number
+  of `pipeline_use` events with `predicted: false` in the same window (newly discovered pipelines).
+  Quarantined keys (spec 7 design) are excluded when that design exists.
+- **AC11 (commit within +10 % of Warm during world load; per-compile 4 GB guard).** Max process
+  commit (`memory` telemetry events or `activity` `committed_mb`) from the last `loading` phase
+  start to 60 s after the first `world` phase, against the same window of the Warm run of the same
+  series. The 4 GB per-compile part is reported as "not evaluated" until U15.
+- **Validity and extras:** coldness check; `driver_cache_hit_estimate`, `driver_cache_evicted`;
+  `precache` counts per scene; prewarm wall time and manifest outcome counts; `xcl cache --status`
+  sizes before and after each config.
+
+**Expectations to check (hypotheses, not results):** Warm and Prewarmed reach AC9 thresholds
+because small graphics pipelines come from the driver's cache (run 13) and larger ones from K3
+blobs; AC5 on Cold depends on the preload thread count and the DXC share; AC6 on Cold depends on
+the L compute tail (run 12: up to 374 s per program in the driver), so it is the criterion most
+likely to fail without prewarm.
+
+---
+
+### 10. Deviations from the user's spec
+
+| # | Spec | What the spec says | What this design does | Why |
+|---|---|---|---|---|
+| D1 | 3.3 | capture mode is opt-in, for dev/QA runs | on by default for pipelines a run builds; `XCL_CAPTURE=all` records every created pipeline (the spec's mode); `XCL_CAPTURE=0` off | the local path (4.2 C) needs a capture from ordinary play; the default cost is small (B) |
+| D2 | 3.3 | merge and de-duplicate by pipeline key | merge by capture key (translator-independent); pipeline keys kept per build record | the translator identity changes with every translator source edit; merging by PK would copy every pipeline per build |
+| D3 | 3.3, 3.5 | export to SODB; consume a PSDB first when present | not designed | offline PC, no tool, no PSDB, eligibility open (Q1); the capture keeps what an exporter would need |
+| D4 | 3.4 | key includes a root signature hash | the title's console root signature is excluded; XCL's ABI root signature is determined by translator identity and shader sources, which are in the keys | the title's root signature is replaced at build (`real.rs:5595-5597`) |
+| D5 | 3.4 | stable across machines | true for the capture key; the translated and DXC caches stay machine-specific (DXC DLL modification time) | the capture is the portable artefact; changing the toolchain identity invalidates every cache once for no v1 gain |
+| D6 | 4.2, 5.2 | prewarm at first launch and after a driver change (blocking or progress-barred) | on demand (`xcl prewarm`) in v1; automatic is later unit U14 | measure prewarm cost before putting it on the run path |
+| D7 | 4.1 D, 4.2 | idle precompile hands off the rest | deferred; `--set background` on demand plus the lowest-priority preload | idle detection and its risks are not justified before measurement |
+| D8 | 4.3 | store key includes OS build | Windows major build only, not the monthly revision | a monthly update would otherwise discard every blob |
+| D9 | 4.3 | checksum every cache entry | checksums on driver blobs and capture frames; translated and DXC caches keep structural checks plus the D3D12 runtime's DXIL hash check | a payload checksum there changes both formats and invalidates both caches; refusal already rebuilds |
+| D10 | 5.2, 7.6 | prewarm uses the runtime's timeouts: 10 / 20 / 300 / 300 s hard | prewarm table 30 / 60 / 600 / 900 s hard; a hard timeout abandons the wait, the build continues | runtime timeouts do not exist yet; run 12 measured M graphics up to 21.3 s and L compute up to 374.5 s, above the spec's values (also relevant to Q8) |
+| D11 | 5.3 | detect NVIDIA Auto Shader Compilation | not done; driver version logged, fast builds counted | vendor-specific; our rule is capability checks only |
+| D12 | 6.2 | runtime discovery queues plausible permutations | only same-shaders-other-state (K0) tier, lowest rank | speculative builds of created pipelines cost commit (lazy mode's reason) |
+| D13 | 6.2 | load completion may be held for must-draw (10 s cap) | not in this design | belongs to the spec 8.5 design |
+| D14 | 6.2 | validation mode when enabled | computed whenever telemetry tier `pass` is on | cost is a few counters; one switch less |
+| D15 | 6.3 | fast generic variant first | deferred | doubles driver work; the fast output is unmeasured on NVIDIA |
+| D16 | 6.2, 4.2 | must-draw tag at capture | derived at plan time from scene, frames shown and a hand-kept list; the capture reserves a byte for a runtime flag | no runtime must-draw classification exists yet |
+| D17 | 12.1 | Cold clears the driver's shader cache | cleared through the D3D12 API for `xcl.exe` only, or a fresh `xcl.exe` copy; never deletes driver folders; a telemetry rule proves coldness | vendor folders are shared by all applications |
+| D18 | 12.1 | PSDB and cross-vendor configurations | not run | no PSDB; no AMD GPU here, and #2577's stale-reference risk |
+| D19 | AC11 | no compile exceeds 4 GB | reported as not evaluated until U15 | an in-process compile cannot be measured or capped alone |
+| D20 | 9.3 item 4, Q6 | measure the EXEC-emulation share | not measured | needs a translator switch, which is out of scope |
+| D21 | 3.3 | every pipeline state object, graphics and compute | mesh/stream pipelines counted, not recorded or prewarmed | their replay needs the stream path; v1 covers VS/PS/GS graphics and compute |
+| D22 | 6.2, AC5 | precache priority P2 | existing preload threads stay; their count rises from 3 to 7 on the PC (Proposed) | AC5 arithmetic (section 4.D) |
