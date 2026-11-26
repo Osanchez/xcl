@@ -2045,7 +2045,11 @@ pub fn telemetry_execute(queue: *mut c_void, lists: &[*mut c_void], submit: impl
         return;
     };
     let origin = if IN_PRESENT_SPAN.with(|c| c.get()) { "present" } else { "submit" };
+    let seq_before = tel.seq.load(Ordering::Relaxed);
     tel.execute(queue, lists, origin, submit, &mut global_sink);
+    // the lists' numbers when this call took exactly `lists.len()` of them (not when another thread submitted meanwhile)
+    let seq0 = (tel.seq.load(Ordering::Relaxed) == seq_before + lists.len() as u64).then_some(seq_before);
+    crate::hle::d3d12x::pass_capture::after_submit(queue, lists, seq0);
 }
 
 /// The number of the last submission `telemetry_execute` stamped (`None` before the first, or
@@ -2206,6 +2210,7 @@ pub fn telemetry_list_reset(list: *mut c_void) {
     if let Some(t) = GPU.get() {
         t.list_reset(list, xlog::telemetry_on(Tier::Pass));
     }
+    crate::hle::d3d12x::pass_capture::list_reset(list);
 }
 
 /// A draw with the pipeline `pso` (the resolved pointer) was recorded into `list`.

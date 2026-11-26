@@ -409,6 +409,46 @@ pub fn record(list: &ID3D12GraphicsCommandList, k: &Kernel, src_va: u64, partial
     groups
 }
 
+/// The bytes of a 24-bit BMP of `rgb` (`w * h` pixels, R, G, B, top row first): 54-byte header,
+/// rows bottom-up in B, G, R order, each padded to 4 bytes. None when `rgb` is too short.
+fn bmp_bytes(w: u32, h: u32, rgb: &[u8]) -> Option<Vec<u8>> {
+    let (wz, hz) = (w as usize, h as usize);
+    if rgb.len() < wz * hz * 3 {
+        return None;
+    }
+    let stride = (wz * 3 + 3) & !3;
+    let size = 54 + stride * hz;
+    let mut out = Vec::with_capacity(size);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(size as u32).to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&((stride * hz) as u32).to_le_bytes());
+    out.extend_from_slice(&2835u32.to_le_bytes());
+    out.extend_from_slice(&2835u32.to_le_bytes());
+    out.extend_from_slice(&[0; 8]);
+    for y in (0..hz).rev() {
+        for x in 0..wz {
+            let i = (y * wz + x) * 3;
+            out.extend_from_slice(&[rgb[i + 2], rgb[i + 1], rgb[i]]);
+        }
+        out.resize(out.len() + (stride - wz * 3), 0);
+    }
+    Some(out)
+}
+
+/// Writes a 24-bit bottom-up BMP of `rgb` (`w * h` pixels, R, G, B, top row first) to `path`.
+pub fn write_bmp(path: &std::path::Path, w: u32, h: u32, rgb: &[u8]) -> std::io::Result<()> {
+    let bytes = bmp_bytes(w, h, rgb).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pixel data shorter than w * h * 3"))?;
+    std::fs::write(path, bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +456,23 @@ mod tests {
 
     fn part(min: f32, max: f32, sum: f32, zero: u32, nan: u32, count: u32, h1: u32, h2: u32) -> Partial {
         Partial { min: [min; 4], max: [max; 4], sum: [sum; 4], zero, nan, inf: 0, count, h1, h2 }
+    }
+
+    #[test]
+    fn write_bmp_header_is_valid() {
+        // 2 x 2: rows of 6 bytes padded to 8, so 54 + 16 = 70 bytes; bottom row first, B, G, R
+        let rgb = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let b = bmp_bytes(2, 2, &rgb).unwrap();
+        assert_eq!(&b[0..2], b"BM");
+        assert_eq!(u32::from_le_bytes(b[2..6].try_into().unwrap()), 70);
+        assert_eq!(b.len(), 70);
+        assert_eq!(u32::from_le_bytes(b[10..14].try_into().unwrap()), 54);
+        assert_eq!(u32::from_le_bytes(b[14..18].try_into().unwrap()), 40);
+        assert_eq!((u32::from_le_bytes(b[18..22].try_into().unwrap()), u32::from_le_bytes(b[22..26].try_into().unwrap())), (2, 2));
+        assert_eq!(u16::from_le_bytes(b[28..30].try_into().unwrap()), 24);
+        assert_eq!(&b[54..62], &[9, 8, 7, 12, 11, 10, 0, 0]);
+        assert_eq!(&b[62..70], &[3, 2, 1, 6, 5, 4, 0, 0]);
+        assert!(bmp_bytes(2, 2, &rgb[..11]).is_none());
     }
 
     #[test]

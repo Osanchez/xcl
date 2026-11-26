@@ -28,8 +28,7 @@ pub mod layout;
 mod leave_out;
 pub mod list_x;
 pub mod null;
-#[allow(dead_code)] // take() is used by the stats unit that follows
-mod pass_capture;
+pub mod pass_capture;
 pub mod present;
 pub mod pso_async;
 pub mod pso_manifest;
