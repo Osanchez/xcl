@@ -2251,7 +2251,8 @@ pub fn telemetry_dispatch(list: *mut c_void, pso: usize) {
 // ---- call counts: totals and calls left out, by kind and reason (part 3b) ----
 
 /// Counted calls, in this order; frame and activity fields take these names.
-pub const COUNT_NAMES: [&str; 33] = [
+pub const COUNTS_LEN: usize = 36;
+pub const COUNT_NAMES: [&str; COUNTS_LEN] = [
     "draw_total", "ei_draw_total", "dispatch_total", "ei_dispatch_total",            // 0-3 totals
     "ei_draw_skip_building", "ei_draw_skip_late", "ei_draw_skip_abandoned",          // 4-6
     "ei_draw_skip_quarantined", "ei_draw_skip_failed", "ei_draw_skip_other",         // 7-9
@@ -2262,8 +2263,9 @@ pub const COUNT_NAMES: [&str; 33] = [
     "dispatch_skip_quarantined", "dispatch_skip_failed", "dispatch_skip_other",      // 23-25
     "ei_after_skipped_dispatch", "mustdraw_skipped", "mustdraw_wait_timeout",        // 26-28
     "mustdraw_wait_us", "cache_hit_layer", "cache_miss_layer", "reserved_0",         // 29-32
+    "dispatch_skip_left_out", "dispatch_skip_rt_off", "dispatch_skip_rt_incomplete", // 33-35
 ];
-static COUNTS: [AtomicU64; 33] = [const { AtomicU64::new(0) }; 33];
+static COUNTS: [AtomicU64; COUNTS_LEN] = [const { AtomicU64::new(0) }; COUNTS_LEN];
 
 const DRAW_TOTAL: usize = 0;
 const EI_DRAW_TOTAL: usize = 1;
@@ -2277,6 +2279,9 @@ const DRAW_PC: usize = 16;
 const DISPATCH_SKIP_BUILDING: usize = 17;
 const DISPATCH_SKIP_FAILED: usize = 24;
 const DISPATCH_SKIP_OTHER: usize = 25;
+const DISPATCH_SKIP_LEFT_OUT: usize = 33;
+const DISPATCH_SKIP_RT_OFF: usize = 34;
+const DISPATCH_SKIP_RT_INCOMPLETE: usize = 35;
 const EI_AFTER_SKIPPED_DISPATCH: usize = 26;
 const MUSTDRAW_SKIPPED: usize = 27;
 const MUSTDRAW_WAIT_TIMEOUT: usize = 28;
@@ -2289,8 +2294,8 @@ fn bump(i: usize) {
 }
 
 /// The call counts now (relaxed loads).
-pub fn counts_now() -> [u64; 33] {
-    let mut a = [0u64; 33];
+pub fn counts_now() -> [u64; COUNTS_LEN] {
+    let mut a = [0u64; COUNTS_LEN];
     for (x, c) in a.iter_mut().zip(COUNTS.iter()) {
         *x = c.load(Ordering::Relaxed);
     }
@@ -2325,6 +2330,9 @@ fn skip_index(call: Call, why: Option<&str>) -> usize {
             Some("abandoned") => DISPATCH_SKIP_BUILDING + 5,
             Some("quarantined") => DISPATCH_SKIP_BUILDING + 6,
             Some("failed") => DISPATCH_SKIP_FAILED,
+            Some("left_out") => DISPATCH_SKIP_LEFT_OUT,
+            Some("rt_off") => DISPATCH_SKIP_RT_OFF,
+            Some("rt_incomplete") => DISPATCH_SKIP_RT_INCOMPLETE,
             Some(_) => DISPATCH_SKIP_OTHER,
         };
     }
@@ -2383,6 +2391,15 @@ pub fn telemetry_skip(list: *mut c_void, call: Call, pso: usize) {
         return;
     }
     note_skip(list, call, crate::hle::d3d12x::pso_async::skipped(pso));
+}
+
+/// A compute program was left out by `rule` at `stage`: writes its `left_out` event.
+pub fn telemetry_left_out(record: u64, rule: &str, stage: &str) {
+    if !xlog::telemetry_on(Tier::Frame) {
+        return;
+    }
+    let f: [(&'static str, Value); 3] = [("record", format!("{record:016x}").into()), ("rule", rule.into()), ("stage", stage.into())];
+    xlog::event(Tier::Frame, "left_out", &f);
 }
 
 /// A call of `call` on `list` is left out for a reason that is not a pipeline's (a two-pass
@@ -2463,8 +2480,8 @@ pub fn telemetry_mustdraw_wait(took: Duration, timed_out: bool) {
 
 /// pure: the fields of a frame's call-count deltas `d`: the four totals always, the others when
 /// non-zero. `mustdraw_wait_us` (29) is written by the frame as `mustdraw_wait_ms`; `reserved_0` never.
-fn frame_count_fields(d: &[u64; 33]) -> Vec<(&'static str, u64)> {
-    (0..32).filter(|&i| i != MUSTDRAW_WAIT_US && (i < 4 || d[i] != 0)).map(|i| (COUNT_NAMES[i], d[i])).collect()
+fn frame_count_fields(d: &[u64; COUNTS_LEN]) -> Vec<(&'static str, u64)> {
+    (0..COUNTS_LEN).filter(|&i| i != 32 && i != MUSTDRAW_WAIT_US && (i < 4 || d[i] != 0)).map(|i| (COUNT_NAMES[i], d[i])).collect()
 }
 
 /// The pipeline `pso` (a pointer) was bound on `list`.
@@ -2964,7 +2981,7 @@ struct Counters {
     wait_ns: u64,
     wait_calls: u64,
     barriers: u64,
-    counts: [u64; 33],
+    counts: [u64; COUNTS_LEN],
 }
 
 impl Default for Counters {
@@ -2974,7 +2991,7 @@ impl Default for Counters {
 }
 
 impl Counters {
-    const ZERO: Counters = Counters { draws: 0, dispatches: 0, pso_draw_us: 0, pso_dispatch_us: 0, look_us: 0, wait_ns: 0, wait_calls: 0, barriers: 0, counts: [0; 33] };
+    const ZERO: Counters = Counters { draws: 0, dispatches: 0, pso_draw_us: 0, pso_dispatch_us: 0, look_us: 0, wait_ns: 0, wait_calls: 0, barriers: 0, counts: [0; COUNTS_LEN] };
 
     /// bind::activity (draws, dispatches), pso_async::blocked (total us, graphics + compute),
     /// sparse::look_counters()[0] (whole looks, us), and the wait counters above.
@@ -3011,7 +3028,7 @@ struct FrameRec {
     pso_wait_dispatch_ms: f64,
     look_ms: f64,
     /// call counts of the frame (deltas)
-    counts: [u64; 33],
+    counts: [u64; COUNTS_LEN],
     lists: u32,
     sampled: bool,
     /// calibrated [start, end) of this frame's lists with valid ticks
@@ -3632,8 +3649,35 @@ mod tests {
     }
 
     #[test]
+    fn skip_index_maps_new_reasons() {
+        for call in [Call::Dispatch, Call::Indirect(true)] {
+            assert_eq!(skip_index(call, Some("left_out")), 33, "{call:?}");
+            assert_eq!(skip_index(call, Some("rt_off")), 34, "{call:?}");
+            assert_eq!(skip_index(call, Some("rt_incomplete")), 35, "{call:?}");
+        }
+        // a draw kind does not know them: they map where an unknown reason maps today
+        for r in ["left_out", "rt_off", "rt_incomplete"] {
+            assert_eq!(skip_index(Call::Draw, Some(r)), skip_index(Call::Draw, Some("nothing known")), "{r}");
+            assert_eq!(skip_index(Call::Indirect(false), Some(r)), skip_index(Call::Indirect(false), Some("nothing known")), "{r}");
+        }
+        assert_eq!(&COUNT_NAMES[33..], ["dispatch_skip_left_out", "dispatch_skip_rt_off", "dispatch_skip_rt_incomplete"]);
+    }
+
+    #[test]
+    fn frame_fields_include_new_slots_not_reserved() {
+        let mut d = [0u64; COUNTS_LEN];
+        d[32] = 9; // reserved_0
+        d[33] = 2;
+        d[35] = 4;
+        let f = frame_count_fields(&d);
+        assert!(f.contains(&("dispatch_skip_left_out", 2)));
+        assert!(f.contains(&("dispatch_skip_rt_incomplete", 4)));
+        assert!(!f.iter().any(|(n, _)| *n == "dispatch_skip_rt_off" || *n == "reserved_0"));
+    }
+
+    #[test]
     fn frame_count_fields_keep_totals_and_drop_zero_skips() {
-        let mut d = [0u64; 33];
+        let mut d = [0u64; COUNTS_LEN];
         let f = frame_count_fields(&d);
         assert_eq!(f, [("draw_total", 0), ("ei_draw_total", 0), ("dispatch_total", 0), ("ei_dispatch_total", 0)]);
         d[0] = 400;
@@ -3650,7 +3694,7 @@ mod tests {
     fn frame_book_takes_count_deltas() {
         let mut b = FrameBook::new();
         let mut c = close_of(1, 16, 1, true);
-        let mut counts = [0u64; 33];
+        let mut counts = [0u64; COUNTS_LEN];
         counts[0] = 100;
         counts[4] = 10;
         counts[29] = 1500;

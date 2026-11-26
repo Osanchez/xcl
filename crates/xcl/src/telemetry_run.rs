@@ -348,19 +348,19 @@ fn activity_pso_fields(pso_us: u64, pso_us_prev: u64, builds: u64, builds_prev: 
 }
 
 /// The call counts at the previous `activity` event.
-static ACTIVITY_COUNTS: std::sync::Mutex<[u64; 33]> = std::sync::Mutex::new([0; 33]);
+static ACTIVITY_COUNTS: std::sync::Mutex<[u64; super::COUNTS_LEN]> = std::sync::Mutex::new([0; super::COUNTS_LEN]);
 
 /// pure: the 2 s deltas of the call counts: `draw_total`, `draw_no_output` (the left-out and
 /// stand-in draws, counts 4-15), `dispatch_total`, `dispatch_skipped` (counts 17-25),
 /// `cache_hit_layer`, `cache_miss_layer` and `mustdraw_wait_ms` (3 decimals).
-fn activity_count_fields(now: &[u64; 33], prev: &[u64; 33]) -> Vec<(&'static str, serde_json::Value)> {
+fn activity_count_fields(now: &[u64; super::COUNTS_LEN], prev: &[u64; super::COUNTS_LEN]) -> Vec<(&'static str, serde_json::Value)> {
     let d = |i: usize| now[i].saturating_sub(prev[i]);
     let sum = |r: std::ops::Range<usize>| r.map(d).sum::<u64>();
     vec![
         ("draw_total", d(0).into()),
         ("draw_no_output", sum(4..16).into()),
         ("dispatch_total", d(2).into()),
-        ("dispatch_skipped", sum(17..26).into()),
+        ("dispatch_skipped", (sum(17..26) + sum(33..36)).into()),
         ("cache_hit_layer", d(30).into()),
         ("cache_miss_layer", d(31).into()),
         ("mustdraw_wait_ms", (d(29) as f64 / 1000.0).into()),
@@ -1356,8 +1356,8 @@ mod telemetry_p5e_tests {
 
     #[test]
     fn activity_count_fields_are_deltas_and_sums() {
-        let mut prev = [0u64; 33];
-        let mut now = [0u64; 33];
+        let mut prev = [0u64; super::super::COUNTS_LEN];
+        let mut now = [0u64; super::super::COUNTS_LEN];
         now[0] = 500;
         prev[0] = 100;
         now[2] = 40;
@@ -1389,6 +1389,22 @@ mod telemetry_p5e_tests {
         // a count that went back never wraps
         let f = activity_count_fields(&prev, &now);
         assert!(f.iter().all(|(_, v)| v.as_f64() == Some(0.0)));
+    }
+
+    #[test]
+    fn activity_dispatch_skipped_sums_new_slots() {
+        let prev = [0u64; super::super::COUNTS_LEN];
+        let mut now = [0u64; super::super::COUNTS_LEN];
+        now[17] = 1;
+        now[25] = 2;
+        now[26] = 50; // not a skip of a dispatch
+        now[32] = 60; // reserved_0
+        now[33] = 3;
+        now[34] = 4;
+        now[35] = 5;
+        let f = activity_count_fields(&now, &prev);
+        let skipped = f.iter().find(|(n, _)| *n == "dispatch_skipped").unwrap().1.clone();
+        assert_eq!(skipped, serde_json::json!(1 + 2 + 3 + 4 + 5));
     }
 
     #[test]
