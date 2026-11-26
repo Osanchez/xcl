@@ -248,6 +248,11 @@ use std::sync::atomic::AtomicU64;
 
 use crate::log::{self as xlog, Tier};
 
+/// Fork-only telemetry code that lives in its own files (never referenced by upstream files except through one-line calls).
+#[path = "telemetry_run.rs"]
+mod run_tel;
+pub use run_tel::*;
+
 /// `manifest.json` of a telemetry run (schema 1). Unknown values stay JSON null.
 #[derive(Serialize, Default, Clone)]
 struct Manifest {

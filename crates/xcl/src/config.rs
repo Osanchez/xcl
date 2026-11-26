@@ -255,6 +255,19 @@ impl Config {
         let mode = env.as_deref().unwrap_or(self.raytracing.as_str()).trim();
         parse_raytracing_tier(mode)
     }
+
+    /// `XCL_WINDOW_SIZE=<w>x<h>` (1..=16384 each, `x` any case) overrides window_width/height;
+    /// an invalid value warns once and keeps xcl.toml's.
+    pub fn window_size(&self) -> (u32, u32) {
+        if let Ok(v) = std::env::var("XCL_WINDOW_SIZE") {
+            if let Some(size) = parse_window_size(&v) {
+                return size;
+            }
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| crate::xlog_warn!("XCL_WINDOW_SIZE={v:?} is not <w>x<h> (1..=16384): using xcl.toml's size"));
+        }
+        (self.window_width, self.window_height)
+    }
 }
 
 pub fn parse_device_type(raw: &str) -> Option<&'static str> {
@@ -275,6 +288,12 @@ pub fn parse_raytracing_tier(mode: &str) -> Option<u32> {
     } else {
         None
     }
+}
+
+pub fn parse_window_size(v: &str) -> Option<(u32, u32)> {
+    let (w, h) = v.trim().split_once(['x', 'X'])?;
+    let dim = |s: &str| s.parse::<u32>().ok().filter(|n| (1..=16384).contains(n));
+    Some((dim(w)?, dim(h)?))
 }
 
 /// Everything the host process needs; written by the launcher as JSON.
@@ -428,5 +447,19 @@ mod tests {
         assert_eq!(parse_raytracing_tier("tier1_1"), Some(11));
         assert_eq!(parse_raytracing_tier("1.1"), Some(11));
         assert_eq!(parse_raytracing_tier("11"), Some(11));
+    }
+
+    #[test]
+    fn window_size_takes_w_x_h() {
+        assert_eq!(parse_window_size("1280x720"), Some((1280, 720)));
+        assert_eq!(parse_window_size("1X1"), Some((1, 1)));
+        assert_eq!(parse_window_size("16384x16384"), Some((16384, 16384)));
+        assert_eq!(parse_window_size("0x5"), None);
+        assert_eq!(parse_window_size("x720"), None);
+        assert_eq!(parse_window_size("16385x1"), None);
+        assert_eq!(parse_window_size(" 640x480 "), Some((640, 480)));
+        assert_eq!(parse_window_size("640 x 480"), None);
+        assert_eq!(parse_window_size("640x480x2"), None);
+        assert_eq!(parse_window_size(""), None);
     }
 }

@@ -477,7 +477,8 @@ fn window_thread() {
         RegisterClassW(&wc);
         let cfg = crate::state::config();
         let title = window_name();
-        let mut rc = RECT { left: 0, top: 0, right: cfg.window_width as i32, bottom: cfg.window_height as i32 };
+        let (ww, wh) = cfg.window_size();
+        let mut rc = RECT { left: 0, top: 0, right: ww as i32, bottom: wh as i32 };
         let _ = AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false);
         let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
         let (x, y) = window_position(&cfg.window_pos, w, h);
@@ -500,7 +501,7 @@ fn window_thread() {
             return;
         };
         HWND_RAW.store(hwnd.0 as isize, Ordering::Release);
-        crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
+        crate::xlog_info!("XCL window created ({}x{})", ww, wh);
         crate::hle::kbm::attach(hwnd.0);
         SetTimer(Some(hwnd), COMPILE_TIMER, 500, None);
         let mut msg = MSG::default();
@@ -1075,10 +1076,12 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
         (mw, mh)
     };
     let Some(fmt) = swap_format(resolved[0].1.Format) else { return };
+    if crate::report::present_bypass(false) { p.last = Instant::now(); return frame_shown(w, h); }
     let Some(hwnd) = ensure_window() else { return };
     if p.queue != queue {
         return; // swap chain is bound to the first queue we presented from
     }
+    if crate::report::present_bypass(true) { p.last = Instant::now(); return frame_shown(w, h); }
     // rotate to the oldest in-flight allocator slot and wait only for its fence (frame N-2)
     if let Err(e) = prepare_pipelined_slot(p, is_frame) {
         p.disabled = matches!(&e, FenceError::Removed(_));
@@ -1234,6 +1237,10 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
             }
         }
     }
+    frame_shown(w, h);
+}
+
+fn frame_shown(w: u32, h: u32) {
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
     if super::pso_manifest::present_milestone(n + 1) {
         super::pso_manifest::note(super::pso_manifest::Event::Present { n: n + 1 });
