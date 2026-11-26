@@ -223,18 +223,36 @@ pub fn telemetry_gpu_fault(va: u64, window: &str, allocations: &str, freed: &str
 }
 
 /// DRED's line of one command list (`list` is the pointer, written as hex text).
-pub fn telemetry_gpu_fault_list(list: usize, done: usize, count: usize, bound: &str) {
+pub fn telemetry_gpu_fault_list(list: usize, done: usize, count: usize, bound: &str, marker: &str) {
     if !crate::log::telemetry_on(crate::log::Tier::Frame) {
         return;
     }
-    let extra: [(&'static str, serde_json::Value); 5] = [
+    let extra: [(&'static str, serde_json::Value); 6] = [
         ("what", "breadcrumb".into()),
         ("list", format!("{list:#x}").into()),
         ("done", done.into()),
         ("count", count.into()),
         ("bound", bound.into()),
+        ("marker", marker.into()),
     ];
     telemetry_error(ErrKind::GpuFault, "dred", "command list breadcrumbs", None, false, &extra);
+}
+
+/// DRED's summary after a device removal: the device state, the lists' progress
+/// `(complete, unfinished, not started)` and the page fault address (`va` is null without one).
+pub fn telemetry_dred_summary(state: &str, lists: (usize, usize, usize), page_fault: Option<u64>) {
+    if !crate::log::telemetry_on(crate::log::Tier::Frame) {
+        return;
+    }
+    let extra: [(&'static str, serde_json::Value); 6] = [
+        ("what", "dred_summary".into()),
+        ("device_state", state.into()),
+        ("complete", lists.0.into()),
+        ("unfinished", lists.1.into()),
+        ("not_started", lists.2.into()),
+        ("va", page_fault.map_or(serde_json::Value::Null, |va| format!("{va:#x}").into())),
+    ];
+    telemetry_error(ErrKind::GpuFault, "dred", "summary", None, false, &extra);
 }
 
 /// `unhandled_filter`: the title raised an exception nobody handled (fatal unless one came first).

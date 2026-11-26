@@ -518,6 +518,11 @@ pub fn init() -> Result<String, String> {
                 Ok(d) => {
                     d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                     d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    if let Ok(d1) = d.cast::<ID3D12DeviceRemovedExtendedDataSettings1>() {
+                        d1.SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    } else {
+                        crate::xlog_warn!("D3D12: DRED 1.2 breadcrumb contexts unavailable");
+                    }
                 }
                 Err(e) => {
                     crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
@@ -8050,22 +8055,113 @@ pub fn drain_gpu() {
     }
 }
 
+/// What the breadcrumb lists of `D3D12_AUTO_BREADCRUMB_NODE` and `..._NODE1` give.
+trait DredNode: Sized {
+    unsafe fn count(&self) -> u32;
+    unsafe fn last_done(&self) -> u32;
+    unsafe fn next(&self) -> *const Self;
+    unsafe fn list(&self) -> *mut c_void;
+    unsafe fn queue(&self) -> *mut c_void;
+    unsafe fn history(&self) -> *const D3D12_AUTO_BREADCRUMB_OP;
+    unsafe fn name(&self) -> Option<String>;
+    /// `(BreadcrumbIndex, text)` of the breadcrumb contexts (DRED 1.2); none for a `NODE`
+    unsafe fn contexts(&self) -> Vec<(u32, String)>;
+}
+
+impl DredNode for D3D12_AUTO_BREADCRUMB_NODE {
+    unsafe fn count(&self) -> u32 { self.BreadcrumbCount }
+    unsafe fn last_done(&self) -> u32 { self.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0) }
+    unsafe fn next(&self) -> *const Self { self.pNext }
+    unsafe fn list(&self) -> *mut c_void { self.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw()) }
+    unsafe fn queue(&self) -> *mut c_void { self.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()) }
+    unsafe fn history(&self) -> *const D3D12_AUTO_BREADCRUMB_OP { self.pCommandHistory }
+    unsafe fn name(&self) -> Option<String> { if self.pCommandListDebugNameW.is_null() { None } else { self.pCommandListDebugNameW.to_string().ok() } }
+    unsafe fn contexts(&self) -> Vec<(u32, String)> { Vec::new() }
+}
+
+impl DredNode for D3D12_AUTO_BREADCRUMB_NODE1 {
+    unsafe fn count(&self) -> u32 { self.BreadcrumbCount }
+    unsafe fn last_done(&self) -> u32 { self.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0) }
+    unsafe fn next(&self) -> *const Self { self.pNext }
+    unsafe fn list(&self) -> *mut c_void { self.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw()) }
+    unsafe fn queue(&self) -> *mut c_void { self.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()) }
+    unsafe fn history(&self) -> *const D3D12_AUTO_BREADCRUMB_OP { self.pCommandHistory }
+    unsafe fn name(&self) -> Option<String> { if self.pCommandListDebugNameW.is_null() { None } else { self.pCommandListDebugNameW.to_string().ok() } }
+    unsafe fn contexts(&self) -> Vec<(u32, String)> {
+        if self.pBreadcrumbContexts.is_null() {
+            return Vec::new();
+        }
+        std::slice::from_raw_parts(self.pBreadcrumbContexts as *const D3D12_DRED_BREADCRUMB_CONTEXT, self.BreadcrumbContextsCount as usize)
+            .iter()
+            .map(|c| (c.BreadcrumbIndex, if c.pContextString.is_null() { String::new() } else { c.pContextString.to_string().unwrap_or_default() }))
+            .collect()
+    }
+}
+
 /// DRED gives us a linked list in driver order. Keep the diagnostic bounded even on a
 /// long chain, with room in the log for work that the GPU had already started.
-unsafe fn report_dred_lists(head: *const D3D12_AUTO_BREADCRUMB_NODE, mut report: impl FnMut(&D3D12_AUTO_BREADCRUMB_NODE, usize)) {
-    const SCAN_LIMIT: usize = 4096;
+unsafe fn report_dred_lists<N: DredNode>(head: *const N, mut report: impl FnMut(&N, usize)) {
     const REPORT_LIMIT: usize = 64;
-    let nodes = || std::iter::successors(head.as_ref(), |node| node.pNext.as_ref()).take(SCAN_LIMIT);
     let mut reported = 0;
     for started in [true, false] {
-        for node in nodes() {
-            let done = node.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
-            if done < node.BreadcrumbCount && (done != 0) == started {
+        for node in dred_nodes(head) {
+            let (done, count) = (node.last_done(), node.count());
+            if done < count && (done != 0) == started {
                 report(node, done as usize);
                 reported += 1;
                 if reported == REPORT_LIMIT { return; }
             }
         }
+    }
+}
+
+/// The nodes of a DRED list, bounded.
+unsafe fn dred_nodes<'a, N: DredNode + 'a>(head: *const N) -> impl Iterator<Item = &'a N> {
+    const SCAN_LIMIT: usize = 4096;
+    std::iter::successors(head.as_ref(), |node| node.next().as_ref()).take(SCAN_LIMIT)
+}
+
+/// `(complete, unfinished, not started)` of lists given as `(done, count)`.
+fn summarize(nodes: impl Iterator<Item = (u32, u32)>) -> (usize, usize, usize) {
+    nodes.fold((0, 0, 0), |(c, u, n), (done, count)| {
+        if done >= count { (c + 1, u, n) } else if done == 0 { (c, u, n + 1) } else { (c, u + 1, n) }
+    })
+}
+
+/// The log lines of the lists' summary.
+fn summary_lines(counts: (usize, usize, usize)) -> Vec<String> {
+    let (complete, unfinished, not_started) = counts;
+    let mut lines = vec![format!("DRED: {} lists: {complete} complete, {unfinished} unfinished, {not_started} not started", complete + unfinished + not_started)];
+    if unfinished + not_started == 0 {
+        lines.push("DRED: no list has unfinished work".to_string());
+    }
+    lines
+}
+
+/// The history of a list is a ring of 65536 operations: operation `op` is at this index.
+fn history_index(op: u32) -> usize {
+    (op % 65536) as usize
+}
+
+/// How many operations of a list's `count` are in its history.
+fn history_len(count: u32) -> usize {
+    count.min(65536) as usize
+}
+
+/// The text of the last breadcrumb context at or before operation `op`.
+fn context_before(contexts: &[(u32, String)], op: u32) -> Option<&str> {
+    contexts.iter().filter(|c| c.0 <= op).max_by_key(|c| c.0).map(|c| c.1.as_str())
+}
+
+fn device_state_text(state: D3D12_DRED_DEVICE_STATE) -> &'static str {
+    if state == D3D12_DRED_DEVICE_STATE_HUNG {
+        "hung"
+    } else if state == D3D12_DRED_DEVICE_STATE_FAULT {
+        "fault"
+    } else if state == D3D12_DRED_DEVICE_STATE_PAGEFAULT {
+        "pagefault"
+    } else {
+        "unknown"
     }
 }
 
@@ -8093,6 +8189,42 @@ mod dred_tests {
             assert_eq!((node, done), (std::ptr::from_ref(&nodes[i]), 0));
         }
     }
+
+    #[test]
+    fn history_index_wraps_at_65536() {
+        assert_eq!(history_index(65535), 65535);
+        assert_eq!(history_index(65536), 0);
+        assert_eq!(history_len(70000), 65536);
+        assert_eq!(history_len(12), 12);
+    }
+
+    #[test]
+    fn summarize_counts_complete_unfinished_unstarted() {
+        assert_eq!(summarize([(2, 2), (1, 2), (0, 2)].into_iter()), (1, 1, 1));
+    }
+
+    #[test]
+    fn no_unfinished_work_is_reported_when_all_complete() {
+        let lines = summary_lines(summarize([(2, 2), (5, 5)].into_iter()));
+        assert_eq!(lines, ["DRED: 2 lists: 2 complete, 0 unfinished, 0 not started", "DRED: no list has unfinished work"]);
+        assert_eq!(summary_lines((1, 1, 0)).len(), 1);
+    }
+
+    #[test]
+    fn context_before_picks_the_last_marker_at_or_before_the_op() {
+        let contexts = vec![(2, "xcl cs 1111222233334444".to_string()), (6, "xcl cs 5555666677778888".to_string())];
+        assert_eq!(context_before(&contexts, 5), Some("xcl cs 1111222233334444"));
+        assert_eq!(context_before(&contexts, 6), Some("xcl cs 5555666677778888"));
+        assert_eq!(context_before(&contexts, 1), None);
+    }
+
+    #[test]
+    fn device_state_text_names_all_states() {
+        assert_eq!(device_state_text(D3D12_DRED_DEVICE_STATE_UNKNOWN), "unknown");
+        assert_eq!(device_state_text(D3D12_DRED_DEVICE_STATE_HUNG), "hung");
+        assert_eq!(device_state_text(D3D12_DRED_DEVICE_STATE_FAULT), "fault");
+        assert_eq!(device_state_text(D3D12_DRED_DEVICE_STATE_PAGEFAULT), "pagefault");
+    }
 }
 
 /// If the device was removed: the reason, DRED's page fault (address, the allocations around
@@ -8109,40 +8241,116 @@ pub fn log_device_removed() {
     crate::report::telemetry_device_removed(e.code().0, &e.message().to_string());
     unsafe {
         let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
-        if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
-            let names = |mut n: *const D3D12_DRED_ALLOCATION_NODE| {
-                let mut v = Vec::new();
-                while !n.is_null() && v.len() < 8 {
-                    let a = &*n;
-                    let name = if a.ObjectNameA.is_null() { String::new() } else { std::ffi::CStr::from_ptr(a.ObjectNameA as *const std::ffi::c_char).to_string_lossy().into_owned() };
-                    v.push(format!("type {} {}", a.AllocationType.0, name));
-                    n = a.pNext;
-                }
-                v.join(", ")
-            };
-            let va = pf.PageFaultVA;
+        let dred1 = dev.cast::<ID3D12DeviceRemovedExtendedData1>().ok();
+        let dred2 = dev.cast::<ID3D12DeviceRemovedExtendedData2>().ok();
+        let state = dred2.as_ref().map_or("unavailable", |d| device_state_text(d.GetDeviceState()));
+        crate::xlog_error!("DRED: device state {state}");
+        let names = |mut n: *const D3D12_DRED_ALLOCATION_NODE| {
+            let mut v = Vec::new();
+            while !n.is_null() && v.len() < 8 {
+                let a = &*n;
+                let name = if a.ObjectNameA.is_null() { String::new() } else { std::ffi::CStr::from_ptr(a.ObjectNameA as *const std::ffi::c_char).to_string_lossy().into_owned() };
+                v.push(format!("type {} {}", a.AllocationType.0, name));
+                n = a.pNext;
+            }
+            v.join(", ")
+        };
+        // ObjectNameW first (DRED 1.2 has both)
+        let names1 = |mut n: *const D3D12_DRED_ALLOCATION_NODE1| {
+            let mut v = Vec::new();
+            while !n.is_null() && v.len() < 8 {
+                let a = &*n;
+                let name = if !a.ObjectNameW.is_null() {
+                    a.ObjectNameW.to_string().unwrap_or_default()
+                } else if !a.ObjectNameA.is_null() {
+                    std::ffi::CStr::from_ptr(a.ObjectNameA as *const std::ffi::c_char).to_string_lossy().into_owned()
+                } else {
+                    String::new()
+                };
+                v.push(format!("type {} {}", a.AllocationType.0, name));
+                n = a.pNext;
+            }
+            v.join(", ")
+        };
+        // (address, allocations there, recently freed, DRED 1.2 flags)
+        let mut fault: Option<(u64, String, String, Option<i32>)> = None;
+        if dred2.is_some() && state != "pagefault" {
+            crate::xlog_error!("DRED: no page fault recorded (device state {state})");
+        } else if let Some(d2) = &dred2 {
+            let mut pf = D3D12_DRED_PAGE_FAULT_OUTPUT2::default();
+            match d2.GetPageFaultAllocationOutput2(&mut pf) {
+                Ok(()) => fault = Some((pf.PageFaultVA, names1(pf.pHeadExistingAllocationNode), names1(pf.pHeadRecentFreedAllocationNode), Some(pf.PageFaultFlags.0 as i32))),
+                Err(e) => crate::xlog_error!("DRED: GetPageFaultAllocationOutput2 failed: {e}"),
+            }
+        } else if let Some(d1) = &dred1 {
+            match d1.GetPageFaultAllocationOutput1() {
+                Ok(pf) => fault = Some((pf.PageFaultVA, names1(pf.pHeadExistingAllocationNode), names1(pf.pHeadRecentFreedAllocationNode), None)),
+                Err(e) => crate::xlog_error!("DRED: GetPageFaultAllocationOutput1 failed: {e}"),
+            }
+        } else {
+            match dred.GetPageFaultAllocationOutput() {
+                Ok(pf) => fault = Some((pf.PageFaultVA, names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode), None)),
+                Err(e) => crate::xlog_error!("DRED: GetPageFaultAllocationOutput failed: {e}"),
+            }
+        }
+        if let Some((va, existing, freed, flags)) = &fault {
+            let va = *va;
             let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
-            crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
-            crate::report::telemetry_gpu_fault(va, &window, &names(pf.pHeadExistingAllocationNode), &names(pf.pHeadRecentFreedAllocationNode));
+            let flags = flags.map(|f| format!(" (flags {f:#x})")).unwrap_or_default();
+            crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}{flags}; allocations there: [{existing}]; recently freed: [{freed}]");
+            crate::report::telemetry_gpu_fault(va, &window, existing, freed);
         }
-        if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
-            report_dred_lists(bc.pHeadAutoBreadcrumbNode, |node, done| {
-                let count = node.BreadcrumbCount as usize;
-                let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
-                let list = node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw());
-                let history: Vec<i32> = if node.pCommandHistory.is_null() { Vec::new() } else { std::slice::from_raw_parts(node.pCommandHistory, count).iter().map(|o| o.0).collect() };
-                let name = if node.pCommandListDebugNameW.is_null() { None } else { node.pCommandListDebugNameW.to_string().ok() };
-                let key = super::dred::node_list(list as usize, name.as_deref());
-                let mut bound = super::dred::bound_at(key, &history, done).map(|l| format!("; pipeline bound there: {l}")).unwrap_or_default();
-                let after = super::dred::bound_after(key, &history, done);
-                if !after.is_empty() {
-                    bound += &format!("; bound after it: {}", after.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
-                }
-                crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}{bound}", list, node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
-                crate::report::telemetry_gpu_fault_list(list as usize, done, count, &bound);
-            });
+        let mut lists = (0, 0, 0);
+        if let Some(d1) = &dred1 {
+            match d1.GetAutoBreadcrumbsOutput1() {
+                Ok(bc) => lists = log_dred_lists(bc.pHeadAutoBreadcrumbNode),
+                Err(e) => crate::xlog_error!("DRED: GetAutoBreadcrumbsOutput1 failed: {e}"),
+            }
+        } else {
+            match dred.GetAutoBreadcrumbsOutput() {
+                Ok(bc) => lists = log_dred_lists(bc.pHeadAutoBreadcrumbNode),
+                Err(e) => crate::xlog_error!("DRED: GetAutoBreadcrumbsOutput failed: {e}"),
+            }
         }
+        crate::report::telemetry_dred_summary(state, lists, fault.as_ref().map(|f| f.0));
     }
+}
+
+/// The summary of DRED's lists and a line for each list that did not finish.
+unsafe fn log_dred_lists<N: DredNode>(head: *const N) -> (usize, usize, usize) {
+    let counts = summarize(dred_nodes(head).map(|n| (n.last_done(), n.count())));
+    for line in summary_lines(counts) {
+        crate::xlog_error!("{line}");
+    }
+    report_dred_lists(head, |node: &N, done| {
+        let count = node.count();
+        // a list of more than 65536 operations keeps the last 65536 (a ring)
+        let stored = history_len(count);
+        let base = count as usize - stored;
+        let history_ptr = node.history();
+        let history: Vec<i32> = if history_ptr.is_null() { Vec::new() } else { (0..stored).map(|k| (*history_ptr.add(history_index((base + k) as u32))).0).collect() };
+        let done_w = done.saturating_sub(base);
+        let ops: Vec<String> = (done_w.saturating_sub(3)..(done_w + 3).min(history.len())).map(|i| format!("{}{}", if i == done_w { ">" } else { "" }, history[i])).collect();
+        let list = node.list();
+        let name = node.name();
+        let key = super::dred::node_list(list as usize, name.as_deref());
+        let contexts = node.contexts();
+        let marker = context_before(&contexts, done as u32);
+        let mut bound = match marker {
+            Some(m) => format!("; marker: {m}"),
+            None => super::dred::bound_at(key, &history, done_w).map(|l| format!("; pipeline bound there: {l}")).unwrap_or_default(),
+        };
+        let after = super::dred::bound_after(key, &history, done_w);
+        if !after.is_empty() {
+            bound += &format!("; bound after it: {}", after.iter().take(4).cloned().collect::<Vec<_>>().join(", "));
+        }
+        if count as usize > stored {
+            bound += " (history truncated to the last 65536 ops)";
+        }
+        crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}{bound}", list, node.queue(), ops.join(" "));
+        crate::report::telemetry_gpu_fault_list(list as usize, done, count as usize, &bound, marker.unwrap_or(""));
+    });
+    counts
 }
 
 /// The GPU hung or the device was removed: the title is stopped at once (a title that goes on

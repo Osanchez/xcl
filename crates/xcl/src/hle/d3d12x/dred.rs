@@ -63,17 +63,22 @@ pub unsafe fn mark_pipeline(list: *mut c_void, pso: usize, bound: usize) {
     // nothing labelled: a stand-in still building, or a pipeline of PC shaders
     let text = label_of(bound).unwrap_or_else(|| format!("pipeline {pso:#x} (a stand-in, or not translated)"));
     let first = !MARKS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).and_then(|r| r.last()).is_some_and(|v| v.iter().any(Option::is_some));
-    push(list as usize, Some(text));
+    push(list as usize, Some(text.clone()));
     if let Some(l) = ID3D12GraphicsCommandList::from_raw_borrowed(&list) {
         // DRED's node may give the list's name and not its pointer (NVIDIA, Windows 26300)
         if first {
             let _ = l.SetName(&windows::core::HSTRING::from(format!("xcl list {:#x}", list as usize)));
         }
-        let w: Vec<u16> = "xcl pipeline".encode_utf16().chain([0]).collect();
+        let w: Vec<u16> = marker_text(&text).encode_utf16().chain([0]).collect();
         OWN_MARKER.with(|f| f.set(true));
         l.SetMarker(0, Some(w.as_ptr() as *const c_void), (w.len() * 2) as u32);
         OWN_MARKER.with(|f| f.set(false));
     }
+}
+
+/// The text of XCL's marker: DRED's breadcrumb context of the operation carries the label.
+pub fn marker_text(label: &str) -> String {
+    format!("xcl {label}")
 }
 
 /// The title's own `SetMarker` on `list`: counted, so the labels after it stay in step.
@@ -174,6 +179,11 @@ mod tests {
         assert_eq!(recording_of(&recordings, &new_history).unwrap()[0].as_deref(), Some("cs new"));
         // no recording with that many markers: the newest
         assert_eq!(recording_of(&recordings, &[46, 0, 0, 0, 6]).unwrap()[0].as_deref(), Some("cs new"));
+    }
+
+    #[test]
+    fn marker_text_carries_the_label() {
+        assert_eq!(marker_text("cs 1111222233334444"), "xcl cs 1111222233334444");
     }
 
     #[test]
