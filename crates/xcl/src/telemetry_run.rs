@@ -729,6 +729,71 @@ fn phase_frames() -> u64 {
     crate::hle::d3d12x::present::presents()
 }
 
+/// Phase classes of a mark: the title is still (not interactive), playing, or nothing is marked.
+pub const PHASE_UNKNOWN: u8 = 0;
+pub const PHASE_STILL: u8 = 1;
+pub const PHASE_PLAY: u8 = 2;
+
+/// pure: the class of a phase name. `world` plays; the non-interactive names are still; `auto` and
+/// any other name are unknown.
+pub fn phase_class_of(name: &str) -> u8 {
+    match name {
+        "world" => PHASE_PLAY,
+        "boot" | "intro" | "loading" | "menu" | "cutscene" | "splash" | "credits" => PHASE_STILL,
+        _ => PHASE_UNKNOWN,
+    }
+}
+
+/// The class of the last mark (control file or schedule); the automatic guess never sets it.
+static MARK_CLASS: AtomicU8 = AtomicU8::new(PHASE_UNKNOWN);
+
+fn set_mark(name: &str) {
+    MARK_CLASS.store(phase_class_of(name), Ordering::Relaxed);
+}
+
+/// The phase class the user marked (`PHASE_UNKNOWN` with no mark). One atomic load; with telemetry
+/// off, the first call starts `xcl-phase-mark`, which reads the marks only (no events, no files).
+pub fn phase_mark_class() -> u8 {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        if crate::log::telemetry_on(crate::log::Tier::Frame) {
+            return;
+        }
+        let logs_dir = crate::state::boot().map(|b| b.logs_dir());
+        if let Err(e) = std::thread::Builder::new().name("xcl-phase-mark".to_string()).spawn(move || phase_mark_thread(logs_dir)) {
+            crate::xlog_warn!("telemetry: cannot start the phase mark thread: {e}");
+        }
+    });
+    MARK_CLASS.load(Ordering::Relaxed)
+}
+
+/// Telemetry off: the same control file and schedule as `telemetry_poll_thread`, every 250 ms, but
+/// only `set_mark`.
+fn phase_mark_thread(logs_dir: Option<std::path::PathBuf>) {
+    let started = std::time::Instant::now();
+    let path = std::env::var_os("XCL_PHASE_FILE").filter(|v| !v.is_empty()).map(std::path::PathBuf::from).or_else(|| logs_dir.map(|d| d.join("phase")));
+    let mut file = path.map(PhaseFile::new);
+    let (schedule, bad) = match std::env::var("XCL_PHASE_MARK") {
+        Ok(v) => parse_phase_schedule(&v),
+        Err(_) => (Vec::new(), Vec::new()),
+    };
+    for msg in bad {
+        crate::xlog_warn!("telemetry: {msg}");
+    }
+    let mut next_entry = 0usize;
+    loop {
+        if let Some(name) = file.as_mut().and_then(|f| f.poll()) {
+            set_mark(&name);
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        while next_entry < schedule.len() && schedule[next_entry].0 <= elapsed {
+            set_mark(&schedule[next_entry].1);
+            next_entry += 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(PHASE_POLL_MS));
+    }
+}
+
 /// Every 250 ms: the control file, due schedule entries, the counters; every 1 s: classify. Reads only
 /// public counters, holds no lock across a sleep and ends with the process.
 fn telemetry_poll_thread(logs_dir: std::path::PathBuf) {
@@ -755,12 +820,14 @@ fn telemetry_poll_thread(logs_dir: std::path::PathBuf) {
         std::thread::sleep(std::time::Duration::from_millis(PHASE_POLL_MS));
         let frames_now = phase_frames();
         if let Some(name) = file.poll() {
+            set_mark(&name);
             if name != "auto" {
                 write_phase(&name, &mut from_mark, 1.0, "mark", frames_now);
             }
         }
         let elapsed = started.elapsed().as_secs_f64();
         while next_entry < schedule.len() && schedule[next_entry].0 <= elapsed {
+            set_mark(&schedule[next_entry].1);
             write_phase(&schedule[next_entry].1, &mut from_schedule, 1.0, "schedule", frames_now);
             next_entry += 1;
         }
@@ -900,6 +967,26 @@ mod telemetry_p5c_tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn phase_names_map_to_classes() {
+        assert_eq!(phase_class_of("world"), PHASE_PLAY);
+        for n in ["boot", "intro", "loading", "menu", "cutscene", "splash", "credits"] {
+            assert_eq!(phase_class_of(n), PHASE_STILL, "{n}");
+        }
+        assert_eq!(phase_class_of("auto"), PHASE_UNKNOWN);
+        assert_eq!(phase_class_of("bench1"), PHASE_UNKNOWN);
+    }
+
+    #[test]
+    fn a_mark_sets_the_class_and_auto_clears_it() {
+        set_mark("intro");
+        assert_eq!(MARK_CLASS.load(Ordering::Relaxed), PHASE_STILL);
+        set_mark("world");
+        assert_eq!(MARK_CLASS.load(Ordering::Relaxed), PHASE_PLAY);
+        set_mark("auto");
+        assert_eq!(MARK_CLASS.load(Ordering::Relaxed), PHASE_UNKNOWN);
     }
 
     #[test]
