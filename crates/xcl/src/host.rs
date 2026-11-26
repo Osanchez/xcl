@@ -55,6 +55,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
             let mut last_looks = crate::hle::d3d12x::sparse::look_counters();
             let mut last_parts = crate::hle::d3d12x::title_textures::look_parts();
             let mut last_sync = crate::hle::d3d12x::list_x::sync_activity();
+            let headroom_mb: u64 = std::env::var("XCL_VRAM_HEADROOM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+            let mut warned: Option<std::time::Instant> = None;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 let now = snap();
@@ -93,15 +95,16 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
                     c.PrivateUsage
                 };
-                let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
+                let (local, non_local, budget) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0, 0));
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
                 let mb = |b: u64| b >> 20;
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
+                    "memory: {} MB committed by the process; video memory {} MB local (budget {} MB), {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
                     mb(private as u64),
                     mb(local),
+                    mb(budget),
                     mb(non_local),
                     mb(pages as u64),
                     mb(page_pools as u64),
@@ -110,6 +113,17 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                // `XCL_VRAM_HEADROOM_MB` (1024): local video memory that close to the budget warns
+                // (once a minute) – past the budget Windows moves video memory to system memory
+                if budget > 0 && local + (headroom_mb << 20) > budget && warned.is_none_or(|t: std::time::Instant| t.elapsed().as_secs() >= 60) {
+                    crate::xlog_warn!(
+                        "video memory {} MB is within {} MB of the budget Windows gives the process ({} MB): past it, video memory spills to system memory. A smaller title memory (device_type = \"lockhart\" in xcl.toml) or fewer other GPU programs keep it under",
+                        mb(local),
+                        headroom_mb,
+                        mb(budget)
+                    );
+                    warned = Some(std::time::Instant::now());
+                }
                 last = now;
             }
         });
