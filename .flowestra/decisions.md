@@ -9072,3 +9072,781 @@ Draw kinds never receive these reasons. If one did, it would map to slot 4 of it
 - **U3:** role-tagged counts at the three run sites (§3).
 - **U8:** roles and producer counts come from `rt_chain`, not `Pending`. The only change to
   `Pending` is the `standin` field (§3).
+
+## 2026-11-26 Instrumentation: shader code in use, device removal when and where, DRED, debug layer, per-pass output statistics (user: "go ahead ... the instrumentation")
+
+### 0. Approval and orchestrator review
+
+- **User decisions (2026-11-26):** "I think you should do research and figure out how we can add
+  real instrumentation for Nvidia style cards, and get away from just looking at screenshots. Get
+  real data and don't infer what is happening. Find real proof." Then, on the plan: "Go ahead and
+  change the profile for XCL, and also the instrumentation." Then: "For a game like this, I think
+  2gb heap makes sense." Installing other tools (Aftermath Monitor, PIX, WinDbg, RenderDoc,
+  Nsight) is not approved and is out of this entry.
+- **Why:** the device removal in the title's scene was first explained by inference (a hung GPU);
+  the removed reason is 0x887A0005, Windows logged no timeout, and upstream issue #2403 documents
+  the same removal as NVIDIA's limit on the driver code of pipelines in use. The profile that
+  raises it was adopted through the gate (#2590, merge 106caf20) with a fix to load nvapi64.dll
+  from System32 only (db9e6c5c). I1 below is the instrument that measures that cause on this PC.
+- **Measured before this entry (RTX 5080, driver 32.0.16.2140, ray tracing on, every used compute
+  pipeline prebuilt):** nothing left out: removed 0-2.6 s into the scene; first 250 of the 1,000
+  per-material resolve programs left out: removed after 11 s of scene; the other 500 left out:
+  after 33 s; the first 500 left out: none in 133 s; all 1,000: none in 131 s; builder, trace,
+  ray-bin or shadow pipelines left out (19-64 each): removed at or before the first scene frame.
+- **Citations spot-checked by the orchestrator at db9e6c5c:** `hle/d3d12x/dred.rs:40-49`
+  (`label`), `:57-60` (`mark_pipeline`), `:114-119` (`forget_pso`), `hle/d3d12x/bind.rs:1105-1109`
+  (`SetPipelineState` of the real pipeline), `telemetry_gpu.rs:2907-2911`
+  (`telemetry_frame_shown`), `hle/d3d12x/pso_async.rs:2607-2611` (`shared`),
+  `hle/d3d12x/present.rs:1269` (`presents`). All hold.
+- **Evidence standard (binding on later work):** a cause is stated only with the artefact the
+  table in section 1 names for it; otherwise it is "not known". Screenshots are used only to ask
+  the user to verify by eye once the data says a fix works.
+- **Limit values:** `XCL_CODE_LIMIT_MB` defaults to 448 (the #2403 measurement for a 512 MB
+  reserve). For the profile at 2 GiB the orchestrator sets it per run; the proportional figure
+  is an inference until I1 measures it.
+- Nothing here was built or run on macOS; every unit is built and tested on the Windows PC.
+
+Design, 2026-11-26. Code citations are on `rt-wave4` (`1fb5d6c6`). Nothing in the repository
+was changed. The research behind it is in `instrumentation-research.md`, in the same folder.
+"Inference" marks what no source states. No game-derived name or key appears here. Tests use
+synthetic hashes only.
+
+---
+
+### 1. Summary
+
+**Recommendation.** Build the units in the order I1 → I3 → I2, with I4 and the I5 kernel in
+parallel in wave 1. I1 decides the question in front of us: does this PC hit NVIDIA's limit on
+shader code in use (#2403)? It also costs the least to build. I3 comes before I2 because both
+rewrite `log_device_removed` (`crates/xcl/src/hle/d3d12x/real.rs:8075-8121`), and I2's report
+builds on I3's output. **I keep the brief's priority order with one change:** I2's
+"last-dispatch ring" (I2b) is split from I2a and comes after I1, because both edit `bind.rs` and
+`console_list.rs`.
+
+**Today's new measurement fits #2403 and gives I1 a sharp prediction.** Leaving out all 1,000
+resolve programs, or just the first 500 (504 pipelines), prevents the removal. Leaving out a
+group of 19-64 builder, trace, ray-bin or shadow pipelines does not. A size wall predicts exactly
+that: the resolve programs are the large ones (the code comment at `real.rs:4960-4962` gives
+about 1 MB of DXIL each), and 19-64 small pipelines do not bring the sum under the wall. The
+prediction I1 must confirm or refute:
+- With the driver default (512 MB reserve), the counter crosses about 440-450 MB of blob bytes
+  just before the removal at 97-99 s. #2403 measured 446-449 MB on four cards with
+  `GetCachedBlob` sizes, so I take that as the 512 MB wall in blob bytes.
+- With 500 resolve programs left out, it stays below that level for 230 s.
+- With the profile at 1 GiB (#2590), the removal goes away, or moves to about twice the level.
+
+What each unit proves, and the artefact a later claim must cite:
+
+| unit | proves | the artefact a claim must cite |
+|---|---|---|
+| I1 code in use | how much driver code the pipelines in use hold (as #2403 counts it), per frame and at the removal | `code` events per frame; the `code_in_use` line and the `device_removed.code_*` fields. Claim "#2403 limit": removal with `in_use_bytes` ≥ 0.9 × limit in each removal run, AND no removal over the same scene time with the limit raised (1 GiB profile). Refuted by a removal with `in_use_bytes` < 0.6 × limit. |
+| I2a removal when/where | the moment of removal, the Execute call after which it was first seen, the queue's submitted and observed-completed values, the removed reason and DRED device state | one `device_removed` event, written before `end`. Claim "removed during submission": `detected.site = "execute"` and `queues[q].pending = 0` at the last sample, OR culprit shows no open dispatch. |
+| I2b dispatch ring | the last dispatches recorded into the lists of the last submissions, with record keys | `last_dispatch` events. Claim "program X was running": X in the ring of the detecting submission AND (with `XCL_GPU_CULPRIT=1`) in culprit's "started, not done" list. |
+| I3 DRED | for a real GPU fault: the list, the op and the marker text (record key) at the fault; whether a page fault happened at all | `dred_*` log lines and `error` events. Claim "page fault": `device_state = "pagefault"` with a VA. Claim "no GPU fault": state ≠ hung/pagefault and "no list has unfinished work". |
+| I4 debug layer | runtime-detected invalid use, removal-process messages 232-234, and optionally GPU-based validation findings | `debug_layer` events and log lines. Claim "invalid use caused it": an error-severity message within 1 s before `device_removed`. |
+| I5 pass statistics | what each pass wrote in one frame: ranges, NaN/Inf, zero, unchanged, hash | `pass_stats` events + `scripts/dev/pass-stats-check.py` findings. Claim "pass P writes nothing": `unchanged=true` for its outputs in two armed runs. |
+| I6 run recipe | GPU engine activity and resets (ETW), Windows' own TDR records, GPU memory and clock state | `run.etl` → `run-dump.txt`, `events.txt`, `smi.csv`. Claim "Windows timeout": a reset/TDR event in the ETW dump or a 4101 event at the time. |
+
+**The user is asked to check by eye** (screenshots) only after the data says a fix works: no
+removal over N runs of the same length, and the I5 invariants passing for the final target.
+
+---
+
+### 2. Goal and scope
+
+**Goal.** Replace inference with recorded evidence for (a) why and where the D3D12 device is
+removed, and (b) what each pass of a frame writes. It must work on NVIDIA now and stay
+vendor-neutral, with vendor parts behind capability checks.
+
+**In:** I1-I5 as runtime code (opt-in switches, off by default except where telemetry is
+already on), one fork-only script (I5d), and the I6 recipe (no code).
+
+**Out:**
+- installs (Aftermath, PIX, WinDbg, RenderDoc, Nsight) and any registry change other than the
+  approved NVIDIA profile, which the orchestrator handles through #2590;
+- a fix for the code-size wall (#1269, #2526, #1901, #2496 upstream);
+- shader-side write logging (it changes cache identity);
+- graphics-pass read tracking in I5 v1 (§10);
+- Aftermath SDK integration (a licence question).
+
+---
+
+### 3. What exists today
+
+| piece | where | what it does / lacks |
+|---|---|---|
+| Device removal log | `real.rs:8073-8121` `log_device_removed`, `:8126-8139` `stop_if_device_removed` | reason + DRED 1.1; detected only after an Execute (`real.rs:7972`); a once-guard `AtomicBool` (`:8076-8082`) lets a second caller go on to `TerminateProcess` while the first still writes |
+| Removal telemetry | `telemetry_run.rs:203-208` `telemetry_device_removed` | an `error` event, fatal: `telemetry_error` writes `end` at once (`:191-197`). The DRED `gpu_fault` events (`:211-243`) therefore land after `end`. |
+| DRED enable | `real.rs:503-518` | breadcrumbs + page faults only; no contexts |
+| DRED report | `real.rs:8030-8045` `report_dred_lists` | unfinished lists only; silent on getter failure; no `% 65536` (`:8106`, `:8108`) |
+| DRED labels | `crates/xcl/src/hle/d3d12x/dred.rs:41-75` | `label` (called for every translated pipeline) and `mark_pipeline` (after every title bind, with the driver pointer `bound`); marker text is only `"xcl pipeline"` (`:70`) |
+| Pipeline release | `real.rs:1724-1731` `pso_release` → `forget_pso` (`:1833`) → `dred::forget_pso` (`dred.rs:115`) | every adopted pipeline, including dispatch-chain tail pieces (`real/dispatch_chain.rs:102-105`: "releasing a tail PSO also goes through forget_pso") |
+| Driver binds | `real.rs:7628-7632` (title SetPipelineState), `crates/xcl/src/hle/d3d12x/bind.rs:1107-1109` (`bind_abi`, every translated dispatch/draw), `bind.rs:358` (EI whole), `crates/xcl/src/hle/d3d12x/console_list.rs:917-919` (console list replay), `real/dispatch_chain.rs:223` (whole), `crates/xcl/src/gpu/recomp/pso.rs:1370` (pieces) | the points where a driver pipeline reaches a PC list |
+| First use | `crates/xcl/src/hle/d3d12x/pso_async.rs:161-172` `note_use` | per title pipeline, not per driver pointer |
+| Frame hook | `crates/xcl/src/telemetry_gpu.rs:2908` `telemetry_frame_shown`, called at `present.rs:1247` | once per shown frame |
+| Pipeline build event | `telemetry_gpu.rs:2695` `telemetry_pipeline_built` (DXIL bytes, not driver bytes), called at `real.rs:4381` | has no pipeline pointer |
+| Debug layer | `crates/xcl/src/gpu/agility.rs:358-367`, `real.rs:492-502`, `:547-552`, `:564-587` | no GBV; 8-per-id cap; log only |
+| Culprit markers | `crates/xcl/src/hle/d3d12x/culprit.rs:161-300` | GPU progress per dispatch, read only on a wait timeout |
+| Last-dispatch ring | designed as U3 in `.flowestra/decisions.md` (entry "2026-11-26 Ray tracing: on/off toggle …", §U3; refined in the next entry) | **not built** (grep: no `DispatchRing`, no `on_device_removed`) |
+| Pass boundaries | `telemetry_gpu.rs:2180` `telemetry_pass_boundary`, from `crates/xcl/src/hle/d3d12x/list_x.rs:4258` (`resource_barrier_x`), `:3138`, `console_list.rs:810`, `:870` | timestamps at tier `pass` |
+| Render-target binds | `real.rs:7596-7600` → `list_x::note_render_targets` (`list_x.rs:558`) | per-list RTV/DSV handles |
+| UAV views | `real.rs:2631` (CreateUnorderedAccessView hook) | the resource behind a UAV descriptor |
+| Bindless resolution | `bind.rs:936-1000` `trace_fullscreen` | root constants/buffers → descriptor slot → `console_heap::resource_at` (`console_heap.rs:532`) |
+| Window copies | `list_x.rs:2232-2234` (COMMON↔COPY_SOURCE around `CopyBufferRegion`), `real.rs:206` `uma_window_buffer` | the precedent for copying title memory |
+| Runtime HLSL | `crates/xcl/src/gpu/recomp/dxc.rs:492` `dxc::compile` | used by tests for XCL-owned kernels |
+| BMP writing | `present.rs:1400-1470` (inline) | precedent for image files |
+
+---
+
+### 4. Architecture and data flow
+
+```
+pipeline creation ──dred::label──► code_use::note_label(pso, label)   (I1)
+driver bind sites ─────────────► code_use::bound(driver_pso)         (I1: first use, per-frame use)
+pso_release → forget_pso → dred::forget_pso ─► code_use::released(pso)
+present (telemetry_frame_shown) ─► code_use::frame(n) → `code` event, threshold warnings
+
+ExecuteCommandLists (real.rs:7960 block) ─► removal::after_execute(queue, lists)   (I2a: signal, sample)
+                                        └► telemetry ring: submission entry       (I2b)
+telemetry_dispatch sites ─► ring: dispatch entry per PC list                      (I2b)
+device removed: fence(UINT64_MAX) callback  ─┐
+                stop_if_device_removed      ─┴► real::log_device_removed (Once)
+                       ├ I3: DRED 1.2/1.3 lines (contexts, device state, flags)
+                       ├ I1: code_use::removal_line()
+                       ├ I2b: ring dump (`last_dispatch`), culprit::on_device_removed()
+                       └ I2a: one `device_removed` event, THEN the fatal error/`end`
+
+debug layer callback ─► log (232-234 uncapped) + `debug_layer` events            (I4)
+
+armed frame (XCL_PASS_STATS=N, tier pass):                                        (I5)
+  write targets noted (OMSetRenderTargets, UAV descriptors of a dispatch)
+  ├ pre-snapshot copy (first write of a resource in a pass)
+  └ post-snapshot copy at the pass boundary (before the title's barrier batch)
+  after the list's submission: XCL stats list on the same queue → partials → readback
+  pass-stats thread → `pass_stats` events (+ BMP files) → pass-stats-check.py
+```
+
+---
+
+### 5. Dependencies and order
+
+| wave | units (parallel within a wave) | why this order |
+|---|---|---|
+| 1 | **I1** (code in use), **I4** (debug layer), **I5a** (stats kernel) | no shared files (§8) |
+| 2 | **I3** (DRED) | edits `dred.rs` after I1 and `real.rs` `init` after I4 |
+| 3 | **I2a** (removal when/where), **I5b** (snapshot capture) | I2a needs I3's `log_device_removed` and I1's `removal_line`. I5b is parallel: different files (§8). |
+| 4 | **I2b** (ring + culprit on removal), **I5c** (stats list, events, images) | I2b edits `bind.rs`/`console_list.rs` after I1 and I5b. I5c needs I5a and I5b. |
+| any time after this design | **I5d** script, **I6** recipe (no code) | the event schema is fixed here |
+
+The upstream pieces the work leans on: #2590 (profile, being adopted by the orchestrator: not a
+code dependency); #2566 (marker labels). I3 does what #2566 does for marker text inside its own
+diff; if #2566 lands first, I3 keeps #2566's text format and drops its own.
+
+---
+
+### 6. Constraints and considerations
+
+- **Hot path (5,000 dispatches a frame).** Every new call on a bind or dispatch path is one
+  relaxed atomic load when its switch is off. I1 when on: a thread-local 64-entry direct-mapped
+  cache of (pointer, frame) skips the shared map for repeat binds in a frame. The shared map is
+  touched once per (thread, pointer, frame); about 100 ns each, so under 0.3 ms a frame for 3,000
+  distinct binds (inference, to be measured in the acceptance run). I2b writes 4 words per
+  dispatch into a per-list ring under the list's existing state lock. I5 costs only in the armed
+  frame.
+- **Cache identity must not change.** No unit changes HLSL, DXIL, root signatures of title
+  pipelines, or the pipeline cache keys. `GetCachedBlob` only reads. DRED itself already rebuilds
+  pipelines (`culprit.rs:11-13`). That is an existing property of `XCL_DRED`, unchanged.
+- **Vendor neutrality.** I1 counts on every vendor; only the limit default (448 MB) is the
+  NVIDIA figure, set by `XCL_CODE_LIMIT_MB`. DRED 1.2/1.3 interfaces are optional casts: a failed
+  cast logs one line and falls back. GBV is a Windows feature. I5 uses SM 6.0 wave ops and 32-bit
+  atomics only.
+- **Title data rule.** Record keys (`fnv64` of console shaders) appear only in run output (log,
+  `events.jsonl`, images in the run folder) on the user's machine. Tests use made-up hashes such
+  as `0x1111_2222_3333_4444`. No dump, name or key goes into the repo, commit messages or PR text.
+- **Threads.** `log_device_removed` can now run from a thread-pool thread (I2a's fence callback)
+  and from the submitting thread. It becomes `std::sync::Once`-guarded, so the second caller
+  blocks until the report is written. Then `stop_if_device_removed` terminates the process.
+- **Telemetry ordering.** `end` must stay the last event. All removal details are written before
+  the fatal `telemetry_error`.
+- **Formatting.** No `cargo fmt`. Format only the changed lines, in the style around them.
+
+---
+
+### 7. Work breakdown
+
+Each unit: files, function-level changes, acceptance criteria, tests (name: assertion). The
+switch names and event fields here are final.
+
+#### I1. Shader code in use (about 300 lines; wave 1)
+
+**Definition (as #2403):** a driver pipeline object is *in use* from the first time it is set on
+any PC command list until it is released. Its size is the byte length of its `GetCachedBlob()`.
+Stand-ins count as well; they are small. A pointer shared by many title pipelines (a shared
+stand-in driver, `pso_async::shared`, `pso_async.rs:2609`) counts once.
+
+**Switch:** on when `XCL_CODE_IN_USE=1`, or when the telemetry tier is ≥ `frame`. Read once into a
+`OnceLock<bool>`. `XCL_CODE_LIMIT_MB=<n>` (default 448) is the wall in blob bytes. For runs with
+the 1 GiB profile, the orchestrator sets 896 (inference: proportional to the reserve).
+
+**New file `crates/xcl/src/hle/d3d12x/code_use.rs`:**
+- `pub fn on() -> bool`.
+- `struct Entry { bytes: AtomicU64 /*u64::MAX = not measured*/, stage: u8 /*0 unknown,1 compute,2 graphics*/, label: Mutex<Option<String>>, first_frame: AtomicU64 /*0 = never bound*/, last_frame: AtomicU64 }`.
+- `static MAP: RwLock<HashMap<usize, Arc<Entry>>>`. Totals (`AtomicU64`): `IN_USE_BYTES`,
+  `IN_USE_COUNT`, `IN_USE_COMPUTE`, `IN_USE_GRAPHICS`, `PEAK_BYTES`, `PEAK_FRAME`,
+  `NEW_FRAME_BYTES` (first uses this frame), `RELEASED_FRAME_BYTES`, `MEASURE_US` (time in
+  `GetCachedBlob`), `RECENT_BYTES` (computed at frame end, see `frame`).
+- `pub fn note_label(pso: usize, shaders: &[(&str, Option<&[u8]>)])`: if `on()`, create or update
+  the entry. `label` = the same text `dred::label` builds (`"cs 0123…"`, `"vs … ps …"`); `stage` =
+  1 if a `cs` key is present, else 2. Do not measure here; measuring on first use keeps unused
+  pipelines (51,000 at load, `pso_async.rs:995-998`) at zero cost.
+- `pub fn bound(pso: usize)`: if `!on() || pso == 0`, return. Let `f = present::presents()`.
+  Thread-local cache `[(usize,u64);64]` at index `(pso >> 4) & 63`: if it equals `(pso, f)`,
+  return. Else look up the entry (read lock; insert with the write lock if absent: stage 0, no
+  label).
+  - If `bytes` is `u64::MAX`, call `measure(pso)` and store the result.
+  - If `first_frame` swaps from 0 to `f.max(1)`, it is a first use: add bytes to
+    `IN_USE_BYTES`/`COUNT` and the stage total and to `NEW_FRAME_BYTES`, update the peak, and call
+    `warn_threshold`.
+  - Store `last_frame = f`.
+- `fn measure(pso: usize) -> u64`: `ID3D12PipelineState::from_raw_borrowed(&(pso as *mut c_void))`
+  → `GetCachedBlob()` → `GetBufferSize()`; 0 on error (counted in a `MEASURE_FAILED` atomic).
+  Time it into `MEASURE_US`. The blob is dropped at once.
+- `pub fn released(pso: usize)`: remove the entry (write lock). If it had been used
+  (`first_frame != 0`), subtract its bytes from the totals and add them to `RELEASED_FRAME_BYTES`.
+- `pub fn frame(n: u64)`: compute `RECENT_BYTES` (the sum of entries with `last_frame + 120 >= n`;
+  one read-locked pass, only when `n % 30 == 0`, else keep the last value). Emit a `code` event at
+  tier `frame` through `crate::log::event`: `{frame:n, in_use_bytes, in_use_count,
+  in_use_compute_bytes, in_use_graphics_bytes, new_bytes, released_bytes, recent_bytes,
+  peak_bytes, peak_frame, limit_bytes, measure_ms, measure_failed}`. Reset the two per-frame
+  totals.
+- `fn warn_threshold(bytes)`: warn once each at 75 %, 90 %, 100 % of the limit:
+  `xlog_warn!("D3D12.X: driver code of pipelines in use: {mb} MB ({pct} % of {limit} MB) in {count} pipelines")`.
+- `pub fn removal_line() -> Option<(String, Vec<(&'static str, serde_json::Value)>)>`: None when
+  off. The text: `"driver code in use at removal: {in_use} MB in {count} pipelines (compute {c} MB, graphics {g} MB), bound in the last 120 frames {recent} MB, peak {peak} MB at frame {pf}, limit {limit} MB; largest: {label1} {mb1} MB, … (8)"`.
+  The fields carry the same numbers with `code_` prefixes and `code_largest` as an array of
+  `{label, bytes, first_frame}`. Unlabelled entries show `pipeline {ptr:#x}`.
+- Pure helpers for the tests: `fn pct(bytes, limit) -> u32`, `fn thresholds_crossed(prev, now, limit) -> Vec<u32>`, `fn largest(entries, n)`.
+
+**Hooks (one or two lines each):**
+- `crates/xcl/src/hle/d3d12x/mod.rs`: `mod code_use;` (`pub(crate)`).
+- `dred.rs:41-49` `label`: after the two existing calls (`:42-43`), add
+  `super::code_use::note_label(pso, shaders);` before the `on()` check.
+- `dred.rs:57` `mark_pipeline`: first line `super::code_use::bound(bound);` before the `on()`
+  check. That covers `real.rs:7631`, `:7649`, `:3002`, `device_x.rs:104` and `list_x.rs:2885`.
+- `dred.rs:115` `forget_pso`: first line `super::code_use::released(pso);` before the `on()` check.
+- `bind.rs:1109`: after `list.SetPipelineState(pc);` add `super::code_use::bound(real as usize);`.
+- `bind.rs:358`: `Ok(Some(whole)) => { list.SetPipelineState(&whole); super::code_use::bound(whole.as_raw() as usize); }`.
+- `console_list.rs:919`: after it, `super::code_use::bound(real as usize);`.
+- `real/dispatch_chain.rs:223`: bind the whole to a local first, then `code_use::bound(w.as_raw() as usize)`.
+- `gpu/recomp/pso.rs:1370`: after `list.SetPipelineState(piece);`,
+  `crate::hle::d3d12x::code_use::bound(piece.as_raw() as usize);` (make the path visible with
+  `pub(crate)`).
+- `telemetry_gpu.rs:2908` `telemetry_frame_shown`: add `crate::hle::d3d12x::code_use::frame(n);`
+  outside the tier check (`frame` checks `on()` itself).
+
+**Tests (in `code_use.rs`):**
+- `first_bind_counts_once_per_pointer`: two `bound` calls (and a second thread's) on one fake
+  entry with preset bytes add its bytes once.
+- `release_subtracts_only_used_entries`: an entry released before any bind leaves totals at 0; a
+  used one returns totals to 0.
+- `shared_pointer_counts_once`: two labels with one pointer count once.
+- `thresholds_fire_once_each`: `thresholds_crossed(0, 0.8L, L) == [75]`, then
+  `(0.8L, 1.0L) == [90, 100]`, then nothing more.
+- `largest_orders_by_bytes_and_caps`: 10 entries → the 8 largest in descending order.
+- `removal_line_none_when_off` and `removal_line_names_unlabelled_by_pointer`.
+- The tests use a seam: `fn bound_with(pso, frame, measure: impl Fn(usize)->u64)`, so no device
+  is needed. A GPU test `gpu_measure_reads_cached_blob_size` creates a tiny compute PSO and
+  asserts `measure > 0`; it calls `runner::skip_test` without a GPU.
+
+**Acceptance:** the tests pass. On the retail title (§9), the `code` events are present each
+frame and the removal line is printed.
+
+#### I4. Debug layer (about 180 lines; wave 1)
+
+**Files:** `crates/xcl/src/gpu/agility.rs`, `real.rs` (`init` debug block `:492-502`,
+`debug_message` `:564-587`), `crates/xcl/src/telemetry_run.rs` (new fn), `docs/guide/cli-and-config.md`
+(fork docs: two rows).
+
+**Changes:**
+- `agility.rs`: `pub fn enable_gpu_based_validation(no_state_tracking: bool) -> Result<(), String>`:
+  `configuration_interface::<ID3D12Debug1>(&CLSID_D3D12Debug)` → `SetEnableGPUBasedValidation(true)`.
+  With `no_state_tracking`, also cast to `ID3D12Debug2` and call `SetGPUBasedValidationFlags(D3D12_GPU_BASED_VALIDATION_FLAGS_DISABLE_STATE_TRACKING)`.
+  A `OnceLock` like `DEBUG_LAYER` (`agility.rs:358-367`).
+- `real.rs` `init`: `XCL_D3D12_GBV` = `1` | `nostate` turns on `debug` as well. After
+  `enable_debug_layer` succeeds, call `enable_gpu_based_validation(v == "nostate")` and log
+  `"D3D12: GPU-based validation enabled ({mode})"`, or warn on error.
+- `debug_message`: pure `fn always_logged(id: i32) -> bool` (true for 232, 233, 234). Those skip
+  both caps. For every message (before the caps), call
+  `crate::report::telemetry_debug_message(id.0, severity.0, category.0, &t)`.
+- `telemetry_run.rs`: `pub fn telemetry_debug_message(id, severity, category, text)`: tier frame.
+  - A per-id count in a `Mutex<HashMap<i32,u64>>` (taken with `try_lock`; on contention, count
+    into `DEBUG_DROPPED`).
+  - The first 64 of an id, and every id 232-234: a `debug_layer` event `{id, severity:
+    "corruption"|"error"|"warning"|"info"|"message", category, text (first 512 chars), n}`.
+  - After that, a `debug_layer_count` event `{id, n}` at n = 128, 256, 512, ….
+- Pure helper `fn debug_event_due(n: u64, id: i32) -> Option<&'static str>` returning
+  `"debug_layer"`, `"debug_layer_count"` or None.
+
+**SDKLayers crash: what to do (no code in this unit; the orchestrator does it on the PC):**
+1. Find the crashed test binary's WER report: `C:\ProgramData\Microsoft\Windows\WER\ReportArchive\AppCrash_xcl-*`.
+   `Report.wer` gives the faulting module offset and the exception code. Keep it outside the repo.
+2. Rerun that binary alone with the same environment and `--test-threads=1 --nocapture`. With
+   one thread, libtest prints `test <name> ...` before each test runs, so the last line names the
+   test (inference from libtest's behaviour; confirm on the first run).
+3. A lead from reading: `gpu/texture.rs:888-897`
+   (`gpu_large_mixed_upload_keeps_tight_staging_and_exact_pixels`) calls `EnableDebugLayer()`
+   directly when `XCL_D3D12_DEBUG` is set. That bypasses the once-guard in
+   `agility::enable_debug_layer`, whose comment (`agility.rs:358-359`) says that enabling it
+   again after a device exists removes that device. In a test process where another test already
+   made a device, this can break the debug layer state (inference).
+4. Whether it matters: only if the same crash happens in `xcl run` with `XCL_D3D12_DEBUG`.
+   Acceptance run R4d (§9) answers that. A test-only bug gets its own small PR (outside this plan).
+
+**Tests:** `always_logged_covers_removal_ids` (232, 233, 234 true; 0, 231, 235 false);
+`debug_event_due_caps_per_id` (n = 1 and 64 give `debug_layer`, 65 gives None, 128 gives
+`debug_layer_count`, id 233 at n = 1000 gives `debug_layer`).
+
+**Acceptance:** the tests pass. Run R4d with `XCL_D3D12_GBV=1` on a reduced repro: the log says GBV is enabled, and `debug_layer` events
+appear.
+
+#### I3. DRED done properly (about 280 lines; wave 2)
+
+**Files:** `real.rs` (`init` DRED block `:503-518`, `report_dred_lists` `:8030-8045`,
+`log_device_removed` `:8075-8121`, the test module `dred_tests` `:8047-8071`), `dred.rs`
+(`mark_pipeline` marker text `:70`; new pure fn), `telemetry_run.rs` (new fn).
+
+**Changes:**
+1. **Enable contexts.** After `SetPageFaultEnablement`, `if let Ok(d1) = d.cast::<ID3D12DeviceRemovedExtendedDataSettings1>() { d1.SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON) }`.
+   Otherwise log `"D3D12: DRED 1.2 breadcrumb contexts unavailable"`.
+2. **Marker text carries the label.** `dred.rs:70`: the marker string becomes
+   `format!("xcl {text}")`, with `text` as computed at `:62` (`"cs 0123…"` or `"pipeline 0x… (a stand-in, or not translated)"`).
+   The counting fallback (`markers_before`, `bound_at`) is unchanged.
+3. **Getters with errors reported.** `log_device_removed` reads, in order:
+   - `dev.cast::<ID3D12DeviceRemovedExtendedData2>()` → `GetDeviceState()`. The state text is
+     `fn device_state_text(D3D12_DRED_DEVICE_STATE) -> &'static str` (`"unknown"|"hung"|"fault"|"pagefault"`).
+     Without DRED2: `"unavailable"`.
+   - The page fault: `GetPageFaultAllocationOutput2` (DRED2; `PageFaultFlags` printed as hex),
+     else `GetPageFaultAllocationOutput1`, else `GetPageFaultAllocationOutput`. With DRED2 and a
+     state other than `pagefault`, print `"DRED: no page fault recorded (device state {s})"`
+     instead of a VA line. With state `pagefault`, or with no DRED2, print the VA line as today.
+     Object names come from `ObjectNameW` of `ALLOCATION_NODE1` when available (this also covers
+     upstream #2131).
+   - Breadcrumbs: `GetAutoBreadcrumbsOutput1` (DRED1), else `GetAutoBreadcrumbsOutput`. A getter
+     error prints `"DRED: {getter} failed: {e}"`.
+4. **`report_dred_lists` becomes summary + detail.** A new pure
+   `fn summarize(nodes: impl Iterator<Item=(u32 /*done*/, u32 /*count*/)>) -> (usize, usize, usize)`
+   counts (complete, unfinished, not started). Always print
+   `"DRED: {n} lists: {complete} complete, {unfinished} unfinished, {not_started} not started"`.
+   When unfinished + not started is 0, also print `"DRED: no list has unfinished work"`. Detail
+   lines stay as today (unfinished first, at most 64).
+5. **Index modulo 65536.** A pure `fn history_index(op: u32) -> usize { (op % 65536) as usize }`
+   and `fn history_len(count: u32) -> usize { count.min(65536) as usize }`. Use both at
+   `:8106`/`:8108`. When `count > 65536`, pass to `dred::bound_at`/`bound_after` only the stored
+   window: the op range `[count-65536, count)` mapped through `history_index`, and offset `done` by
+   `count-65536`. Print `"(history truncated to the last 65536 ops)"`.
+6. **Context text at the op.** For a `NODE1`, a pure
+   `fn context_before(contexts: &[(u32, String)], op: u32) -> Option<&str>` returns the string of
+   the last context whose `BreadcrumbIndex <= op`. The detail line gets `; marker: {text}` and the
+   `gpu_fault_list` event gets `marker`. When a context exists, it replaces `bound_at`'s guess;
+   `bound_after` is still printed.
+7. **Telemetry.** `telemetry_run.rs`: `pub fn telemetry_dred_summary(state: &str, lists: (usize,usize,usize), page_fault: Option<u64>)`
+   writes an `error` event `{kind:"gpu_fault", what:"dred_summary", device_state, complete,
+   unfinished, not_started, va}` (`va` null when there is no fault).
+
+**Tests (in `real.rs` `dred_tests` and `dred.rs` tests):**
+- `history_index_wraps_at_65536`: `history_index(65535)==65535`, `history_index(65536)==0`,
+  `history_len(70000)==65536`.
+- `summarize_counts_complete_unfinished_unstarted`: (2,2),(1,2),(0,2) → (1,1,1).
+- `no_unfinished_work_is_reported_when_all_complete`: a list of complete nodes yields the
+  "no list has unfinished work" line (through a pure `fn summary_lines(...) -> Vec<String>`).
+- `context_before_picks_the_last_marker_at_or_before_the_op`: contexts at 2 and 6; op 5 → index
+  2's text, op 6 → index 6's text, op 1 → None.
+- `device_state_text_names_all_states`.
+- `marker_text_carries_the_label` (`dred.rs`): a pure `fn marker_text(label: &str) -> String` gives
+  `"xcl cs 1111222233334444"`.
+- The existing `a_late_partially_executed_list_is_reported_before_unstarted_lists` still passes.
+
+**Acceptance:** the tests pass. Run R2 with `XCL_DRED=1` prints a `DRED: n lists: …` summary and
+a device-state line.
+
+#### I2a. Removal: when and where (about 300 lines; wave 3)
+
+**Files:** new `crates/xcl/src/hle/d3d12x/removal.rs`; `hle/d3d12x/mod.rs` (one line);
+`real.rs` (the execute block `:7960-7972`, `init` after the device is made, `log_device_removed`,
+`stop_if_device_removed`); `telemetry_run.rs` (new fn, and an ordering change in the removal path).
+
+**Switch:** on when the telemetry tier is ≥ `frame`, or with `XCL_REMOVAL_INFO=1`. The fence
+callback is installed whenever the device is created; it is one fence and costs nothing per frame.
+
+**`removal.rs`:**
+- `pub fn arm(dev: &ID3D12Device)`, called at the end of `init` before `into_raw` (`real.rs:555`):
+  - `CreateFence(0)`, then `CreateEventW` (auto-reset) and `SetEventOnCompletion(u64::MAX, event)`.
+  - `RegisterWaitForSingleObject(&mut h, event, Some(on_removed), null, INFINITE, WT_EXECUTEONLYONCE)`.
+    Microsoft documents this pattern as a device-removal callback
+    (https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device5-removedevice).
+  - Keep the fence and handles in statics for the process lifetime.
+- `unsafe extern "system" fn on_removed(_: *mut c_void, _: BOOLEAN)`: store `REMOVED_QPC = qpc()`,
+  set `MOMENT_SOURCE = "fence"`, call `real::log_device_removed()`. The process is not stopped
+  here; the next Execute's `stop_if_device_removed` does that, after the `Once` (below).
+- Per-queue progress: `struct QueueProgress { fence: ID3D12Fence, submitted: u64, last_seq: u64, completed_seen: u64, seen_qpc: i64, executes: u64 }`
+  in `Mutex<HashMap<usize, QueueProgress>>`.
+  - `pub fn after_execute(queue: *mut c_void, lists: &[*mut c_void], seq: Option<u64>)`, called
+    after the `execute_with_waits_on` closure (`real.rs:7968`) and before `stop_if_device_removed`:
+    - If off, return.
+    - Create the queue's fence on first use. Read `GetCompletedValue()`; if it is not `u64::MAX`,
+      store it with `seen_qpc`.
+    - `submitted += 1`, then `queue.Signal(fence, submitted)`.
+    - Record `last_seq` and the list count.
+  - `seq`: the telemetry submission number when telemetry is on (`GpuTel` `seq`); otherwise
+    removal.rs's own counter. Expose the telemetry one with
+    `pub(crate) fn telemetry_last_seq() -> Option<u64>` in `telemetry_gpu.rs`. That is the only
+    edit there in this unit.
+- `pub fn detected_at(site: &'static str, queue: *mut c_void)`: the first caller stores the site
+  (`"execute"`, `"present"`, `"fence"`) and the queue. `stop_if_device_removed` calls it with
+  `"execute"` and the queue. `stop_if_device_removed` gets the queue as a new parameter: the
+  execute site passes `this`, other callers pass null with `"other"`.
+- `pub fn report() -> Vec<(&'static str, serde_json::Value)>` and log lines:
+  - `"removal: device removed at +{ms} ms (source {fence|detected}), first seen after {site} on queue {q:p}"`;
+  - per queue: `"removal: queue {q:p}: {submitted} submissions, completed {completed_seen} as of {ms} ms before the removal ({pending} not seen complete)"`.
+  - `pending = submitted - completed_seen`. The fields: `moment_ms`, `source`, `site`, `queue`,
+    `queues: [{queue, submitted, completed_seen, pending, seen_ms_before}]`.
+  - A pure `fn classify(pending_on_detecting_queue: u64, seen_ms_before: f64) -> &'static str`
+    returns `"idle_at_last_sample"` (pending 0), `"work_outstanding"` (pending > 0 and seen
+    within 100 ms), or `"unknown"`.
+
+**`real.rs` changes:**
+- `log_device_removed`: replace the `AtomicBool` once-guard (`:8076-8082`) with a
+  `static ONCE: std::sync::Once`. The body runs inside `ONCE.call_once`, so a concurrent caller
+  blocks until it is done. Order inside:
+  1. the reason line;
+  2. I3's DRED lines;
+  3. `code_use::removal_line()` printed;
+  4. (I2b adds the ring and culprit here);
+  5. `crate::report::telemetry_device_removed_full(hr, msg, device_state, removal::report(), code_fields)`.
+- `stop_if_device_removed(queue: *mut c_void, site: &'static str)`: calls
+  `removal::detected_at(site, queue)` before `log_device_removed()`. Update all callers
+  (`real.rs:7972` passes `this, "execute"`; grep for the others).
+- The execute block: `super::removal::after_execute(this, &mapped, crate::report::telemetry_last_seq());`.
+
+**`telemetry_run.rs`:**
+- `pub fn telemetry_device_removed_full(hr, message, device_state, removal_fields, code_fields)`
+  writes a `device_removed` event (tier frame): `{hresult, message, device_state, …removal fields,
+  …code fields}`. Then it calls the existing fatal `telemetry_error(ErrKind::DeviceRemoved, …)`,
+  which writes `end`. `telemetry_device_removed` stays as a thin wrapper for other callers.
+- The DRED events from I3 (`gpu_fault`) are written before this call, so they precede `end`.
+
+**Tests (in `removal.rs`):**
+- `classify_names_idle_outstanding_unknown`: (0, 5.0) idle; (3, 20.0) outstanding; (3, 500.0) unknown.
+- `detected_at_keeps_the_first_site`: a second call does not overwrite it.
+- `report_fields_have_fixed_names`: `report()` on a seeded state yields the field names above.
+- `log_once_blocks_second_caller` (in `real.rs` tests, through a seam
+  `fn once_report(f: impl FnOnce())`): two threads, the second returns only after the first's
+  closure has finished (an `AtomicBool` set at its end is true when the second returns).
+- `device_removed_event_precedes_end` (`telemetry_run.rs` tests, with the existing test sink):
+  `device_removed`, then `error`, then `end`.
+
+**Acceptance:** the tests pass. Run R2 has one `device_removed` event with `moment_ms`, `site`
+and `queues`, before `end`.
+
+#### I2b. Last-dispatch ring (U3, amended) and culprit on removal (about 250 lines; wave 4)
+
+**What is reused from U3 (`.flowestra/decisions.md`, §U3):** 4 words a dispatch; filled where
+`telemetry_dispatch` is called; dumped as `last_dispatch` events (newest first, at most 64 per
+queue); `culprit::on_device_removed()` = the body of `on_watchdog_release` without the burst
+limit, run once.
+
+**Amendment (why):** U3 says "256 entries per queue". At record time the queue is not known: a
+list is recorded first and submitted to a queue later. So:
+- each PC list keeps its last 64 dispatches of the current recording;
+- each queue keeps the last 16 submissions (seq, list pointers) at Execute;
+- at removal, for each queue, the newest submissions are expanded into their lists' dispatches,
+  up to 64 per queue (U3's cap).
+
+The rt-role counters (U3's first bullet, refined in the next entry, "U3: at the three run sites")
+are out of this unit if not yet built. They are not part of the instrumentation.
+
+**Files:** `telemetry_gpu.rs` (ring + entry points), `bind.rs` (one call at `:1046`, one in the
+EI Ok branch near `:363`), `console_list.rs` (one call at `:920`), `culprit.rs` (new fn),
+`real.rs` (`log_device_removed`, one call; the execute block, one call).
+
+**Changes:**
+- `telemetry_gpu.rs`:
+  - `struct ListRing { entries: [(u64 /*record*/, [u32;3], u64 /*frame*/, u8 /*kind: 0 dispatch,1 indirect*/); 64], next: usize, len: usize }`
+    in `Mutex<HashMap<usize, ListRing>>`.
+  - `pub fn telemetry_ring_dispatch(list: *mut c_void, pso: usize, groups: [u32;3], indirect: bool)`
+    (tier frame). The record is `crate::hle::d3d12x::culprit::cs_of(0, pso)`-style: make
+    `culprit::cs_of` (`culprit.rs:139`) `pub(crate)`. The note there: `CS` is filled only with
+    `XCL_GPU_CULPRIT=1` (`culprit.rs:37-39`). So add a second lookup: the label held by
+    `code_use` (I1) for `pso` (`code_use::label_of(pso) -> Option<String>`). The ring stores
+    whichever exists: the 64-bit record, else the label index into a small intern table.
+  - Clear the ring on `telemetry_list_reset` (`:2195`).
+  - `pub fn telemetry_ring_submit(queue, lists, seq)` keeps 16 per queue, called from the execute
+    block.
+  - `pub fn telemetry_ring_dump() -> Vec<String>` writes `last_dispatch` events
+    `{queue, seq, list, index, record|label, groups, frame, indirect}`, newest first, ≤ 64 per
+    queue. It returns the log lines.
+  - A pure `fn newest(ring: &ListRing, n: usize) -> Vec<…>` for the tests.
+- `culprit.rs`: `pub fn on_device_removed()` = the body of `on_watchdog_release` (`:269`) without
+  its burst limit, guarded by a `Once`; a no-op when `!enabled()`.
+- `real.rs` `log_device_removed`, step 4: `crate::report::telemetry_ring_dump()` (print its lines),
+  then `super::culprit::on_device_removed()`.
+
+**Tests:**
+- `dispatch_ring_keeps_the_newest_64_per_list` (U3's test, renamed for the amended size).
+- `ring_clears_on_list_reset`.
+- `submission_ring_keeps_16_per_queue`.
+- `device_removed_dumps_the_ring_once` (U3's test): a second dump writes nothing.
+- `culprit_on_device_removed_reports_open_lists` (U3's test, the seam over `open_lists`).
+
+**Acceptance:** the tests pass. Run R2 has `last_dispatch` events before `end`, with records or
+labels.
+
+#### I5a. Pass statistics kernel (about 300 lines; wave 1)
+
+**Files:** new `crates/xcl/src/gpu/pass_stats.rs`; `crates/xcl/src/gpu/mod.rs` (one line).
+
+**Content:**
+- `pub enum FormatClass { Rgba8Unorm, Bgra8Unorm, Rgba16Float, Rg16Float, R16Float, Rgba32Float, Rg32Float, R32Float, R11G11B10Float, Rgb10A2Unorm, D32Float, D24UnormS8, R32Uint, Raw32 }`
+  and `pub fn class_of(fmt: DXGI_FORMAT) -> (FormatClass, u32 /*bytes per element*/)`. Typeless
+  formats map to their float/unorm sibling. Unknown formats map to `Raw32` with 4 bytes.
+- `const HLSL: &str`: one `cs_6_0` kernel with `[numthreads(256,1,1)]`.
+  - Root constants: `elements, row_elems, row_pitch, elem_bytes, class, base_offset`.
+  - Root SRV `ByteAddressBuffer src`, root UAV `RWByteAddressBuffer partials`.
+  - Each thread handles 16 elements: decode channels by `class`, then accumulate per channel
+    `min`, `max` and `sum`, plus `zero` (all channels 0), `nan`, `inf`, `count`, and two hashes
+    `h1 += mix1(word ^ idx*0x9E3779B9)`, `h2 += mix2(word + idx)` over the raw 32-bit words.
+  - Wave reductions (`WaveActiveMin/Max/Sum`), then one lane per wave writes into groupshared;
+    thread 0 writes the group's 32-word partial.
+- `pub struct Partial { min: [f32;4], max: [f32;4], sum: [f32;4], zero: u32, nan: u32, inf: u32, count: u32, h1: u32, h2: u32 }`.
+  `pub fn combine(parts: &[Partial]) -> Stats` gives min/max/mean per channel, the counts and
+  `hash = (h1 as u64) << 32 | h2` summed with wrapping. Pure, CPU-side.
+- `pub struct Kernel { rs: ID3D12RootSignature, pso: ID3D12PipelineState }` and
+  `pub fn kernel(dev: &ID3D12Device) -> Result<&'static Kernel, String>`: compiled once with
+  `dxc::compile(HLSL, "main", "cs_6_0", &[])`. XCL-owned; never a title pipeline.
+- `pub fn record(list: &ID3D12GraphicsCommandList, k: &Kernel, src_va: u64, partials_va: u64, c: Consts) -> u32 /*groups*/`.
+
+**Tests:**
+- `class_of_maps_common_targets` (RGBA16F → (Rgba16Float, 8); R11G11B10 → 4; D32 → D32Float;
+  BC7 → Raw32).
+- `combine_merges_min_max_mean_and_counts`.
+- `combine_hash_is_order_independent` (partials in two orders give the same hash).
+- `gpu_kernel_reports_nan_zero_and_constant`: upload a 64×64 RGBA16F buffer with 3 NaN texels,
+  100 zero texels and the rest 0.5. Assert nan = 3, zero = 100, min = 0, max = 0.5, and a hash
+  that differs after changing one texel. Uses `runner::skip_test("no GPU"|"no DXC")`.
+
+**Acceptance:** the tests pass on the RTX 5080 (GPU test not skipped).
+
+#### I5b. Snapshot capture at pass boundaries (about 380 lines; wave 3)
+
+**Switch:** `XCL_PASS_STATS=<frame>[,<frame>…]` (present counts), only at telemetry tier `pass`
+(otherwise warn once and stay off). `XCL_PASS_STATS_MB` (default 1024) is the snapshot memory
+budget. `XCL_PASS_STATS_PRE=0` turns off pre-snapshots.
+
+**Files:** new `crates/xcl/src/hle/d3d12x/pass_capture.rs`; `hle/d3d12x/mod.rs` (one line);
+`list_x.rs` (`note_render_targets` `:558`: one call; `resource_barrier_x` `:4258`: one call);
+`console_list.rs` (`:810`, `:870`: one call each; before `:919`: one call); `bind.rs` (in
+`translated_dispatch` before `bind_abi`, `:1043`: one call); `real.rs` (`:2631` UAV view hook:
+one call). (`bind.rs`, `console_list.rs` and `real.rs` are also touched by I2a/I2b. The
+concurrency plan puts I5b in wave 3 with I2a, which does not edit `bind.rs` or `console_list.rs`,
+and only `real.rs` at other functions. See §8: `real.rs` is serialized by giving I5b only the
+`:2631` line and landing it after I2a.)
+
+**`pass_capture.rs`:**
+- `pub fn armed_now() -> bool`: `present::presents()+1` is in the armed set and tier `pass`.
+- Per-list state `Rec { frame, pass: u32, written: Vec<Target>, snapshots: Vec<Snap>, pre_done: HashSet<usize> }`
+  in `Mutex<HashMap<usize, Rec>>`, reset by `list_reset` (call it from
+  `telemetry_list_reset` in `telemetry_gpu.rs`. **This edit goes to I5c**, which already edits
+  `telemetry_gpu.rs`. Until then, a reset is detected by a changed `frame` at the next boundary.)
+- `enum Target { Texture { res: usize, kind: Kind /*Rt|Ds|Uav*/, state: D3D12_RESOURCE_STATES }, Memory { va: usize, bytes: usize, res: usize } }`.
+- `pub fn note_targets(list, rtvs: &[usize], dsv: Option<usize>)`: resolve handles through
+  `present::rtv_resource` (and a DSV twin: add `present::dsv_resource` if not present, the same
+  lookup). Kinds Rt (state RENDER_TARGET) and Ds (DEPTH_WRITE). Pre-snapshot each new one.
+- `pub fn note_uav_view(handle_slot: usize, res: usize)` from `real.rs:2631`: remember that slot →
+  UAV resource (the set of UAV-created slots).
+- `pub fn note_dispatch(list, this_state)`: resolve the dispatch's descriptors as
+  `trace_fullscreen` does (`bind.rs:936-1000`). Factor the resolution loop into
+  `bind::resolve_descriptors(this) -> (Vec<(slot, res)>, Vec<usize /*root VAs*/>)`. That is a pure
+  move of the loop body, called from `trace_fullscreen` and here. Slots in the UAV set become
+  targets:
+  - a texture: `Texture{Uav, UNORDERED_ACCESS}`;
+  - a buffer: `Memory{va: real::title_address(res), bytes: desc.Width}`.
+  Root VAs become `Memory{va, bytes: 65536, res: 0}`, marked `unresolved`. Other slots are reads:
+  stored as `reads: Vec<usize>`. Pre-snapshot new targets.
+- `pub fn boundary(list, barriers: &[[u32;8]] /*the title's batch*/)`: if the list has targets
+  for the pass that ended:
+  - post-snapshot each one, using the `before` state from the batch when the resource is in it,
+    else the target's state;
+  - then `pass += 1` and clear `written`/`pre_done`.
+- **Snapshots** (`fn snap(list, t, when: Pre|Post)`):
+  - Texture: `GetCopyableFootprints` of subresource 0 → an XCL default-heap buffer from a pool
+    (budget-checked). Transition `state → COPY_SOURCE`, `CopyTextureRegion` to the footprint,
+    transition back. MSAA, array > 1 and 3D are skipped with `skipped: "shape"`.
+  - Memory: `real::uma_window_buffer(va, bytes)`, then `list_x::transition(list, w,
+    COMMON, COPY_SOURCE)`, `CopyBufferRegion` into the pool buffer, and the transition back, as
+    `list_x.rs:2232-2234` does. Not in UMA: `skipped: "not_uma"`.
+  - Over budget: `skipped: "budget"`.
+  - The record: `Snap { pass, res, kind, when, fmt, w, h, row_pitch, buf, offset, bytes, skipped }`.
+- `pub fn take(list) -> Option<Rec>`, called at submit by I5c.
+
+**Tests:**
+- `armed_frames_parse` (`"120,240"` → {120, 240}; garbage → empty, with a warning).
+- `boundary_moves_targets_to_snapshots_and_advances_pass` (with a seam that records snap calls
+  instead of recording commands).
+- `pre_snapshot_once_per_resource_per_pass`.
+- `state_from_barrier_batch_wins` (a batch naming the resource with `before = 0x8` gives a
+  UAV-state snap).
+- `budget_marks_skipped`.
+
+**Acceptance:** the tests pass. With the switch on and frame N armed, the log says
+`"pass stats: frame N armed: {k} snapshots in {lists} lists ({mb} MB)"`.
+
+#### I5c. Stats list, events and images (about 330 lines; wave 4)
+
+**Files:** `pass_capture.rs` (submit side); `telemetry_gpu.rs` (`telemetry_execute`: after
+`tel.execute`, call `pass_capture::after_submit(queue, lists, seqs)`; `telemetry_list_reset`: one
+call); `crates/xcl/src/gpu/pass_stats.rs` (BMP writer).
+
+**Changes:**
+- `after_submit(queue, lists, seq0)`: for lists with a taken `Rec`, record one XCL list (own
+  allocator, from a small pool):
+  - a UAV barrier on the pool buffers, then per snapshot `pass_stats::record` into a partials
+    buffer, then `CopyBufferRegion` of the partials into a readback buffer;
+  - `ExecuteCommandLists` on the same queue through the PC's original `ExecuteCommandLists`
+    (bypassing hooks, as telemetry does: `QueueFns::orig`), then `Signal` an XCL fence.
+  - Hand the job (fence value, readback, snapshot metadata, the list's telemetry seq) to an
+    `xcl-pass-stats` thread.
+- The thread waits on the fence (`SetEventOnCompletion` + wait). If the device is removed, it
+  drops the job. Otherwise it maps the readback, runs `combine`, and writes one `pass_stats` event
+  (tier pass) per snapshot: `{frame, list: seq, pass, when: "pre"|"post", res: "0x…", kind,
+  format, w, h, min:[..], max:[..], mean:[..], zero, nan, inf, count, hash: "016x", skipped,
+  unresolved, reads: ["0x…",…] (post only)}`. It then releases the pool buffers.
+- `XCL_PASS_DUMP=1`: for post snapshots of classes Rgba8, Bgra8, Rgba16Float, R11G11B10, R32Float
+  and D32Float, at most 64 per armed frame. A second readback copy of the snapshot (in the same
+  XCL list) is decoded on the CPU and downsampled to at most 1024 px on the long side. It is
+  written as `<run folder>/pass/f{frame}_l{seq}_p{pass}_{res:x}.bmp` (the run folder:
+  `crate::log::run_dir()`, `log.rs:321`). Float formats are tone-mapped by clamping to [0,1].
+  Depth is shown as grey.
+- `pass_stats.rs`: `pub fn write_bmp(path, w, h, rgb: &[u8]) -> io::Result<()>` (24-bit, bottom-up).
+
+**How it avoids changing the frame it measures:** it adds only copies and the state transitions
+around them, restored to the state they came from. There are no pipeline, root-signature,
+root-argument or descriptor-heap changes on title lists. The statistics run in XCL's own list
+after the title's lists, on XCL-owned buffers. **Residual effects (stated in the run output):**
+the transitions add GPU synchronisation and can hide a race, and the armed frame is slower. Only
+the armed frame is touched. Resubmitted lists and bundles are skipped with `skipped:
+"resubmitted"|"bundle"`.
+
+**Tests:**
+- `write_bmp_header_is_valid` (a 2×2 image: size field, offset 54, row padding).
+- `stats_event_fields_are_fixed` (the field list from a seeded `Stats`).
+- `job_dropped_when_device_removed` (a fence seam returning `u64::MAX`).
+- A GPU test `gpu_snapshot_of_cleared_target_is_constant`: a small committed RT cleared to 0.25,
+  run through `snap` + `after_submit` on a test queue; assert min = max = 0.25 and nan = 0. Skips
+  without a GPU.
+
+**Acceptance:** the tests pass. Run R5 (§9) gives `pass_stats` events for the armed frame.
+
+#### I5d. `scripts/dev/pass-stats-check.py` (fork-only, about 200 lines; any wave after the schema)
+
+**Input:** `--run <run folder>` (reads `events.jsonl`); `--frame N`. The script only parses
+JSON; no eval. It prints findings as text lines: `FINDING <rule> frame=… list=… pass=… res=…
+<detail>`, then a summary count per rule. Exit code 0 always (it reports, it does not judge).
+
+**Rules:**
+1. `nan_inf`: a post snapshot with `nan+inf > 0`.
+2. `unchanged`: post `hash` == pre `hash` for the same (list, pass, res).
+3. `constant`: post `min == max` on all channels, with `count > 1`.
+4. `all_zero`: `zero == count`.
+5. `read_unwritten`: a resource in `reads` of a pass that has no post snapshot earlier in the
+   same frame (any list), and is not in the frame's first pass.
+6. `first_constant_ancestor`: for the presented resource (the `res` of the last post snapshot
+   whose kind is `rt` in the frame's last list), walk back through earlier passes that wrote it.
+   Print the first pass after which it became `constant`.
+7. `skipped`: a count of skipped snapshots by reason.
+
+**Tests:** `scripts/dev/test_pass_stats_check.py` (the pattern of `test_smoke_events.py`): a
+synthetic events file with one case per rule; asserts that each rule fires once and only there.
+
+#### I6. Run recipe (no code; the orchestrator runs it)
+
+All artefacts go to `C:\xcl-diag\<date>-<n>\` (outside the repo).
+
+1. Elevated console, before the start: `wpr -profiles` (confirm `GPU`), then `wpr -start GPU -filemode`.
+2. Second console: `nvidia-smi --help-query-gpu` once to confirm the names, then:
+   `nvidia-smi --query-gpu=timestamp,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw,clocks_event_reasons.active --format=csv -lms 500 > smi.csv`
+   (or `clocks_throttle_reasons.active` on older drivers).
+3. Run the title with the switches of the run (§9).
+4. After the removal or the end: `wpr -stop run.etl`, then `xperf -i run.etl -o run-dump.txt -a dumper`.
+5. `wevtutil qe System /q:"*[System[Provider[@Name='nvlddmkm' or @Name='Display' or @Name='Microsoft-Windows-DxgKrnl']]]" /c:30 /rd:true /f:text > events.txt`.
+6. `dir C:\ProgramData\Microsoft\Windows\WER\ReportArchive C:\ProgramData\Microsoft\Windows\WER\ReportQueue > wer.txt`
+   (look for `LiveKernelEvent_*` and `AppCrash_*` with the run's time).
+
+What each artefact proves:
+- `run-dump.txt`: DMA packets per engine around the `device_removed.moment_ms` wall-clock time.
+  A packet running ≥ 2 s, or a reset/TDR event, means a Windows timeout. All packets finished,
+  with no reset, means a CPU-side removal. (The DxgKrnl event names must be read from the first
+  dump.)
+- `events.txt`: a Display 4101 event at the time proves an adapter-level TDR. No event is
+  consistent with #2403 but not proof.
+- `smi.csv`: rules memory exhaustion (memory.used at total) and thermal or power limits in or out
+  at the time.
+- `wer.txt`: LiveKernelEvent 117/141 at the time proves a timeout.
+
+---
+
+### 8. Concurrency plan
+
+Shared hot spots: `telemetry_gpu.rs`, `telemetry_run.rs`, `real.rs`, `pso_async.rs`, `bind.rs`
+(and `console_list.rs`, `dred.rs`, `hle/d3d12x/mod.rs`).
+
+| unit | writes | wave |
+|---|---|---|
+| I1 | `code_use.rs` (new), `hle/d3d12x/mod.rs`, `dred.rs`, `bind.rs`, `console_list.rs`, `real/dispatch_chain.rs`, `gpu/recomp/pso.rs`, `telemetry_gpu.rs` (one line) | 1 |
+| I4 | `gpu/agility.rs`, `real.rs` (`init` debug block, `debug_message`), `telemetry_run.rs`, `docs/guide/cli-and-config.md` | 1 |
+| I5a | `gpu/pass_stats.rs` (new), `gpu/mod.rs` | 1 |
+| I3 | `real.rs` (`init` DRED block, `report_dred_lists`, `log_device_removed`, `dred_tests`), `dred.rs`, `telemetry_run.rs` | 2 |
+| I2a | `removal.rs` (new), `hle/d3d12x/mod.rs`, `real.rs` (execute block, `init` end, `log_device_removed`, `stop_if_device_removed` + callers), `telemetry_run.rs`, `telemetry_gpu.rs` (`telemetry_last_seq`) | 3 |
+| I5b | `pass_capture.rs` (new), `list_x.rs`, `console_list.rs`, `bind.rs`, `present.rs` (`dsv_resource`), `real.rs` (`:2631` only), `hle/d3d12x/mod.rs` | 3, **landed after I2a** (`real.rs`, `mod.rs`) |
+| I2b | `telemetry_gpu.rs`, `bind.rs`, `console_list.rs`, `culprit.rs`, `real.rs` (`log_device_removed`, execute block) | 4 |
+| I5c | `pass_capture.rs`, `telemetry_gpu.rs`, `gpu/pass_stats.rs` | 4, **after I2b** (`telemetry_gpu.rs`) |
+| I5d | `scripts/dev/pass-stats-check.py`, its test (dev branch only) | any |
+
+Rule: within a wave, the writers of the same file are serialized. Wave 3: I2a and I5b both write
+`real.rs` and `mod.rs`, so I5b lands second. Wave 4: I2b, then I5c. Wave 1 has no overlap
+(`real.rs`: only I4; `telemetry_gpu.rs`: only I1; `telemetry_run.rs`: only I4). No unit touches
+`pso_async.rs`.
+
+---
+
+### 9. Acceptance runs on the retail title (RTX 5080, driver 621.40)
+
+The same scene start, warm caches, ray tracing on unless said. Each run uses I6. Pass = the
+numbers below. The cost baseline: the same run with telemetry `frame` and no new switches
+(before the units).
+
+| run | switches | success means |
+|---|---|---|
+| R1 cost | `XCL_TELEMETRY=frame` (I1 on through the tier), RT off, 300 s | median frame `cpu_ms` within 2 % of the baseline; `measure_ms` total < 2,000 ms; `code` events every frame |
+| R2 removal, 512 MB (no profile: `xcl nvprofile remove`) | `XCL_TELEMETRY=pass XCL_DRED=1 XCL_CODE_LIMIT_MB=448`, RT on | one `device_removed` event before `end` with `site`, `moment_ms`, `queues`, `device_state`, `code_in_use_bytes`; `DRED: n lists: …` summary; `last_dispatch` events. **#2403 supported** if `code_in_use_bytes` ≥ 0.9 × 448 MB (≥ 403 MB) at the removal in 2 of 2 runs, and the 75/90/100 % warnings come just before it. **Refuted** if < 270 MB. |
+| R3 left-out half | as R2 + leave out the first 500 resolve programs, 230 s | no removal; peak `in_use_bytes` < 403 MB (if a removal-free run peaks above 448 MB, the 448 figure is wrong for this driver: report it) |
+| R3b left-out 250 / other 500 | as R3 with those rules (the orchestrator's runs in progress) | the peak predicts the outcome: removal iff the peak crosses about 448 MB |
+| R4 profile 1 GiB | as R2 with `xcl nvprofile install --mb 1024`, `XCL_CODE_LIMIT_MB=896`, 230 s | no removal; **or** a removal with `in_use_bytes` ≥ 806 MB. Either supports #2403. A removal below 448 MB with the profile active refutes it. |
+| R4d debug layer | `XCL_D3D12_DEBUG=1`, RT off, 120 s of menus + scene | no crash in SDKLayers, or the crash located (test name or `xcl run` stack); `debug_layer` events present |
+| R5 pass stats | `XCL_TELEMETRY=pass XCL_PASS_STATS=<first scene frame + 60> XCL_PASS_DUMP=1`, RT off | `pass_stats` events for ≥ 90 % of the armed frame's passes that have a target; the frame after the armed one is within 5 % of the frame before it; the script prints findings and names the first pass whose output becomes constant |
+
+---
+
+### 10. Deliberately left out
+
+- **Shader-side write-address logging** (exact bindless write sets): it changes every shader's
+  cache identity (hours of rebuild). It comes only if I5's root-argument resolution misses the
+  writes that matter (`unresolved` counts in R5 show that).
+- **Graphics read tracking** in I5 v1: the `read_unwritten` rule covers compute reads only.
+- **Reading the NVIDIA profile value from inside `code_use`:** the limit is a switch.
+  `#2590`'s `status` could feed it later.
+- **Aftermath, PIX, RenderDoc, Nsight, WinDbg:** not approved installs.
+- **Fixing the code-size wall** (less code in use, releasing unused pipelines): upstream work
+  (#2403 "What would fix it"), not instrumentation.
+- **U3's rt-role counters:** a ray-tracing feature metric, not removal evidence.
+- **GBV on the full title:** too slow (research report §3.1). The switch is there for reduced
+  repros.
