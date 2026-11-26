@@ -807,6 +807,7 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
         return;
     }
     let key = list as usize;
+    crate::report::telemetry_list_reset(list);
     // (of a list that was here before and whose release was not seen: the GPU may still use it)
     release_copy_scratch(key);
     let old = {
@@ -3129,6 +3130,7 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _
             UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: ManuallyDrop::new(None) }),
         },
     };
+    crate::report::telemetry_pass_boundary(this, 1);
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
 }
 
@@ -4247,6 +4249,7 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     if barriers.is_null() || n == 0 {
         return;
     }
+    crate::report::telemetry_pass_boundary(this, n);
     let mut out: Vec<[u32; 8]> = Vec::with_capacity(n as usize + 1);
     // a UAV barrier for all resources is in `out` / a transition from or to UNORDERED_ACCESS
     let (mut any_uav, mut uav_transition) = (false, false);

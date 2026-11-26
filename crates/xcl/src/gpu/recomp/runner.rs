@@ -1670,6 +1670,7 @@ pub fn dispatch_timed(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32],
     .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
     dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, reps.max(1), true, None).map(|(_, t)| t)
 }
+#[cfg(test)] pub(crate) fn hold_gpu() -> impl Sized { GPU.lock().unwrap_or_else(|e| e.into_inner()) }
 
 #[cfg(test)]
 pub(crate) fn profile_buffer_forms(

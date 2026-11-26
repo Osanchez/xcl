@@ -878,6 +878,7 @@ fn note_request(r: &Request) {
 
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, dest_on_stack: bool, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
+    let _telemetry = crate::report::telemetry_io_begin(r.destination_size as u64, r.zlib());
     let n = r.destination_size as usize;
     note_request(r);
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {

@@ -302,6 +302,14 @@ struct Manifest {
     sample: u32,
     /// lists and frames that got null GPU data, by reason (written at exit)
     gpu_drops: BTreeMap<String, u64>,
+    /// pass stamp slots in the pass heap (0 below tier pass)
+    pass_slots: u32,
+    /// list stamp slots per set and queue
+    list_slots: u32,
+    /// stamp sets per queue
+    gpu_sets: u32,
+    /// `CopyQueueTimestampQueriesSupported`, once a copy queue was seen
+    copy_queue_timestamps: Option<bool>,
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -800,7 +808,8 @@ mod telemetry_tests {
         let keys = [
             "schema", "run_id", "xcl_version", "commit", "commit_source", "dirty", "rust", "profile", "os", "cpu", "cores", "threads", "ram_mb", "adapter", "driver",
             "vram_mb", "wave_lane_count_min", "wave_lane_count_max", "dxc", "title", "title_version", "exe", "log", "tier", "switches", "started", "events_dropped",
-            "present_mode", "window_size", "loop_budget", "loop_counters", "split_wave64", "diagnostic", "compare_key", "sample", "gpu_drops",
+            "present_mode", "window_size", "loop_budget", "loop_counters", "split_wave64", "diagnostic", "compare_key", "sample", "gpu_drops", "pass_slots", "list_slots",
+            "gpu_sets", "copy_queue_timestamps",
         ];
         for k in keys {
             assert!(o.contains_key(k), "manifest lacks {k}");
@@ -808,7 +817,7 @@ mod telemetry_tests {
         for k in o.keys() {
             assert!(keys.contains(&k.as_str()), "manifest has a key the test does not list: {k}");
         }
-        assert_eq!(o.len(), 36);
+        assert_eq!(o.len(), 40);
         assert_eq!(o["schema"], 1);
         assert!(o["commit"].is_null() && o["commit_source"].is_null() && o["dirty"].is_null() && o["rust"].is_null());
         assert!(o["cores"].is_null() && o["adapter"].is_null() && o["title_version"].is_null());

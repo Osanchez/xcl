@@ -455,6 +455,7 @@ mod translated {
         let err_path = path.with_extension("err");
         if let Some(c) = load_in(&path, ident, blob) {
             super::dxc::note_memory_hit();
+            crate::report::telemetry_shader_source("cache");
             return Ok(c);
         }
         if let Some(reason) = load_err_in(&err_path, ident, blob) {
@@ -550,6 +551,7 @@ mod translated {
         for id in [ident, rerouted] {
             if let Some(c) = load_in(&file(dir, id, blob, stage, sampler_base, windows, split), id, blob) {
                 super::dxc::note_memory_hit();
+                crate::report::telemetry_shader_source("cache");
                 return Ok(c);
             }
         }
@@ -599,6 +601,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         match direct_compute(blob, sampler_base, windows, split_wave64) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated("CS");
+                crate::report::telemetry_shader_source("direct");
                 return Ok((c, false));
             }
             Err(e) => direct_fallback("CS", &e),
@@ -614,6 +617,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         match direct_graphics(blob, stage, sampler_base, windows) {
             Ok(c) => {
                 crate::gpu::dxil::coverage::record_translated(if stage == Stage::Vertex { "VS" } else { "PS" });
+                crate::report::telemetry_shader_source("direct");
                 return Ok((c, false));
             }
             Err(e) => direct_fallback(if stage == Stage::Vertex { "VS" } else { "PS" }, &e),
@@ -632,6 +636,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
                     t.hlsl.len() >> 10,
                     c.dxil.len() >> 10
                 );
+                crate::report::telemetry_shader_source("direct");
                 return Ok((c, true));
             }
             Err(e) => direct_fallback("CS", &e),
@@ -667,6 +672,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
     let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
+    crate::report::telemetry_shader_source("dxc");
     Ok((Compiled { dispatch_chain: None, dxil, samplers: t.static_samplers }, false))
 }
 
@@ -883,6 +889,7 @@ fn cached_shader(
 ) -> Result<Arc<Compiled>, String> {
     if let Some(shader) = cache.lock().unwrap().get(&key, blob) {
         dxc::note_memory_hit();
+        crate::report::telemetry_shader_source("cache");
         return Ok(shader);
     }
     // Cached-only probes (non-blocking PSO creation) must never block on an in-flight worker.
@@ -899,6 +906,7 @@ fn cached_shader(
     let _guard = flight.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shader) = cache.lock().unwrap().get(&key, blob) {
         dxc::note_memory_hit();
+        crate::report::telemetry_shader_source("cache");
         return Ok(shader);
     }
     // Keep compilation outside the cache lock.

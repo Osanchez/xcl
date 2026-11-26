@@ -267,6 +267,7 @@ fn signature_dispatches(sig: usize) -> bool {
 /// translated pipeline, on XCL's ABI with the kept root arguments (signatures that change root
 /// arguments themselves cannot be – skipped, logged)
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
+    crate::report::telemetry_indirect(this);
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
@@ -549,6 +550,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     let pso = with(this, |s| s.pso);
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
     let real = super::pso_async::resolve_wait(pso);
+    crate::report::telemetry_draw(this, real);
     if !super::real::is_translated_graphics(real) {
         // A finished two-pass MS/GS pipeline is a PC mesh shader pipeline (MS+PS) registered in
         // TWO_PASS rather than TRANSLATED_GRAPHICS. Binding the title's graphics RS and issuing
@@ -1011,6 +1013,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         trace_fullscreen(this, pso, [x, y, z]);
     }
     bind_abi(this, list, pso, false)?;
+    crate::report::telemetry_dispatch(this, pso);
     let mark = super::culprit::before_dispatch(list, with(this, |s| s.pso), pso, [x, y, z]);
     if mark != 0 {
         with(this, |s| {

@@ -2770,6 +2770,7 @@ unsafe fn create_display_target(this: *mut c_void, props: usize, desc: usize, st
 }
 
 unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let _telemetry = crate::report::telemetry_resource_begin("committed", desc);
     static SEEN: AtomicU64 = AtomicU64::new(0);
     if desc != 0 && std::env::var_os("XCL_D3D12_TRACE").is_some() && SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
         let w = |o: usize| *((desc + o) as *const u32);
@@ -2994,6 +2995,7 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     preserve_vtable(this, ext);
     if hr >= 0 {
         super::list_x::on_pc_reset(this);
+        crate::report::telemetry_list_reset(this);
         super::dred::reset(this);
         if !initial_state.is_null() {
             super::dred::mark_pipeline(this, initial_state as usize, resolved as usize);
@@ -3195,6 +3197,7 @@ pub(super) unsafe fn create_raw_pc_command_list(
         }
         hr
     };
+    if hr >= 0 && !out.is_null() { crate::report::telemetry_list_reset(out); }
     (hr >= 0 && !out.is_null()).then_some(out)
 }
 creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHeap, [a1]);
@@ -3211,6 +3214,7 @@ pub(super) const PC_RESOURCE_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 |
 /// buffers-only heap) is made the PC's way (`device_x::pc_resource_desc`, the console's state
 /// bits dropped). Logged with the console's values.
 pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_void, heap: usize, offset: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let _telemetry = crate::report::telemetry_resource_begin("placed", desc);
     // the clear value in the PC's format of the resource (D3D12 wants the two to match)
     let mut clear_buf = [0u8; 24];
     let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf) as usize;
@@ -3375,6 +3379,7 @@ unsafe fn is_reserved(res: *mut c_void) -> bool {
 
 /// CreateReservedResource
 pub(super) unsafe extern "system" fn dev_create_reserved_resource(this: *mut c_void, a1: usize, a2: usize, a3: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let _telemetry = crate::report::telemetry_resource_begin("reserved", a1);
     note_reserved(pc_create_reserved_resource(this, a1, a2, a3, riid, ppv), ppv)
 }
 
@@ -4156,6 +4161,7 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
     let started = std::time::Instant::now();
     let r = build();
     let took = started.elapsed();
+    crate::report::telemetry_pipeline_built(kind, bytes, record, took, waited);
     super::pso_manifest::note(super::pso_manifest::Event::Build { kind, bytes, record, driver_ms: took.as_millis(), waited_ms: waited.as_millis() });
     if log {
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, waited));

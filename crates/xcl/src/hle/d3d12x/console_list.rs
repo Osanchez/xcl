@@ -807,6 +807,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             b.chunks_exact(4).filter(|c| c[0] as u32 == 0).map(|c| (c[1] as usize, c[2] as u32, D3D12_RESOURCE_STATES(c[3] as u32 as i32))).collect();
                         super::title_textures::note_transitions(st.pc, &t);
                     }
+                    crate::report::telemetry_pass_boundary(list.as_raw(), n as u32);
                     list.ResourceBarrier(std::slice::from_raw_parts(b.as_ptr() as *const D3D12_RESOURCE_BARRIER, n));
                 }
                 out.barriers += n as u32;
@@ -866,6 +867,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 }
                 at += 35;
             } else if w0 == BARRIER_MARKER {
+                crate::report::telemetry_pass_boundary(list.as_raw(), 1);
                 list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                     Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -913,6 +915,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let raw = real as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
+                        crate::report::telemetry_dispatch(list.as_raw(), real as usize);
                         let mark = super::culprit::before_dispatch(&list, (*p).pc, real, [x, y, z]);
                         super::real::dispatch_chain::dispatch(&list, real, st.allocator, [x, y, z])?;
                         super::culprit::after_dispatch(&list, mark);

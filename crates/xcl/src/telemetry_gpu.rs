@@ -12,10 +12,10 @@
 // P2-C (frame glue) and part 3 use the items that nothing calls yet.
 #![allow(dead_code)]
 
-use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use crate::hle::d3d12x::{frame as dframe, layout, real};
-use crate::log::{self as xlog, FrameFacts, ListFacts, MemoryFacts, Tier};
+use crate::log::{self as xlog, FrameFacts, ListFacts, MemoryFacts, PassFacts, Tier};
 
 /// Stamp sets per queue: frames in flight + 1.
 const SETS: usize = 4;
@@ -43,6 +43,24 @@ const NULLS_MAX: usize = 4096;
 const HARVESTED_MAX: usize = 4096;
 /// Lists with a submission whose stamps are not read yet (the resubmission check).
 const IN_FLIGHT_MAX: usize = 16384;
+/// Pass stamps (part 3): one global heap of `PASS_SLOTS`, handed out in blocks of `BLOCK_SLOTS`.
+const PASS_SLOTS: u32 = 65_536;
+const BLOCK_SLOTS: u32 = 256;
+const BLOCKS: usize = (PASS_SLOTS / BLOCK_SLOTS) as usize;
+/// Blocks one recording may take (then its passes stop: `full`).
+const MAX_REC_BLOCKS: usize = 16;
+/// Recordings with pass notes that are not submitted yet.
+const RECS_MAX: usize = 8192;
+/// Distinct pipeline ids one pass reports.
+const MAX_PIPES: usize = 8;
+/// Telemetry pipeline ids by pointer (bounded).
+const PIPE_MAP_MAX: usize = 262_144;
+/// How long a title thread waits for a telemetry lock before the note is dropped.
+const NOTE_WAIT: Duration = Duration::from_millis(2);
+/// `io` events are flushed at least this often.
+const IO_FLUSH: Duration = Duration::from_millis(250);
+/// Poisoned submissions kept (a resubmitted list's earlier entries).
+const POISONED_MAX: usize = 4096;
 
 // indexes of `GpuTel.drops`
 const DROP_FULL: usize = 0;
@@ -472,12 +490,20 @@ impl StampSet {
 
     /// Records the resolve of `[0, used)` into the readback buffer; the list to submit first in
     /// the queue's next call. The set is Open, so the GPU is done with the allocator.
-    fn record_resolve(&mut self) -> Option<*mut c_void> {
+    /// With `pass` (part 3) the same list also resolves every pass block range the set's
+    /// submissions used, into the pass readback buffer.
+    fn record_resolve(&mut self, pass: Option<&PassPool>) -> Option<*mut c_void> {
+        let ranges = pass.map(|_| resolve_ranges(&self.entries)).unwrap_or_default();
         // SAFETY: nothing of this set is in flight (its last resolve passed the fence before it was freed).
         unsafe {
             self.resolve_alloc.Reset().ok()?;
             self.resolve_list.Reset(&self.resolve_alloc, None::<&ID3D12PipelineState>).ok()?;
             self.resolve_list.ResolveQueryData(&self.heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, self.used, &self.readback, 0);
+            if let Some(p) = pass {
+                for (start, count) in ranges {
+                    self.resolve_list.ResolveQueryData(&p.heap, D3D12_QUERY_TYPE_TIMESTAMP, start, count, &p.readback, start as u64 * 8);
+                }
+            }
             self.resolve_list.Close().ok()?;
         }
         Some(self.resolve_list.as_raw())
@@ -496,6 +522,8 @@ struct ListEntry {
     resubmitted: bool,
     origin: &'static str,
     why: Option<&'static str>,
+    /// the pass stamps of this submission (part 3; Some only at tier pass)
+    pass: Option<Box<PassRec>>,
 }
 
 /// A queue's clock, stamp sets and fence. The mutex is held across the driver call, so only
@@ -565,7 +593,7 @@ impl QueueClock {
 
     /// The queue's first submission in `frame`: the old set (if it holds stamps) gets its resolve,
     /// returned to go first in the call; the next free set is opened when `open_next`.
-    fn new_frame(&mut self, frame: u64, open_next: bool) -> Option<(usize, *mut c_void)> {
+    fn new_frame(&mut self, frame: u64, open_next: bool, pass: Option<&PassPool>) -> Option<(usize, *mut c_void)> {
         let prev = self.cur.take();
         self.cur_frame = frame;
         let mut resolve = None;
@@ -575,7 +603,7 @@ impl QueueClock {
                 if s.used == 0 {
                     s.state = SetState::Free;
                     s.entries.clear();
-                } else if let Some(raw) = s.record_resolve() {
+                } else if let Some(raw) = s.record_resolve(pass) {
                     resolve = Some((i, raw));
                 } else {
                     // the resolve could not be recorded: nothing will be read
@@ -691,6 +719,12 @@ pub(super) struct GpuTel {
     early_reads: AtomicU64,
     /// lists submitted per frame: (frame low 32 bits << 32 | count), one slot per frame modulo 64
     counts: [AtomicU64; 64],
+    /// the pass engine (part 3)
+    pass: PassTel,
+    /// the PC list's function `slot` (the original vtable of an adopted list; the object's own in tests)
+    list_fn: unsafe fn(*mut c_void, usize) -> usize,
+    /// submissions (seq) whose list was submitted again before they were read: their pass ticks are unusable
+    poisoned: Mutex<HashSet<u64>>,
 }
 
 impl GpuTel {
@@ -725,7 +759,19 @@ impl GpuTel {
             reads: AtomicU64::new(0),
             early_reads: AtomicU64::new(0),
             counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            pass: PassTel::new(),
+            list_fn: orig_slot,
+            poisoned: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Turns the pass engine on (tier pass); `plain_lists`: the lists are the objects' own, not adopted (tests).
+    pub(super) fn with_pass(mut self, plain_lists: bool) -> GpuTel {
+        self.pass.on.store(true, Ordering::Relaxed);
+        if plain_lists {
+            self.list_fn = plain_fn;
+        }
+        self
     }
 
     fn dev(&self) -> Option<DevFns> {
@@ -827,7 +873,7 @@ impl GpuTel {
             ONCE.call_once(|| crate::xlog_warn!("telemetry: no PC queue functions for queue {key:p} - its lists are not timed"));
             return None;
         };
-        let (q, ev) = {
+        let (q, ev, copy_cap) = {
             let mut w = self.queues.write().unwrap_or_else(|e| e.into_inner());
             if let Some((_, q)) = w.iter().find(|(kk, _)| *kk == k) {
                 return Some(q.clone());
@@ -840,11 +886,15 @@ impl GpuTel {
             let id = self.next_queue.fetch_add(1, Ordering::Relaxed);
             let c = QueueClock::new(&dev, qf, id, self.slots, self.copy_ts);
             let ev = clock_event(&c, self.qpf, frame);
+            let copy_cap = (c.kind == QueueKind::Copy).then_some(c.cap);
             let q = Arc::new(Mutex::new(c));
             w.push((k, q.clone()));
-            (q, ev)
+            (q, ev, copy_cap)
         };
         sink("clock", ev);
+        if let Some(cap) = copy_cap {
+            super::update_manifest(|m| m.copy_queue_timestamps = Some(cap));
+        }
         Some(q)
     }
 
@@ -886,7 +936,7 @@ impl GpuTel {
         let c: &mut QueueClock = &mut guard;
 
         // the queue's first call in a new frame: the old set's resolve goes first
-        let resolve = if c.cur_frame != frame { c.new_frame(frame, sampled && c.why_off.is_none()) } else { None };
+        let resolve = if c.cur_frame != frame { c.new_frame(frame, sampled && c.why_off.is_none(), self.pass.pool.get()) } else { None };
 
         #[derive(Clone, Copy)]
         enum Plan {
@@ -921,6 +971,9 @@ impl GpuTel {
                 }
             }
         };
+
+        // the pass stamps recorded into these lists (tier pass): each list's recording goes with its entry
+        let mut recs: Vec<Option<Box<PassRec>>> = if self.pass.on.load(Ordering::Relaxed) { self.pass_take(lists, frame) } else { Vec::new() };
 
         let mut v: Vec<*mut c_void> = Vec::new();
         let stamped = matches!(plan, Plan::Stamp(..));
@@ -963,14 +1016,27 @@ impl GpuTel {
 
         self.note_lists(frame, n as u32);
         if matches!(plan, Plan::Skip) {
+            // their blocks stay out of the pool until the GPU has surely run the lists
+            for r in recs.iter_mut().filter_map(Option::take) {
+                self.pass_park(r, frame);
+            }
             return;
         }
         let mut inflight = plock(&self.in_flight);
         for (k, l) in lists.iter().enumerate() {
             let (list, seq) = (*l as usize, seq0 + k as u64);
-            let resubmitted = inflight.contains_key(&list);
+            // the same recording again: a list that was Reset since its last submission is a new one
+            let earlier = inflight.get(&list).copied();
+            let resubmitted = earlier.is_some();
             if resubmitted {
                 self.note(DROP_RESUBMITTED, 1);
+                if let (Some((_, before)), true) = (earlier, self.pass.on.load(Ordering::Relaxed)) {
+                    let mut p = plock(&self.poisoned);
+                    if p.len() >= POISONED_MAX {
+                        p.clear();
+                    }
+                    p.insert(before);
+                }
             }
             let (slot, why) = match plan {
                 Plan::Stamp(_, base) => (Some(base + k as u32), None),
@@ -980,11 +1046,17 @@ impl GpuTel {
             if slot.is_some() && (resubmitted || inflight.len() < IN_FLIGHT_MAX) {
                 inflight.insert(list, (c.id, seq));
             }
-            let e = ListEntry { frame, seq, list, chunk, slot, cpu_us, resubmitted, origin, why };
+            let pass = recs.get_mut(k).and_then(Option::take);
+            let e = ListEntry { frame, seq, list, chunk, slot, cpu_us, resubmitted, origin, why, pass };
             match plan {
                 Plan::Stamp(i, _) => c.sets[i].entries.push(e),
                 _ if c.nulls.len() < NULLS_MAX => c.nulls.push(e),
-                _ => self.note(DROP_FULL, 1),
+                _ => {
+                    self.note(DROP_FULL, 1);
+                    if let Some(r) = e.pass {
+                        self.pass_park(r, frame);
+                    }
+                }
             }
         }
         drop(inflight);
@@ -1009,6 +1081,7 @@ impl GpuTel {
                 self.emit(d, sink);
             }
         }
+        self.pass_release_parked(frame);
     }
 
     fn collect(&self, c: &mut QueueClock, frame: u64, out: &mut Vec<Done>) {
@@ -1056,6 +1129,14 @@ impl GpuTel {
                 SetState::Late(v) if done_value >= v => s.state = SetState::Free,
                 SetState::Ready if frame >= s.frame + 2 => {
                     let ticks = self.read_ticks(s, frame);
+                    if ticks.is_some() {
+                        for e in s.entries.iter_mut() {
+                            if let Some(r) = e.pass.as_mut() {
+                                let t = self.read_pass_ticks(r);
+                                r.ticks = t;
+                            }
+                        }
+                    }
                     let why = if ticks.is_none() { Some("late") } else { None };
                     out.push(mk(std::mem::take(&mut s.entries), ticks, why));
                     s.state = SetState::Free;
@@ -1087,8 +1168,9 @@ impl GpuTel {
     }
 
     /// Writes the `list` events of `d` and hands the intervals over.
-    fn emit(&self, d: Done, sink: Sink) {
-        for e in &d.entries {
+    fn emit(&self, mut d: Done, sink: Sink) {
+        let recs: Vec<Option<Box<PassRec>>> = d.entries.iter_mut().map(|e| e.pass.take()).collect();
+        for (e, rec) in d.entries.iter().zip(recs) {
             let mut why = e.why.or(d.why);
             let (mut st, mut et, mut sm, mut em) = (None, None, None, None);
             if why.is_none() {
@@ -1132,6 +1214,22 @@ impl GpuTel {
             let mut h = plock(&self.harvested);
             if h.len() < HARVESTED_MAX {
                 h.push_back(HarvestedList { frame: e.frame, queue: d.qid, start_ms: sm, end_ms: em });
+            }
+            drop(h);
+            if let Some(mut rec) = rec {
+                let resub = plock(&self.poisoned).remove(&e.seq) | e.resubmitted;
+                let ctx = PassCtx { frame: e.frame, seq: e.seq, queue: d.qid, resubmitted: resub, list_why: why, start: st, end: et };
+                for p in pass_facts(&rec, &ctx, &|t| self.tick_ms(&d, t)) {
+                    sink("pass", xlog::pass_fields(&p));
+                }
+                // read (or never resolved because the set was given up on): free at once; a submission
+                // that was not stamped may still be on the GPU: parked
+                let blocks = std::mem::take(&mut rec.blocks);
+                if e.slot.is_some() || d.why == Some("removed") {
+                    self.pass_free(blocks);
+                } else {
+                    self.pass_park_blocks(blocks, self.frame());
+                }
             }
         }
         // the stamps of these submissions are read: their lists are no longer "in flight"
@@ -1197,6 +1295,731 @@ impl GpuTel {
 }
 
 // ---------------------------------------------------------------------------------------
+// part 3: pass stamps
+// ---------------------------------------------------------------------------------------
+
+/// What one pass (the span between two barrier batches of a list) did.
+#[derive(Clone, Default, Debug, PartialEq)]
+struct Counts {
+    draws: u32,
+    dispatches: u32,
+    indirect: u32,
+    /// telemetry ids of the distinct pipelines drawn or dispatched with, first seen first (at most `MAX_PIPES`)
+    pipes: Vec<u64>,
+    truncated: bool,
+}
+
+impl Counts {
+    fn pipe(&mut self, id: u64) {
+        if self.pipes.contains(&id) {
+            return;
+        }
+        if self.pipes.len() < MAX_PIPES {
+            self.pipes.push(id);
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    fn merge(&mut self, o: &Counts) {
+        self.draws = self.draws.saturating_add(o.draws);
+        self.dispatches = self.dispatches.saturating_add(o.dispatches);
+        self.indirect = self.indirect.saturating_add(o.indirect);
+        for p in &o.pipes {
+            self.pipe(*p);
+        }
+        self.truncated |= o.truncated;
+    }
+
+    fn is_empty(&self) -> bool {
+        *self == Counts::default()
+    }
+
+    fn kind(&self) -> &'static str {
+        if self.draws > 0 {
+            "draw"
+        } else if self.dispatches > 0 {
+            "dispatch"
+        } else if self.indirect > 0 {
+            "indirect"
+        } else {
+            "empty"
+        }
+    }
+}
+
+/// The pass stamps of one recording of a PC list. Boundary `i` took local slot `i`; pass `k` runs
+/// from boundary `k - 1` (pass 0: the list's start stamp) to boundary `k` (the last pass: the
+/// list's end stamp).
+struct PassRec {
+    list: usize,
+    /// the frame of the first note (a recording that was never submitted or Reset is swept after `LATE_FRAMES`)
+    frame: u64,
+    typed: bool,
+    /// why no more stamps are taken: `copy_list`, `bundle`, `unsupported`, `full`, `lock_busy`
+    why: Option<&'static str>,
+    blocks: Vec<u16>,
+    /// stamps taken
+    total: u32,
+    /// barriers of the batch each boundary stands before
+    bounds: Vec<u32>,
+    /// `bounds.len() + 1` passes
+    passes: Vec<Counts>,
+    /// the resolved ticks by local slot (the harvest fills them)
+    ticks: Vec<u64>,
+}
+
+impl PassRec {
+    fn new(list: usize, frame: u64) -> PassRec {
+        PassRec { list, frame, typed: false, why: None, blocks: Vec::new(), total: 0, bounds: Vec::new(), passes: vec![Counts::default()], ticks: Vec::new() }
+    }
+
+    /// A recording that could not be taken (the one pass of the list says why).
+    fn without_stamps(list: usize, frame: u64, why: &'static str) -> PassRec {
+        PassRec { typed: true, why: Some(why), ..PassRec::new(list, frame) }
+    }
+
+    /// (first slot, count) of each block the stamps went into.
+    fn ranges(&self) -> Vec<(u32, u32)> {
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &b)| {
+                let n = self.total.saturating_sub(i as u32 * BLOCK_SLOTS).min(BLOCK_SLOTS);
+                (n > 0).then_some((b as u32 * BLOCK_SLOTS, n))
+            })
+            .collect()
+    }
+
+    /// The global slot of local slot `j`.
+    fn global(&self, j: u32) -> Option<u32> {
+        let b = *self.blocks.get((j / BLOCK_SLOTS) as usize)?;
+        Some(b as u32 * BLOCK_SLOTS + j % BLOCK_SLOTS)
+    }
+}
+
+/// The block ranges of every pass recording of `entries`, adjacent ones joined.
+fn resolve_ranges(entries: &[ListEntry]) -> Vec<(u32, u32)> {
+    let mut all: Vec<(u32, u32)> = entries.iter().filter_map(|e| e.pass.as_ref()).flat_map(|r| r.ranges()).collect();
+    all.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(all.len());
+    for (s, n) in all {
+        match out.last_mut() {
+            Some(l) if l.0 + l.1 == s => l.1 += n,
+            _ => out.push((s, n)),
+        }
+    }
+    out
+}
+
+/// Recordings by list and the pool of blocks, under one mutex. Nothing in a section that holds
+/// it calls out.
+struct PassState {
+    free: Vec<u16>,
+    recs: HashMap<usize, PassRec>,
+    /// blocks of submissions that were not stamped: free again once the GPU has surely run them
+    parked: VecDeque<(u64, Vec<u16>)>,
+    last_sweep: Option<u64>,
+}
+
+impl PassState {
+    fn new(blocks: usize) -> PassState {
+        PassState { free: (0..blocks as u16).rev().collect(), recs: HashMap::new(), parked: VecDeque::new(), last_sweep: None }
+    }
+
+    /// Recordings that were never submitted or Reset for `LATE_FRAMES` give their blocks back (at most once per frame).
+    fn sweep(&mut self, frame: u64) {
+        if self.last_sweep == Some(frame) {
+            return;
+        }
+        self.last_sweep = Some(frame);
+        let stale: Vec<usize> = self.recs.iter().filter(|(_, r)| r.frame + LATE_FRAMES < frame).map(|(l, _)| *l).collect();
+        for l in stale {
+            if let Some(r) = self.recs.remove(&l) {
+                self.free.extend(r.blocks);
+            }
+        }
+    }
+
+    /// Makes sure the list has a recording; false when `RECS_MAX` recordings wait.
+    fn ensure(&mut self, list: usize, frame: u64) -> bool {
+        if self.recs.contains_key(&list) {
+            return true;
+        }
+        if self.recs.len() >= RECS_MAX {
+            self.sweep(frame);
+            if self.recs.len() >= RECS_MAX {
+                return false;
+            }
+        }
+        self.recs.insert(list, PassRec::new(list, frame));
+        true
+    }
+
+    /// Adds counters to the list's current pass.
+    fn merge_counts(&mut self, list: usize, c: Counts, frame: u64) {
+        if self.ensure(list, frame) {
+            if let Some(p) = self.recs.get_mut(&list).and_then(|r| r.passes.last_mut()) {
+                p.merge(&c);
+            }
+        }
+    }
+
+    /// A pass boundary: the next stamp slot of the recording (a global slot), or why none is taken.
+    fn boundary(&mut self, list: usize, barriers: u32, frame: u64) -> Result<u32, &'static str> {
+        if !self.ensure(list, frame) {
+            return Err("full");
+        }
+        let (why, total, nblocks) = match self.recs.get(&list) {
+            Some(r) => (r.why, r.total, r.blocks.len()),
+            None => return Err("full"),
+        };
+        if let Some(w) = why {
+            return Err(w);
+        }
+        let new_block = total % BLOCK_SLOTS == 0;
+        if new_block && nblocks < MAX_REC_BLOCKS && self.free.is_empty() {
+            self.sweep(frame);
+        }
+        let block = if new_block {
+            if nblocks >= MAX_REC_BLOCKS {
+                None
+            } else {
+                self.free.pop()
+            }
+        } else {
+            Some(0)
+        };
+        let Some(r) = self.recs.get_mut(&list) else { return Err("full") };
+        if new_block {
+            match block {
+                Some(b) => r.blocks.push(b),
+                None => {
+                    r.why = Some("full");
+                    return Err("full");
+                }
+            }
+        }
+        let slot = r.global(total).ok_or("full")?;
+        r.total += 1;
+        r.bounds.push(barriers);
+        r.passes.push(Counts::default());
+        Ok(slot)
+    }
+
+    /// The list was Reset: its recording was never submitted (a submission took it), so its stamps
+    /// never run and its blocks are free. Returns the number of blocks given back.
+    fn reset(&mut self, list: usize) -> usize {
+        match self.recs.remove(&list) {
+            Some(r) => {
+                let n = r.blocks.len();
+                self.free.extend(r.blocks);
+                n
+            }
+            None => 0,
+        }
+    }
+
+    /// The recording of a list that is being submitted (an empty one when it has none).
+    fn take(&mut self, list: usize, frame: u64) -> Box<PassRec> {
+        Box::new(self.recs.remove(&list).unwrap_or_else(|| PassRec::new(list, frame)))
+    }
+
+    fn free_blocks(&mut self, blocks: Vec<u16>) {
+        self.free.extend(blocks);
+    }
+
+    fn park(&mut self, frame: u64, blocks: Vec<u16>) {
+        if !blocks.is_empty() {
+            self.parked.push_back((frame, blocks));
+        }
+    }
+
+    fn release_parked(&mut self, frame: u64) {
+        while self.parked.front().is_some_and(|(f, _)| f + LATE_FRAMES <= frame) {
+            if let Some((_, b)) = self.parked.pop_front() {
+                self.free.extend(b);
+            }
+        }
+    }
+}
+
+/// The global pass heap and its readback buffer (never freed: lists in flight may name the heap).
+struct PassPool {
+    heap: ID3D12QueryHeap,
+    readback: ID3D12Resource,
+    mapped: Mapped,
+}
+
+// SAFETY: free-threaded D3D12 objects; the mapped pointer is read only after a set's fence.
+unsafe impl Send for PassPool {}
+unsafe impl Sync for PassPool {}
+
+impl PassPool {
+    fn new(dev: &DevFns) -> Option<PassPool> {
+        let heap = dev.query_heap(D3D12_QUERY_HEAP_TYPE_TIMESTAMP, PASS_SLOTS)?;
+        let readback = dev.readback(PASS_SLOTS as u64 * 8)?;
+        let mut p: *mut c_void = std::ptr::null_mut();
+        // SAFETY: mapped once, for the life of the buffer.
+        unsafe { readback.Map(0, None, Some(&mut p)).ok()? };
+        if p.is_null() {
+            return None;
+        }
+        Some(PassPool { heap, readback, mapped: Mapped(p as *const u64) })
+    }
+}
+
+/// The pass engine of a `GpuTel`.
+struct PassTel {
+    /// tier pass
+    on: AtomicBool,
+    state: Mutex<PassState>,
+    pool: OnceLock<PassPool>,
+    /// held while the pool is made
+    init: Mutex<()>,
+    failed: AtomicBool,
+    /// notes dropped because the state lock was busy
+    busy: AtomicU64,
+    /// boundaries not stamped because the pool or the recording was full
+    full: AtomicU64,
+    /// the counters of the current pass of each PC list
+    counts: CountMap,
+}
+
+impl PassTel {
+    fn new() -> PassTel {
+        PassTel {
+            on: AtomicBool::new(false),
+            state: Mutex::new(PassState::new(BLOCKS)),
+            pool: OnceLock::new(),
+            init: Mutex::new(()),
+            failed: AtomicBool::new(false),
+            busy: AtomicU64::new(0),
+            full: AtomicU64::new(0),
+            counts: CountMap::new(LIST_COUNTS_MAX),
+        }
+    }
+}
+
+/// Counters of the current pass of one PC list: written by the thread recording it (no lock),
+/// drained under the pass state lock at a boundary, at submit (any thread) and at Reset.
+struct ListCounts {
+    draws: AtomicU32,
+    dispatches: AtomicU32,
+    indirect: AtomicU32,
+    pipes: [AtomicU64; MAX_PIPES],
+    npipes: AtomicU32,
+    truncated: AtomicBool,
+}
+
+impl ListCounts {
+    fn new() -> ListCounts {
+        ListCounts {
+            draws: AtomicU32::new(0),
+            dispatches: AtomicU32::new(0),
+            indirect: AtomicU32::new(0),
+            pipes: std::array::from_fn(|_| AtomicU64::new(0)),
+            npipes: AtomicU32::new(0),
+            truncated: AtomicBool::new(false),
+        }
+    }
+
+    /// Single writer (the recording thread): appended when not among `pipes[..npipes]`.
+    fn note_pipe(&self, id: u64) {
+        let n = self.npipes.load(Ordering::Acquire) as usize;
+        if self.pipes.iter().take(n).any(|p| p.load(Ordering::Relaxed) == id) {
+            return;
+        }
+        if n < MAX_PIPES {
+            self.pipes[n].store(id, Ordering::Relaxed);
+            self.npipes.store(n as u32 + 1, Ordering::Release);
+        } else {
+            self.truncated.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Takes the counters (they are zeroed) as a `Counts`.
+    fn drain(&self) -> Counts {
+        let draws = self.draws.swap(0, Ordering::AcqRel);
+        let dispatches = self.dispatches.swap(0, Ordering::AcqRel);
+        let indirect = self.indirect.swap(0, Ordering::AcqRel);
+        let n = (self.npipes.swap(0, Ordering::AcqRel) as usize).min(MAX_PIPES);
+        let pipes = self.pipes.iter().take(n).map(|p| p.load(Ordering::Relaxed)).collect();
+        let truncated = self.truncated.swap(false, Ordering::AcqRel);
+        Counts { draws, dispatches, indirect, pipes, truncated }
+    }
+}
+
+const COUNT_SHARDS: usize = 16;
+const LIST_COUNTS_MAX: usize = 65_536;
+
+/// PC list pointer -> its counters. An entry is never removed (a pointer reused by a new list gets
+/// its counters zeroed at creation / Reset), so a cached `Arc` stays valid.
+struct CountMap {
+    shards: [RwLock<HashMap<usize, Arc<ListCounts>>>; COUNT_SHARDS],
+    len: AtomicUsize,
+    cap: usize,
+}
+
+impl CountMap {
+    fn new(cap: usize) -> CountMap {
+        CountMap { shards: std::array::from_fn(|_| RwLock::new(HashMap::new())), len: AtomicUsize::new(0), cap }
+    }
+
+    fn shard(list: usize) -> usize {
+        (list >> 6) % COUNT_SHARDS
+    }
+
+    fn get(&self, list: usize) -> Option<Arc<ListCounts>> {
+        self.shards[Self::shard(list)].read().unwrap_or_else(|e| e.into_inner()).get(&list).cloned()
+    }
+
+    /// The counters of `list`, made when new; None when the map is full.
+    fn get_or_insert(&self, list: usize) -> Option<Arc<ListCounts>> {
+        if let Some(c) = self.get(list) {
+            return Some(c);
+        }
+        let mut w = self.shards[Self::shard(list)].write().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = w.get(&list) {
+            return Some(c.clone());
+        }
+        if self.len.load(Ordering::Relaxed) >= self.cap {
+            return None;
+        }
+        let c = Arc::new(ListCounts::new());
+        w.insert(list, c.clone());
+        self.len.fetch_add(1, Ordering::Relaxed);
+        Some(c)
+    }
+}
+
+thread_local! {
+    /// (engine address, list, its counters): the last list this thread noted
+    static COUNT_CACHE: RefCell<(usize, usize, Option<Arc<ListCounts>>)> = const { RefCell::new((0, 0, None)) };
+}
+
+/// `GetType` and `EndQuery` of the list interface.
+fn list_method_slots() -> Option<(usize, usize)> {
+    static S: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    *S.get_or_init(|| Some((method_slot("ID3D12GraphicsCommandList", "GetType")?, method_slot("ID3D12GraphicsCommandList", "EndQuery")?)))
+}
+
+/// Why a list of this `GetType` value gets no pass stamps.
+fn list_type_why(ty: i32) -> Option<&'static str> {
+    match ty {
+        t if t == D3D12_COMMAND_LIST_TYPE_DIRECT.0 || t == D3D12_COMMAND_LIST_TYPE_COMPUTE.0 => None,
+        t if t == D3D12_COMMAND_LIST_TYPE_BUNDLE.0 => Some("bundle"),
+        t if t == D3D12_COMMAND_LIST_TYPE_COPY.0 => Some("copy_list"),
+        _ => Some("unsupported"),
+    }
+}
+
+impl GpuTel {
+    /// Whether pass notes are taken now: tier pass, and a frame with stamps.
+    fn pass_sampled(&self) -> bool {
+        self.pass.on.load(Ordering::Relaxed) && xlog::sample_due(self.frame(), self.sample)
+    }
+
+    /// A pass note that was dropped because the state lock was busy.
+    fn pass_busy(&self) {
+        self.pass.busy.fetch_add(1, Ordering::Relaxed);
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_warn!("telemetry: the pass state lock was busy for {NOTE_WAIT:?} - some pass notes are dropped (counted as pass_busy in the manifest)"));
+    }
+
+    fn pass_pool(&self) -> Option<&PassPool> {
+        if let Some(p) = self.pass.pool.get() {
+            return Some(p);
+        }
+        if self.pass.failed.load(Ordering::Relaxed) {
+            return None;
+        }
+        let _g = try_lock(&self.pass.init)?;
+        if let Some(p) = self.pass.pool.get() {
+            return Some(p);
+        }
+        let dev = self.dev()?;
+        match PassPool::new(&dev) {
+            Some(p) => {
+                let _ = self.pass.pool.set(p);
+                self.pass.pool.get()
+            }
+            None => {
+                self.pass.failed.store(true, Ordering::Relaxed);
+                crate::xlog_warn!("telemetry: cannot make the pass timestamp heap or its readback buffer - no pass stamps this run");
+                None
+            }
+        }
+    }
+
+    /// The list's `GetType` through the PC function; None when the slot is unknown.
+    fn list_type(&self, list: usize) -> Option<i32> {
+        let (get_type, _) = list_method_slots()?;
+        // SAFETY: `GetType` of the list's own (original) vtable.
+        unsafe {
+            let f: unsafe extern "system" fn(*mut c_void) -> i32 = std::mem::transmute((self.list_fn)(list as *mut c_void, get_type));
+            Some(f(list as *mut c_void))
+        }
+    }
+
+    /// `EndQuery(heap, TIMESTAMP, slot)` on the PC list through its original function.
+    unsafe fn end_query(&self, list: usize, heap: &ID3D12QueryHeap, slot: u32) -> bool {
+        let Some((_, end_query)) = list_method_slots() else { return false };
+        let f: unsafe extern "system" fn(*mut c_void, *mut c_void, i32, u32) = std::mem::transmute((self.list_fn)(list as *mut c_void, end_query));
+        f(list as *mut c_void, heap.as_raw(), D3D12_QUERY_TYPE_TIMESTAMP.0, slot);
+        true
+    }
+
+    /// Counters (draws, dispatches, pipelines) of the list being recorded, through this thread's
+    /// cache: no lock on a hit. Counting does not depend on sampling (only stamps do).
+    fn pass_note(&self, list: *mut c_void, apply: impl FnOnce(&ListCounts)) {
+        if !self.pass.on.load(Ordering::Relaxed) || list.is_null() {
+            return;
+        }
+        let (me, l) = (self as *const GpuTel as usize, list as usize);
+        let mut apply = Some(apply);
+        let hit = COUNT_CACHE.with(|c| {
+            let c = c.borrow();
+            match &c.2 {
+                Some(a) if c.0 == me && c.1 == l => {
+                    if let Some(f) = apply.take() {
+                        f(&**a);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        });
+        if hit {
+            return;
+        }
+        let Some(arc) = self.pass.counts.get_or_insert(l) else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("telemetry: more than {LIST_COUNTS_MAX} command lists - later ones get no pass counters"));
+            return;
+        };
+        COUNT_CACHE.with(|c| *c.borrow_mut() = (me, l, Some(arc.clone())));
+        if let Some(f) = apply.take() {
+            f(&*arc);
+        }
+    }
+
+    /// Moves the counters of `l` into its current pass in `st`.
+    fn drain_into(&self, st: &mut PassState, l: usize, frame: u64) {
+        if let Some(c) = self.pass.counts.get(l) {
+            let d = c.drain();
+            if !d.is_empty() {
+                st.merge_counts(l, d, frame);
+            }
+        }
+    }
+
+    /// Takes the counters of `l` (empty when it has none).
+    fn drain_counts(&self, l: usize) -> Counts {
+        self.pass.counts.get(l).map(|c| c.drain()).unwrap_or_default()
+    }
+
+    /// A barrier batch of `barriers` barriers is about to be recorded into `list`: one timestamp
+    /// before it, on the PC list through its original `EndQuery`. The batch drains the list anyway, so
+    /// the stamp adds almost no serialisation.
+    pub(super) fn pass_boundary(&self, list: *mut c_void, barriers: u32) {
+        if !self.pass_sampled() || list.is_null() {
+            return;
+        }
+        let (l, frame) = (list as usize, self.frame());
+        let need_type = {
+            let Some(mut st) = lock_wait(&self.pass.state, NOTE_WAIT) else { return self.pass_busy() };
+            self.drain_into(&mut st, l, frame);
+            st.ensure(l, frame) && st.recs.get(&l).is_some_and(|r| !r.typed)
+        };
+        if need_type {
+            // once per recording, outside the lock: a copy list or a bundle gets no stamps
+            let why = self.list_type(l).and_then(list_type_why);
+            let Some(mut st) = lock_wait(&self.pass.state, NOTE_WAIT) else { return self.pass_busy() };
+            if let Some(r) = st.recs.get_mut(&l) {
+                r.typed = true;
+                r.why = why;
+            }
+        }
+        let Some(pool) = self.pass_pool() else { return };
+        let slot = {
+            let Some(mut st) = lock_wait(&self.pass.state, NOTE_WAIT) else { return self.pass_busy() };
+            st.boundary(l, barriers, frame)
+        };
+        match slot {
+            // SAFETY: the list is being recorded; the heap lives as long as the engine.
+            Ok(s) => {
+                if !unsafe { self.end_query(l, &pool.heap, s) } {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| crate::xlog_warn!("telemetry: no EndQuery slot in the layout table - no pass stamps"));
+                }
+            }
+            Err("full") => {
+                self.pass.full.fetch_add(1, Ordering::Relaxed);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::xlog_warn!("telemetry: the pass stamp pool or a recording's {MAX_REC_BLOCKS} blocks are full - later passes of those lists are not split (counted as pass_full)"));
+            }
+            Err(_) => {} // a copy list or a bundle: its one pass says why
+        }
+    }
+
+    /// The list was Reset: a new recording, never "resubmitted". Its unsubmitted pass stamps are dropped.
+    pub(super) fn list_reset(&self, list: *mut c_void, pass: bool) {
+        let l = list as usize;
+        match lock_wait(&self.in_flight, NOTE_WAIT) {
+            Some(mut m) => {
+                m.remove(&l);
+            }
+            None => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::xlog_warn!("telemetry: the in-flight lock was busy at a list Reset - that list may be flagged resubmitted"));
+            }
+        }
+        if pass && self.pass.on.load(Ordering::Relaxed) {
+            if let Some(c) = self.pass.counts.get(l) {
+                c.drain();
+            }
+            match lock_wait(&self.pass.state, NOTE_WAIT) {
+                Some(mut st) => {
+                    st.reset(l);
+                }
+                None => self.pass_busy(),
+            }
+        }
+    }
+
+    /// Submit: each list's recording leaves the map with the list (an empty one for a list without).
+    fn pass_take(&self, lists: &[*mut c_void], frame: u64) -> Vec<Option<Box<PassRec>>> {
+        let Some(mut st) = lock_wait(&self.pass.state, Duration::from_millis(5)) else {
+            self.pass_busy();
+            return lists
+                .iter()
+                .map(|l| {
+                    let d = self.drain_counts(*l as usize);
+                    let mut rec = PassRec::without_stamps(*l as usize, frame, "lock_busy");
+                    if let Some(p) = rec.passes.last_mut() {
+                        p.merge(&d);
+                    }
+                    Some(Box::new(rec))
+                })
+                .collect();
+        };
+        lists
+            .iter()
+            .map(|l| {
+                let d = self.drain_counts(*l as usize);
+                let mut rec = st.take(*l as usize, frame);
+                if let Some(p) = rec.passes.last_mut() {
+                    p.merge(&d);
+                }
+                Some(rec)
+            })
+            .collect()
+    }
+
+    fn pass_free(&self, blocks: Vec<u16>) {
+        if !blocks.is_empty() {
+            plock(&self.pass.state).free_blocks(blocks);
+        }
+    }
+
+    fn pass_park_blocks(&self, blocks: Vec<u16>, frame: u64) {
+        if !blocks.is_empty() {
+            plock(&self.pass.state).park(frame, blocks);
+        }
+    }
+
+    fn pass_park(&self, mut rec: Box<PassRec>, frame: u64) {
+        self.pass_park_blocks(std::mem::take(&mut rec.blocks), frame);
+    }
+
+    fn pass_release_parked(&self, frame: u64) {
+        if self.pass.on.load(Ordering::Relaxed) {
+            plock(&self.pass.state).release_parked(frame);
+        }
+    }
+
+    /// The resolved ticks of a recording, by local slot (empty when the pool is gone).
+    fn read_pass_ticks(&self, rec: &PassRec) -> Vec<u64> {
+        let Some(p) = self.pass.pool.get() else { return Vec::new() };
+        let mut out = Vec::with_capacity(rec.total as usize);
+        for j in 0..rec.total {
+            let Some(g) = rec.global(j) else { break };
+            // SAFETY: `g < PASS_SLOTS` (a block is below `BLOCKS`); the set's resolve passed its fence.
+            out.push(unsafe { *p.mapped.0.add(g as usize) });
+        }
+        out
+    }
+}
+
+/// What a submission says about its list, for its passes.
+struct PassCtx {
+    frame: u64,
+    seq: u64,
+    queue: u32,
+    resubmitted: bool,
+    /// the list's own reason for null ticks
+    list_why: Option<&'static str>,
+    /// the list's start and end ticks (valid ones only)
+    start: Option<u64>,
+    end: Option<u64>,
+}
+
+/// The `pass` events of one submission. `ms` converts a tick to ms since the start (None: no calibration).
+fn pass_facts(rec: &PassRec, c: &PassCtx, ms: &dyn Fn(u64) -> Option<f64>) -> Vec<PassFacts> {
+    let n = rec.passes.len().max(1);
+    let empty = Counts::default();
+    (0..n)
+        .map(|k| {
+            let cnt = rec.passes.get(k).unwrap_or(&empty);
+            let mut why = None;
+            let (mut st, mut et, mut sm, mut em) = (None, None, None, None);
+            if let Some(w) = c.list_why {
+                why = Some(w);
+            } else if c.resubmitted {
+                // both submissions wrote the same slots: no in-list stamp can be trusted
+                why = Some("resubmitted");
+            } else {
+                let a = if k == 0 { c.start } else { rec.ticks.get(k - 1).copied() };
+                let b = if k + 1 == n { c.end } else { rec.ticks.get(k).copied() };
+                match (a, b) {
+                    (Some(a), Some(b)) if a == 0 || b == 0 => why = Some("zero"),
+                    (Some(a), Some(b)) if b < a => why = Some("order"),
+                    (Some(a), Some(b)) => match (ms(a), ms(b)) {
+                        (Some(x), Some(y)) => (st, et, sm, em) = (Some(a), Some(b), Some(x), Some(y)),
+                        _ => why = Some("no_frequency"),
+                    },
+                    _ => why = Some("late"),
+                }
+            }
+            if why.is_none() && k + 1 == n {
+                // valid ticks, but the passes were not split as far as the title's barriers go
+                why = rec.why;
+            }
+            PassFacts {
+                frame: c.frame,
+                list: c.seq,
+                queue: c.queue,
+                i: k as u32,
+                start_tick: st,
+                end_tick: et,
+                start_ms: sm,
+                end_ms: em,
+                kind: cnt.kind(),
+                draws: cnt.draws,
+                dispatches: cnt.dispatches,
+                indirect: cnt.indirect,
+                pipelines: cnt.pipes.clone(),
+                pipeline_ids_truncated: cnt.truncated,
+                barriers_before: if k == 0 { 0 } else { rec.bounds.get(k - 1).copied().unwrap_or(0) },
+                resubmitted: c.resubmitted,
+                why,
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------------------
 // the global engine
 // ---------------------------------------------------------------------------------------
 
@@ -1253,10 +2076,17 @@ pub(super) fn telemetry_gpu_start() {
         }
     };
     let tel = GpuTel::new(Box::new(DevFns::orig), Box::new(QueueFns::orig), sample, LIST_SLOTS, None);
+    let pass = xlog::telemetry_on(Tier::Pass);
+    tel.pass.on.store(pass, Ordering::Relaxed);
     if GPU.set(tel).is_err() {
         return;
     }
-    super::update_manifest(|m| m.sample = sample);
+    super::update_manifest(|m| {
+        m.sample = sample;
+        m.list_slots = LIST_SLOTS;
+        m.gpu_sets = SETS as u32;
+        m.pass_slots = if pass { PASS_SLOTS } else { 0 };
+    });
     let Some(tel) = GPU.get() else { return };
     if let Err(e) = std::thread::Builder::new().name("xcl-telemetry".into()).spawn(move || thread_main(tel)) {
         crate::xlog_warn!("telemetry: cannot start the xcl-telemetry thread: {e}");
@@ -1284,9 +2114,17 @@ fn gpu_final(t: &GpuTel) {
     let facts = lock_wait(&FRAMES, Duration::from_millis(200)).map(|mut b| b.flush(why)).unwrap_or_default();
     write_frames(facts, &mut global_sink);
     t.finish(&mut global_sink);
+    if xlog::telemetry_on(Tier::Pass) {
+        // the requests since the thread's last look
+        if let Some(f) = IO.take(t.frame()) {
+            pass_sink("io", xlog::io_fields(&f));
+        }
+    }
     let names = ["full", "late", "unsupported", "resubmitted", "removed", "sampled_out"];
     let mut drops: BTreeMap<String, u64> = names.iter().zip(t.drops()).map(|(k, v)| (k.to_string(), v)).collect();
     drops.insert("frames".into(), FRAMES_DROPPED.load(Ordering::Relaxed));
+    drops.insert("pass_busy".into(), t.pass.busy.load(Ordering::Relaxed));
+    drops.insert("pass_full".into(), t.pass.full.load(Ordering::Relaxed));
     let sample = t.sample;
     super::update_manifest(|m| {
         m.sample = sample;
@@ -1297,6 +2135,8 @@ fn gpu_final(t: &GpuTel) {
 /// Wakes on every frame (or every 50 ms) and harvests; every 60 frames it calibrates again.
 fn thread_main(tel: &'static GpuTel) {
     let mut next_clock = 60u64;
+    let mut io = IoFlush { frame: tel.frame(), since: Duration::ZERO };
+    let mut last = Instant::now();
     loop {
         {
             let g = tel.wake.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -1310,12 +2150,420 @@ fn thread_main(tel: &'static GpuTel) {
         tel.harvest(&mut global_sink);
         frames_step(tel, &mut global_sink);
         let f = tel.frame();
+        let now = Instant::now();
+        let elapsed = now.duration_since(last);
+        last = now;
+        if xlog::telemetry_on(Tier::Pass) {
+            io_step(&IO, &mut io, f, elapsed, &mut pass_sink);
+        }
         if f >= next_clock {
             tel.refresh_clocks(&mut global_sink);
             global_sink("memory", xlog::memory_fields(&memory_snapshot(f)));
             next_clock = (f / 60 + 1) * 60;
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// part 3: entry points, pipelines, resources, io
+// ---------------------------------------------------------------------------------------
+
+/// Barrier batches the title recorded (counted at tier frame; `frame.barriers` is a delta of it).
+static BARRIER_BATCHES: AtomicU64 = AtomicU64::new(0);
+
+fn pass_sink(ev: &str, fields: Vec<(&'static str, Value)>) {
+    xlog::event(Tier::Pass, ev, &fields);
+}
+
+/// A barrier batch of `barriers` barriers is about to be recorded into the PC list `list`. At tier
+/// frame it is only counted; at tier pass one timestamp is written into the list before it.
+pub fn telemetry_pass_boundary(list: *mut c_void, barriers: u32) {
+    if !xlog::telemetry_on(Tier::Frame) {
+        return;
+    }
+    BARRIER_BATCHES.fetch_add(1, Ordering::Relaxed);
+    if !xlog::telemetry_on(Tier::Pass) {
+        return;
+    }
+    if let Some(t) = GPU.get() {
+        t.pass_boundary(list, barriers);
+    }
+}
+
+/// The PC list was Reset: its next submission is a new recording, not a resubmission, and the
+/// pass stamps it recorded without being submitted are dropped.
+pub fn telemetry_list_reset(list: *mut c_void) {
+    if !xlog::telemetry_on(Tier::Frame) {
+        return;
+    }
+    if let Some(t) = GPU.get() {
+        t.list_reset(list, xlog::telemetry_on(Tier::Pass));
+    }
+}
+
+/// A draw with the pipeline `pso` (the resolved pointer) was recorded into `list`.
+pub fn telemetry_draw(list: *mut c_void, pso: usize) {
+    if !xlog::telemetry_on(Tier::Pass) {
+        return;
+    }
+    if let Some(t) = GPU.get() {
+        t.pass_note(list, |c| {
+            c.draws.fetch_add(1, Ordering::Relaxed);
+            if let Some(id) = pipe_id(pso) {
+                c.note_pipe(id);
+            }
+        });
+    }
+}
+
+/// An indirect execute was recorded into `list` (counted as `indirect`; `telemetry_draw` counts as a draw).
+pub fn telemetry_indirect(list: *mut c_void) {
+    if !xlog::telemetry_on(Tier::Pass) {
+        return;
+    }
+    if let Some(t) = GPU.get() {
+        t.pass_note(list, |c| {
+            c.indirect.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+}
+
+/// A dispatch of the pipeline `pso` (a pointer) was recorded into `list`.
+pub fn telemetry_dispatch(list: *mut c_void, pso: usize) {
+    if !xlog::telemetry_on(Tier::Pass) {
+        return;
+    }
+    if let Some(t) = GPU.get() {
+        t.pass_note(list, |c| {
+            c.dispatches.fetch_add(1, Ordering::Relaxed);
+            if let Some(id) = pipe_id(pso) {
+                c.note_pipe(id);
+            }
+        });
+    }
+}
+
+/// The pipeline `pso` (a pointer) was bound on `list`.
+pub fn telemetry_bind_pso(list: *mut c_void, pso: usize) {
+    if !xlog::telemetry_on(Tier::Pass) {
+        return;
+    }
+    if let Some(t) = GPU.get() {
+        t.pass_note(list, |c| {
+            if let Some(id) = pipe_id(pso) {
+                c.note_pipe(id);
+            }
+        });
+    }
+}
+
+// ---- pipelines ----
+
+/// The next telemetry pipeline id (the `pipeline` event and the pointer map share the counter).
+static PIPELINE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// The source of the shaders of the pipeline this thread is building.
+    static SOURCE: Cell<Option<&'static str>> = const { Cell::new(None) };
+    /// The last pipeline pointer this thread looked up, its id and the `PIPE_GEN` it was read at.
+    static LAST_PSO: Cell<(usize, u64, u64)> = const { Cell::new((0, 0, 0)) };
+}
+
+fn source_rank(s: &str) -> u8 {
+    match s {
+        "dxc" => 3,
+        "direct" => 2,
+        "cache" => 1,
+        _ => 0,
+    }
+}
+
+/// The source of a pipeline built from several stages: the most expensive one wins (dxc > direct > cache).
+fn merge_source(cur: Option<&'static str>, new: &'static str) -> Option<&'static str> {
+    match cur {
+        Some(c) if source_rank(c) >= source_rank(new) => Some(c),
+        _ => Some(new),
+    }
+}
+
+/// Where the shader of the pipeline being built on this thread came from: `cache`, `dxc` or `direct`.
+pub fn telemetry_shader_source(source: &'static str) {
+    if !xlog::telemetry_on(Tier::Pass) {
+        return;
+    }
+    SOURCE.with(|c| c.set(merge_source(c.get(), source)));
+}
+
+/// Bumped at every relabel: the threads' `LAST_PSO` caches of an older generation are stale.
+static PIPE_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn pipe_map() -> &'static Mutex<PipeMap> {
+    static MAP: OnceLock<Mutex<PipeMap>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(PipeMap::new(PIPE_MAP_MAX)))
+}
+
+/// Pipeline pointers and their telemetry ids (bounded).
+struct PipeMap {
+    cap: usize,
+    ids: HashMap<usize, u64>,
+}
+
+impl PipeMap {
+    fn new(cap: usize) -> PipeMap {
+        PipeMap { cap, ids: HashMap::new() }
+    }
+
+    /// The id of `ptr`; a pointer seen for the first time gets the next one. None when the map is full.
+    fn id_of(&mut self, ptr: usize, seq: &AtomicU64) -> Option<u64> {
+        if let Some(&i) = self.ids.get(&ptr) {
+            return Some(i);
+        }
+        if self.ids.len() >= self.cap {
+            return None;
+        }
+        let id = seq.fetch_add(1, Ordering::Relaxed);
+        self.ids.insert(ptr, id);
+        Some(id)
+    }
+
+    /// `ptr` is a new pipeline (a pointer that was reused): it gets a new id. None when the map is full and `ptr` is new.
+    fn relabel(&mut self, ptr: usize, seq: &AtomicU64) -> Option<u64> {
+        if self.ids.contains_key(&ptr) || self.ids.len() < self.cap {
+            let id = seq.fetch_add(1, Ordering::Relaxed);
+            self.ids.insert(ptr, id);
+            return Some(id);
+        }
+        None
+    }
+}
+
+/// The telemetry id of a pipeline pointer, made on first sight (no `pipeline` event: its creation
+/// was not seen here). None for a null pointer, a full map or a busy lock.
+fn pipe_id(pso: usize) -> Option<u64> {
+    if pso == 0 {
+        return None;
+    }
+    let gen = PIPE_GEN.load(Ordering::Acquire);
+    let (last, id, last_gen) = LAST_PSO.with(|c| c.get());
+    if last == pso && last_gen == gen {
+        return Some(id);
+    }
+    let id = match lock_wait(pipe_map(), NOTE_WAIT) {
+        Some(mut m) => m.id_of(pso, &PIPELINE_SEQ),
+        None => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("telemetry: the pipeline id map lock was busy - some pipelines are not listed in passes"));
+            None
+        }
+    };
+    match id {
+        Some(i) => LAST_PSO.with(|c| c.set((pso, i, gen))),
+        None => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("telemetry: more than {PIPE_MAP_MAX} pipelines seen - later ones are not listed in passes"));
+        }
+    }
+    id
+}
+
+/// `pso` is a new pipeline: a new id, and every thread's cached id of it goes stale. None when the
+/// map is full or busy.
+fn pipe_relabel(pso: usize) -> Option<u64> {
+    let id = match lock_wait(pipe_map(), Duration::from_millis(50)) {
+        Some(mut m) => m.relabel(pso, &PIPELINE_SEQ),
+        None => None,
+    };
+    PIPE_GEN.fetch_add(1, Ordering::Release);
+    if id.is_none() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_warn!("telemetry: the pipeline id map is full or was busy - some pipelines get no pipeline_bind event"));
+    }
+    id
+}
+
+/// The fields of a `pipeline_bind` event: stages without bytes are omitted.
+fn pipeline_bind_fields(id: u64, shaders: &[(&str, Option<&[u8]>)]) -> Vec<(&'static str, Value)> {
+    let (stages, records): (Vec<Value>, Vec<Value>) = shaders
+        .iter()
+        .filter_map(|(k, b)| (*b).map(|b| (Value::from(*k), Value::from(format!("{:016x}", crate::gpu::shader::fnv64(b))))))
+        .unzip();
+    vec![("id", Value::from(id)), ("stages", Value::Array(stages)), ("records", Value::Array(records))]
+}
+
+/// A translated pipeline was made at `pso` (the real pipeline) from these console shaders: the
+/// pointer gets a NEW telemetry id (a reused pointer is a new pipeline) and a `pipeline_bind` event.
+pub fn telemetry_pipeline_label(pso: usize, shaders: &[(&str, Option<&[u8]>)]) {
+    if !xlog::telemetry_on(Tier::Pass) || pso == 0 {
+        return;
+    }
+    let Some(id) = pipe_relabel(pso) else { return };
+    pass_sink("pipeline_bind", pipeline_bind_fields(id, shaders));
+}
+
+/// A pipeline was built by the driver: writes its `pipeline` event. `kind` is the build's label
+/// (`compute` anywhere in it makes the stage compute); `record` is the console record hash and
+/// whether a driver blob was supplied.
+pub fn telemetry_pipeline_built(kind: &str, dxil_bytes: usize, record: Option<(u64, bool)>, driver: Duration, waited: Duration) {
+    if !xlog::telemetry_on(Tier::Pass) {
+        return;
+    }
+    let source = SOURCE.with(|c| c.take());
+    let facts = xlog::PipelineFacts {
+        id: PIPELINE_SEQ.fetch_add(1, Ordering::Relaxed),
+        stage: if kind.contains("compute") { "compute" } else { "graphics" },
+        record: record.map(|r| r.0),
+        dxil_bytes: dxil_bytes as u64,
+        compile_ms: driver.as_secs_f64() * 1000.0,
+        waited_ms: waited.as_secs_f64() * 1000.0,
+        source,
+        blob: record.is_some_and(|r| r.1),
+    };
+    pass_sink("pipeline", xlog::pipeline_fields_built(&facts));
+}
+
+// ---- resources ----
+
+/// A title's resource creation call. Writes its `resource` event when it ends.
+pub struct ResourceSpan(Option<ResourceInfo>);
+
+struct ResourceInfo {
+    kind: &'static str,
+    dim: Option<&'static str>,
+    bytes: Option<u64>,
+    t0: i64,
+    frame: u64,
+}
+
+/// `dim` and `bytes` of the `D3D12_RESOURCE_DESC` at `desc`, when the pointer is readable. A
+/// texture's size needs the allocation info: its `bytes` stay null.
+fn resource_desc(desc: usize) -> (Option<&'static str>, Option<u64>) {
+    if desc == 0 || !crate::gpu::shader::readable(desc, std::mem::size_of::<D3D12_RESOURCE_DESC>()) {
+        return (None, None);
+    }
+    // SAFETY: readable for the structure's size; the title's memory may be unaligned.
+    let d = unsafe { std::ptr::read_unaligned(desc as *const D3D12_RESOURCE_DESC) };
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_BUFFER => (Some("buffer"), Some(d.Width)),
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D | D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D => (Some("texture"), None),
+        _ => (None, None),
+    }
+}
+
+/// The start of a resource creation hook (`desc`: the title's `D3D12_RESOURCE_DESC*`, or 0). Only
+/// while a frame is open (after the first present).
+pub fn telemetry_resource_begin(kind: &'static str, desc: usize) -> ResourceSpan {
+    if !xlog::telemetry_on(Tier::Pass) {
+        return ResourceSpan(None);
+    }
+    let frame = GPU.get().map_or(0, |t| t.frame());
+    if frame == 0 {
+        return ResourceSpan(None);
+    }
+    let (dim, bytes) = resource_desc(desc);
+    ResourceSpan(Some(ResourceInfo { kind, dim, bytes, t0: dframe::qpc(), frame }))
+}
+
+impl Drop for ResourceSpan {
+    fn drop(&mut self) {
+        let Some(i) = self.0.take() else { return };
+        let ms = (dframe::qpc() - i.t0).max(0) as f64 * 1000.0 / qpf() as f64;
+        let facts = xlog::ResourceFacts { kind: i.kind, dim: i.dim, bytes: i.bytes, ms, frame: i.frame };
+        pass_sink("resource", xlog::resource_fields(&facts));
+    }
+}
+
+// ---- io ----
+
+/// DirectStorage requests completed since the last `io` event.
+#[derive(Default)]
+struct IoAgg {
+    requests: AtomicU64,
+    bytes: AtomicU64,
+    ns: AtomicU64,
+    max_ns: AtomicU64,
+    zlib: AtomicU64,
+}
+
+impl IoAgg {
+    const fn new() -> IoAgg {
+        IoAgg { requests: AtomicU64::new(0), bytes: AtomicU64::new(0), ns: AtomicU64::new(0), max_ns: AtomicU64::new(0), zlib: AtomicU64::new(0) }
+    }
+
+    fn add(&self, bytes: u64, zlib: bool, ns: u64) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.ns.fetch_add(ns, Ordering::Relaxed);
+        self.max_ns.fetch_max(ns, Ordering::Relaxed);
+        if zlib {
+            self.zlib.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn pending(&self) -> bool {
+        self.requests.load(Ordering::Relaxed) > 0
+    }
+
+    /// The aggregate so far, reset; None when no request completed.
+    fn take(&self, frame: u64) -> Option<xlog::IoFacts> {
+        let requests = self.requests.swap(0, Ordering::Relaxed);
+        if requests == 0 {
+            return None;
+        }
+        Some(xlog::IoFacts {
+            requests: requests.min(u32::MAX as u64) as u32,
+            bytes: self.bytes.swap(0, Ordering::Relaxed),
+            ms: self.ns.swap(0, Ordering::Relaxed) as f64 / 1e6,
+            max_ms: self.max_ns.swap(0, Ordering::Relaxed) as f64 / 1e6,
+            zlib: self.zlib.swap(0, Ordering::Relaxed).min(u32::MAX as u64) as u32,
+            frame,
+        })
+    }
+}
+
+static IO: IoAgg = IoAgg::new();
+
+/// A DirectStorage request being run. Adds to the per-frame `io` aggregate when it ends.
+pub struct IoSpan(Option<(u64, bool, i64)>);
+
+/// The start of a DirectStorage request of `bytes` bytes (`zlib`: compressed with zlib).
+pub fn telemetry_io_begin(bytes: u64, zlib: bool) -> IoSpan {
+    if !xlog::telemetry_on(Tier::Pass) {
+        return IoSpan(None);
+    }
+    IoSpan(Some((bytes, zlib, dframe::qpc())))
+}
+
+impl Drop for IoSpan {
+    fn drop(&mut self) {
+        let Some((bytes, zlib, t0)) = self.0.take() else { return };
+        let ns = ((dframe::qpc() - t0).max(0) as i128 * 1_000_000_000 / qpf() as i128).min(u64::MAX as i128) as u64;
+        IO.add(bytes, zlib, ns);
+    }
+}
+
+/// When the telemetry thread last looked: the frame it saw and the time since its last flush.
+struct IoFlush {
+    frame: u64,
+    since: Duration,
+}
+
+/// One step of the thread (`elapsed` since the last step): writes one `io` event when the frame
+/// changed (the frame that ended) or `IO_FLUSH` has passed since the last flush, and requests
+/// completed. Returns whether an event was written.
+fn io_step(agg: &IoAgg, st: &mut IoFlush, frame: u64, elapsed: Duration, sink: Sink) -> bool {
+    st.since += elapsed;
+    let boundary = frame != st.frame;
+    let due = boundary || st.since >= IO_FLUSH;
+    let mut wrote = false;
+    if due {
+        if let Some(f) = agg.take(st.frame) {
+            sink("io", xlog::io_fields(&f));
+            wrote = true;
+        }
+        st.since = Duration::ZERO;
+    }
+    st.frame = frame;
+    wrote
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1435,6 +2683,7 @@ struct Counters {
     look_us: u64,
     wait_ns: u64,
     wait_calls: u64,
+    barriers: u64,
 }
 
 impl Counters {
@@ -1450,6 +2699,7 @@ impl Counters {
             look_us: crate::hle::d3d12x::sparse::look_counters()[0],
             wait_ns: WAIT_NS.load(Ordering::Relaxed),
             wait_calls: WAIT_CALLS.load(Ordering::Relaxed),
+            barriers: BARRIER_BATCHES.load(Ordering::Relaxed),
         }
     }
 }
@@ -1464,6 +2714,7 @@ struct FrameRec {
     wait_calls: u64,
     draws: u64,
     dispatches: u64,
+    barriers: u64,
     pso_wait_ms: f64,
     look_ms: f64,
     lists: u32,
@@ -1488,7 +2739,7 @@ impl FrameBook {
         FrameBook {
             pending: VecDeque::new(),
             waiting: Vec::new(),
-            prev: Counters { draws: 0, dispatches: 0, pso_us: 0, look_us: 0, wait_ns: 0, wait_calls: 0 },
+            prev: Counters { draws: 0, dispatches: 0, pso_us: 0, look_us: 0, wait_ns: 0, wait_calls: 0, barriers: 0 },
             last_qpc: None,
             last_written: 0,
         }
@@ -1511,6 +2762,7 @@ impl FrameBook {
             wait_calls: d(n.wait_calls, p.wait_calls),
             draws: d(n.draws, p.draws),
             dispatches: d(n.dispatches, p.dispatches),
+            barriers: d(n.barriers, p.barriers),
             pso_wait_ms: d(n.pso_us, p.pso_us) as f64 / 1000.0,
             look_ms: d(n.look_us, p.look_us) as f64 / 1000.0,
             lists: c.lists,
@@ -1623,7 +2875,7 @@ fn frame_facts(r: &FrameRec, want: u32, forced: Option<&'static str>) -> FrameFa
         lists,
         draws: r.draws,
         dispatches: r.dispatches,
-        barriers: None,
+        barriers: Some(r.barriers),
         pso_wait_ms: r.pso_wait_ms,
         look_ms: r.look_ms,
         sampled: r.sampled,
@@ -1817,7 +3069,11 @@ mod tests {
 
     /// Waits (the test may) until the queue's last signalled fence value has passed, or the device is gone.
     fn settle(r: &Rig) {
-        let q = r.tel.find_queue(r.qraw as usize).expect("queue clock");
+        settle_key(&r.tel, r.qraw);
+    }
+
+    fn settle_key(tel: &GpuTel, key: *mut c_void) {
+        let q = tel.find_queue(key as usize).expect("queue clock");
         let end = Instant::now() + Duration::from_secs(10);
         while Instant::now() < end {
             {
@@ -2147,5 +3403,867 @@ mod tests {
         assert_eq!(t.lists_in(5 + 64), 0, "another frame on the same slot");
         t.note_lists(5 + 64, 1);
         assert_eq!((t.lists_in(5), t.lists_in(5 + 64)), (0, 1));
+    }
+
+    // ---- part 3: pass engine, pipelines, io (no GPU) ----
+
+    /// An engine with the pass tier on and no device. The counters of a list are cached per thread by
+    /// (engine address, list): a test uses list pointers no other test uses.
+    fn tel_pass(sample: u32) -> GpuTel {
+        GpuTel::new(Box::new(|| None), Box::new(|_| None), sample, 8, None).with_pass(false)
+    }
+
+    fn note_draws(tel: &GpuTel, l: usize, n: u32) {
+        tel.pass_note(l as *mut c_void, |c| {
+            c.draws.fetch_add(n, Ordering::Relaxed);
+        });
+    }
+
+    /// The timing tests share the GPU with each other: one at a time.
+    static GPU_TIMING: Mutex<()> = Mutex::new(());
+
+    fn entry_with(rec: PassRec) -> ListEntry {
+        ListEntry {
+            frame: 1,
+            seq: 0,
+            list: rec.list,
+            chunk: 0,
+            slot: Some(0),
+            cpu_us: 0,
+            resubmitted: false,
+            origin: "submit",
+            why: None,
+            pass: Some(Box::new(rec)),
+        }
+    }
+
+    #[test]
+    fn counters_of_a_list_recorded_on_one_thread_reach_its_submit_on_another() {
+        let tel = tel_pass(1);
+        let l = 0x1100usize;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                note_draws(&tel, l, 3);
+                tel.pass_note(l as *mut c_void, |c| {
+                    c.dispatches.fetch_add(1, Ordering::Relaxed);
+                    c.note_pipe(9);
+                });
+            });
+        });
+        let recs = tel.pass_take(&[l as *mut c_void], 1);
+        let r = recs[0].as_ref().expect("a recording");
+        assert_eq!((r.passes[0].draws, r.passes[0].dispatches, r.passes[0].pipes.clone()), (3, 1, vec![9]));
+        let again = tel.pass_take(&[l as *mut c_void], 1);
+        assert!(again[0].as_ref().is_some_and(|r| r.passes[0].is_empty()));
+    }
+
+    #[test]
+    fn the_same_list_on_the_same_thread_every_frame_loses_nothing() {
+        let tel = tel_pass(1);
+        let l = 0x1200usize;
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
+        let tel_ref = &tel;
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                for _ in 0..3 {
+                    note_draws(tel_ref, l, 2);
+                    let _ = tx.send(());
+                    let _ = ack_rx.recv();
+                }
+            });
+            for frame in 1..=3u64 {
+                rx.recv().expect("the recording thread");
+                let recs = tel.pass_take(&[l as *mut c_void], frame);
+                assert_eq!(recs[0].as_ref().map(|r| r.passes[0].draws), Some(2), "frame {frame}");
+                let _ = ack_tx.send(());
+            }
+        });
+    }
+
+    #[test]
+    fn a_boundary_splits_the_counters_of_its_list() {
+        let tel = tel_pass(1);
+        let l = 0x1300usize;
+        note_draws(&tel, l, 2);
+        {
+            let mut st = plock(&tel.pass.state);
+            tel.drain_into(&mut st, l, 1);
+            st.boundary(l, 1, 1).unwrap();
+        }
+        note_draws(&tel, l, 3);
+        let recs = tel.pass_take(&[l as *mut c_void], 1);
+        let r = recs[0].as_ref().expect("a recording");
+        assert_eq!((r.passes.len(), r.passes[0].draws, r.passes[1].draws), (2, 2, 3));
+    }
+
+    #[test]
+    fn a_reset_zeroes_the_counters() {
+        let tel = tel_pass(1);
+        let l = 0x1400usize;
+        note_draws(&tel, l, 4);
+        tel.list_reset(l as *mut c_void, true);
+        let recs = tel.pass_take(&[l as *mut c_void], 1);
+        assert_eq!(recs[0].as_ref().map(|r| r.passes[0].draws), Some(0));
+    }
+
+    #[test]
+    fn the_count_map_is_bounded() {
+        let m = CountMap::new(2);
+        let a = m.get_or_insert(0x40).expect("first");
+        assert!(m.get_or_insert(0x80).is_some());
+        assert!(m.get_or_insert(0xC0).is_none(), "past the cap");
+        assert!(m.get(0xC0).is_none());
+        assert!(Arc::ptr_eq(&a, &m.get_or_insert(0x40).expect("an existing key still works")));
+        assert!(m.get(0x80).is_some());
+    }
+
+    #[test]
+    fn note_pipe_keeps_first_seen_order_and_truncates() {
+        let c = ListCounts::new();
+        for id in [5, 3, 5, 4] {
+            c.note_pipe(id);
+        }
+        for id in 10..20 {
+            c.note_pipe(id);
+        }
+        c.draws.fetch_add(1, Ordering::Relaxed);
+        let d = c.drain();
+        assert_eq!((d.draws, d.pipes.len(), d.truncated), (1, MAX_PIPES, true));
+        assert_eq!(&d.pipes[..4], &[5, 3, 4, 10]);
+        assert!(c.drain().is_empty(), "a drain zeroes the counters");
+        c.note_pipe(5);
+        assert_eq!(c.drain().pipes, vec![5]);
+    }
+
+    #[test]
+    fn counting_does_not_depend_on_sampling() {
+        let tel = tel_pass(2);
+        let l = 0x1500usize;
+        tel.set_frame(1); // unsampled
+        note_draws(&tel, l, 2);
+        tel.set_frame(2);
+        note_draws(&tel, l, 1);
+        let recs = tel.pass_take(&[l as *mut c_void], 2);
+        assert_eq!(recs[0].as_ref().map(|r| r.passes[0].draws), Some(3));
+        tel.set_frame(3);
+        note_draws(&tel, l, 1);
+        let recs = tel.pass_take(&[l as *mut c_void], 3);
+        assert_eq!(recs[0].as_ref().map(|r| r.passes[0].draws), Some(1), "no spill-over");
+    }
+
+    #[test]
+    fn a_pass_kind_follows_its_work_with_indirect_before_empty() {
+        let k = |d, s, i| Counts { draws: d, dispatches: s, indirect: i, ..Default::default() }.kind();
+        assert_eq!((k(1, 1, 1), k(0, 1, 1), k(0, 0, 1), k(0, 0, 0)), ("draw", "dispatch", "indirect", "empty"));
+    }
+
+    #[test]
+    fn a_relabel_gives_a_reused_pointer_a_new_id() {
+        let seq = AtomicU64::new(10);
+        let mut m = PipeMap::new(2);
+        let a = m.id_of(0x10, &seq).expect("a");
+        let b = m.relabel(0x10, &seq).expect("b");
+        assert_ne!(a, b);
+        assert_eq!(m.id_of(0x10, &seq), Some(b));
+        m.id_of(0x20, &seq).expect("second");
+        assert_eq!(m.relabel(0x30, &seq), None, "at the cap an unknown pointer gets nothing");
+        let c = m.relabel(0x20, &seq).expect("a known pointer is relabelled at the cap");
+        assert!(c > b);
+    }
+
+    #[test]
+    fn the_thread_cache_follows_a_relabel() {
+        let p = 0x7E57_0000usize;
+        let a = pipe_id(p).expect("a");
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|s| {
+            let other = s.spawn(move || {
+                assert_eq!(pipe_id(p), Some(a), "this thread caches the old id");
+                let _ = tx.send(());
+                let _ = go_rx.recv();
+                pipe_id(p)
+            });
+            rx.recv().expect("the other thread");
+            let b = pipe_relabel(p).expect("b");
+            assert_ne!(a, b);
+            assert_eq!(pipe_id(p), Some(b), "this thread follows");
+            let _ = go_tx.send(());
+            assert_eq!(other.join().expect("the other thread"), Some(b), "the other thread follows too");
+        });
+    }
+
+    #[test]
+    fn pipeline_bind_fields_list_the_stages_that_have_bytes() {
+        let f = pipeline_bind_fields(7, &[("vs", Some(&[1u8, 2, 3][..])), ("ps", None)]);
+        assert_eq!(get(&f, "id"), Some(&Value::from(7u64)));
+        assert_eq!(get(&f, "stages"), Some(&Value::Array(vec![Value::from("vs")])));
+        assert_eq!(get(&f, "records"), Some(&Value::Array(vec![Value::from(format!("{:016x}", crate::gpu::shader::fnv64(&[1, 2, 3])))])));
+    }
+
+    #[test]
+    fn pass_notes_reach_the_recording_at_submit() {
+        let tel = tel_pass(1);
+        let (a, b) = (0x1600usize as *mut c_void, 0x1700usize as *mut c_void);
+        note_draws(&tel, 0x1600, 3);
+        tel.pass_note(b, |c| {
+            c.dispatches.fetch_add(1, Ordering::Relaxed);
+        });
+        let recs = tel.pass_take(&[a, b], 5);
+        let (ra, rb) = (recs[0].as_ref().expect("a"), recs[1].as_ref().expect("b"));
+        assert_eq!((ra.passes[0].draws, ra.passes[0].dispatches), (3, 0));
+        assert_eq!((rb.passes[0].draws, rb.passes[0].dispatches), (0, 1));
+        // submitted: no recording is left in the map, and a second submit finds an empty one
+        assert!(plock(&tel.pass.state).recs.is_empty());
+        let again = tel.pass_take(&[a], 5);
+        assert!(again[0].as_ref().is_some_and(|r| r.passes[0].is_empty()));
+    }
+
+    #[test]
+    fn a_reset_drops_the_unsubmitted_blocks_and_returns_them() {
+        let mut st = PassState::new(4);
+        let l = 0x10usize;
+        assert_eq!(st.boundary(l, 3, 1), Ok(0));
+        assert_eq!(st.boundary(l, 1, 1), Ok(1));
+        for _ in 2..BLOCK_SLOTS + 1 {
+            st.boundary(l, 1, 1).unwrap();
+        }
+        assert_eq!(st.recs[&l].blocks.len(), 2, "the 257th boundary took a second block");
+        assert_eq!(st.free.len(), 2);
+        assert_eq!(st.reset(l), 2);
+        assert_eq!(st.free.len(), 4);
+        assert!(st.recs.is_empty());
+        // a recording that was submitted is the entry's now: a Reset of the list does not touch its blocks
+        assert!(st.boundary(l, 1, 2).is_ok());
+        let rec = st.take(l, 2);
+        assert_eq!(st.reset(l), 0);
+        assert_eq!(st.free.len(), 3);
+        st.free_blocks(rec.blocks.clone());
+        assert_eq!(st.free.len(), 4);
+    }
+
+    #[test]
+    fn a_recording_takes_at_most_16_blocks_and_the_pool_can_run_out() {
+        let mut st = PassState::new(BLOCKS);
+        let l = 0x10usize;
+        for _ in 0..MAX_REC_BLOCKS as u32 * BLOCK_SLOTS {
+            st.boundary(l, 1, 1).unwrap();
+        }
+        assert_eq!(st.boundary(l, 1, 1), Err("full"));
+        assert_eq!(st.boundary(l, 1, 1), Err("full"), "it stays full");
+        assert_eq!(st.recs[&l].blocks.len(), MAX_REC_BLOCKS);
+        assert_eq!(st.recs[&l].why, Some("full"));
+        // the passes it did split still have their counters
+        assert_eq!(st.recs[&l].passes.len(), MAX_REC_BLOCKS * BLOCK_SLOTS as usize + 1);
+        // an empty pool: no block, no stamp
+        let mut one = PassState::new(1);
+        assert!(one.boundary(0x1, 1, 1).is_ok());
+        assert_eq!(one.boundary(0x2, 1, 1), Err("full"));
+        // a recording nobody submitted or Reset gives its block back after LATE_FRAMES
+        assert_eq!(one.boundary(0x3, 1, 1 + LATE_FRAMES + 1), Ok(0));
+        assert!(!one.recs.contains_key(&0x1));
+    }
+
+    #[test]
+    fn parked_blocks_wait_for_the_gpu() {
+        let mut st = PassState::new(2);
+        let rec = {
+            st.boundary(0x10, 1, 3).unwrap();
+            st.take(0x10, 3)
+        };
+        st.park(3, rec.blocks.clone());
+        st.release_parked(3 + LATE_FRAMES - 1);
+        assert_eq!(st.free.len(), 1);
+        st.release_parked(3 + LATE_FRAMES);
+        assert_eq!(st.free.len(), 2);
+    }
+
+    #[test]
+    fn block_ranges_of_a_set_are_joined() {
+        let mut a = PassRec::new(1, 1);
+        a.blocks = vec![0, 1, 3];
+        a.total = 2 * BLOCK_SLOTS + 10;
+        assert_eq!(a.ranges(), vec![(0, 256), (256, 256), (768, 10)]);
+        assert_eq!(a.global(BLOCK_SLOTS + 5), Some(BLOCK_SLOTS + 5));
+        assert_eq!(a.global(2 * BLOCK_SLOTS), Some(3 * BLOCK_SLOTS));
+        let mut b = PassRec::new(2, 1);
+        b.blocks = vec![4];
+        b.total = 3;
+        let entries = vec![entry_with(a), entry_with(b)];
+        assert_eq!(resolve_ranges(&entries), vec![(0, 512), (768, 10), (1024, 3)]);
+        assert!(resolve_ranges(&[]).is_empty());
+    }
+
+    fn rec_of_three_passes() -> PassRec {
+        let mut r = PassRec::new(0x10, 1);
+        r.total = 2;
+        r.bounds = vec![4, 2];
+        r.passes = vec![Counts { draws: 5, pipes: vec![1, 2], ..Default::default() }, Counts { dispatches: 2, pipes: vec![9], ..Default::default() }, Counts::default()];
+        r.ticks = vec![100, 200];
+        r
+    }
+
+    fn ctx() -> PassCtx {
+        PassCtx { frame: 3, seq: 11, queue: 1, resubmitted: false, list_why: None, start: Some(50), end: Some(300) }
+    }
+
+    #[test]
+    fn passes_chain_from_the_list_start_to_the_list_end() {
+        let rec = rec_of_three_passes();
+        let ps = pass_facts(&rec, &ctx(), &|t| Some(t as f64 / 10.0));
+        assert_eq!(ps.len(), 3);
+        let t = |p: &PassFacts| (p.start_tick, p.end_tick);
+        assert_eq!((t(&ps[0]), t(&ps[1]), t(&ps[2])), ((Some(50), Some(100)), (Some(100), Some(200)), (Some(200), Some(300))));
+        assert_eq!((ps[0].start_ms, ps[2].end_ms), (Some(5.0), Some(30.0)));
+        assert_eq!((ps[0].kind, ps[1].kind, ps[2].kind), ("draw", "dispatch", "empty"));
+        assert_eq!((ps[0].barriers_before, ps[1].barriers_before, ps[2].barriers_before), (0, 4, 2));
+        assert_eq!(ps[0].pipelines, vec![1, 2]);
+        assert!(ps.iter().all(|p| p.why.is_none() && !p.resubmitted && p.frame == 3 && p.list == 11 && p.queue == 1));
+        assert_eq!(ps.iter().map(|p| p.i).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn a_list_without_boundaries_gets_one_pass_over_the_list() {
+        let mut rec = PassRec::new(0x10, 1);
+        rec.passes[0].dispatches = 1;
+        let ps = pass_facts(&rec, &ctx(), &|t| Some(t as f64));
+        assert_eq!(ps.len(), 1);
+        assert_eq!((ps[0].start_tick, ps[0].end_tick, ps[0].kind), (Some(50), Some(300), "dispatch"));
+        // a list nobody noted anything on
+        let ps = pass_facts(&PassRec::new(0x10, 1), &ctx(), &|t| Some(t as f64));
+        assert_eq!((ps.len(), ps[0].kind), (1, "empty"));
+    }
+
+    #[test]
+    fn a_resubmitted_list_has_null_pass_ticks() {
+        let rec = rec_of_three_passes();
+        let mut c = ctx();
+        c.resubmitted = true;
+        let ps = pass_facts(&rec, &c, &|t| Some(t as f64));
+        assert_eq!(ps.len(), 3);
+        assert!(ps.iter().all(|p| p.start_tick.is_none() && p.end_tick.is_none() && p.start_ms.is_none() && p.why == Some("resubmitted") && p.resubmitted));
+        // the counters are still there
+        assert_eq!(ps[0].draws, 5);
+        // a list with null ticks of its own: its reason
+        let mut c = ctx();
+        c.list_why = Some("late");
+        c.start = None;
+        c.end = None;
+        let ps = pass_facts(&rec, &c, &|t| Some(t as f64));
+        assert!(ps.iter().all(|p| p.start_tick.is_none() && p.why == Some("late")));
+    }
+
+    #[test]
+    fn bad_pass_ticks_are_null_with_a_reason() {
+        let mut rec = rec_of_three_passes();
+        rec.ticks = vec![100, 0];
+        let ps = pass_facts(&rec, &ctx(), &|t| Some(t as f64));
+        assert_eq!((ps[0].why, ps[1].why, ps[2].why), (None, Some("zero"), Some("zero")));
+        rec.ticks = vec![200, 100];
+        let ps = pass_facts(&rec, &ctx(), &|t| Some(t as f64));
+        assert_eq!((ps[0].why, ps[1].why, ps[2].why), (None, Some("order"), None));
+        rec.ticks = Vec::new();
+        let ps = pass_facts(&rec, &ctx(), &|t| Some(t as f64));
+        assert_eq!((ps[0].why, ps[1].why), (Some("late"), Some("late")));
+        let ps = pass_facts(&rec, &ctx(), &|_| None);
+        assert_eq!(ps[0].why, Some("late"));
+        rec.ticks = vec![100, 200];
+        let ps = pass_facts(&rec, &ctx(), &|_| None);
+        assert!(ps.iter().all(|p| p.why == Some("no_frequency") && p.start_tick.is_none()));
+    }
+
+    #[test]
+    fn a_full_recording_says_so_on_its_last_pass() {
+        let mut rec = rec_of_three_passes();
+        rec.why = Some("full");
+        let ps = pass_facts(&rec, &ctx(), &|t| Some(t as f64));
+        assert_eq!((ps[0].why, ps[1].why, ps[2].why), (None, None, Some("full")));
+        assert!(ps[2].end_tick.is_some(), "the ticks of that pass are valid, it just spans more");
+        let ps = pass_facts(&PassRec::without_stamps(1, 1, "copy_list"), &ctx(), &|t| Some(t as f64));
+        assert_eq!((ps.len(), ps[0].why, ps[0].start_tick), (1, Some("copy_list"), Some(50)));
+    }
+
+    #[test]
+    fn pipeline_ids_of_a_pass_are_distinct_first_seen_and_capped_at_eight() {
+        let mut c = Counts::default();
+        for id in [5, 3, 5, 4] {
+            c.pipe(id);
+        }
+        assert_eq!((c.pipes.clone(), c.truncated), (vec![5, 3, 4], false));
+        for id in 10..20 {
+            c.pipe(id);
+        }
+        assert_eq!(c.pipes.len(), MAX_PIPES);
+        assert!(c.truncated);
+        assert_eq!(&c.pipes[..4], &[5, 3, 4, 10]);
+        let mut d = Counts { draws: 1, ..Default::default() };
+        d.merge(&c);
+        assert_eq!((d.draws, d.pipes.len(), d.truncated), (1, MAX_PIPES, true));
+    }
+
+    #[test]
+    fn a_reset_makes_the_next_submission_a_new_recording() {
+        let tel = tel_pass(1);
+        let l = 0x30usize as *mut c_void;
+        plock(&tel.in_flight).insert(l as usize, (0, 1));
+        note_draws(&tel, l as usize, 1);
+        plock(&tel.pass.state).boundary(l as usize, 1, 0).unwrap();
+        assert!(plock(&tel.pass.state).recs.contains_key(&(l as usize)));
+        tel.list_reset(l, true);
+        assert!(!plock(&tel.in_flight).contains_key(&(l as usize)), "a Reset list is not in flight");
+        assert!(plock(&tel.pass.state).recs.is_empty(), "its unsubmitted recording is dropped");
+        // another list is not touched
+        plock(&tel.in_flight).insert(0x40, (0, 2));
+        tel.list_reset(l, true);
+        assert!(plock(&tel.in_flight).contains_key(&0x40));
+        // and its counters are gone
+        let left = tel.pass.counts.get(l as usize).map(|c| c.drain()).unwrap_or_default();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn the_shader_source_with_the_most_work_wins() {
+        assert_eq!(merge_source(None, "cache"), Some("cache"));
+        assert_eq!(merge_source(Some("cache"), "dxc"), Some("dxc"));
+        assert_eq!(merge_source(Some("dxc"), "cache"), Some("dxc"));
+        assert_eq!(merge_source(Some("direct"), "cache"), Some("direct"));
+        assert_eq!(merge_source(Some("cache"), "direct"), Some("direct"));
+        assert_eq!(merge_source(Some("direct"), "dxc"), Some("dxc"));
+        assert_eq!(merge_source(Some("dxc"), "direct"), Some("dxc"));
+        // across the stages of one build, in any order
+        let stages = ["cache", "direct", "cache", "dxc", "direct"];
+        assert_eq!(stages.iter().fold(None, |c, s| merge_source(c, s)), Some("dxc"));
+        assert_eq!(["cache", "cache"].iter().fold(None, |c, s| merge_source(c, s)), Some("cache"));
+    }
+
+    #[test]
+    fn the_pipeline_pointer_map_is_bounded() {
+        let seq = AtomicU64::new(10);
+        let mut m = PipeMap::new(2);
+        assert_eq!(m.id_of(0x1000, &seq), Some(10));
+        assert_eq!(m.id_of(0x2000, &seq), Some(11));
+        assert_eq!(m.id_of(0x1000, &seq), Some(10), "the same pointer, the same id");
+        assert_eq!(m.id_of(0x3000, &seq), None, "full");
+        assert_eq!(seq.load(Ordering::Relaxed), 12, "a refused pointer takes no id");
+        assert_eq!(m.ids.len(), 2);
+    }
+
+    #[test]
+    fn io_requests_are_aggregated_and_flushed_per_frame_or_every_250_ms() {
+        let agg = IoAgg::new();
+        let mut st = IoFlush { frame: 5, since: Duration::ZERO };
+        let mut evs: Vec<Ev> = Vec::new();
+        let mut sink = |ev: &str, f: Vec<(&'static str, Value)>| evs.push((ev.to_string(), f));
+        // nothing completed: no event at a frame boundary
+        assert!(!io_step(&agg, &mut st, 6, Duration::from_millis(16), &mut sink));
+        agg.add(1000, false, 2_000_000);
+        agg.add(3000, true, 6_000_000);
+        agg.add(500, true, 1_000_000);
+        // inside the frame, before 250 ms: nothing
+        assert!(!io_step(&agg, &mut st, 6, Duration::from_millis(100), &mut sink));
+        assert!(!io_step(&agg, &mut st, 6, Duration::from_millis(100), &mut sink));
+        // 250 ms since the last flush: a batch of the load so far
+        assert!(io_step(&agg, &mut st, 6, Duration::from_millis(60), &mut sink));
+        agg.add(10, false, 4_000_000);
+        // a frame boundary flushes what completed, labelled with the frame that ended
+        assert!(io_step(&agg, &mut st, 7, Duration::from_millis(1), &mut sink));
+        assert!(!io_step(&agg, &mut st, 8, Duration::from_millis(1), &mut sink), "nothing completed in frame 7");
+        drop(sink);
+        assert_eq!(evs.len(), 2);
+        let (n0, f0) = (&evs[0].0, &evs[0].1);
+        assert_eq!(n0, "io");
+        assert_eq!(get(f0, "requests"), Some(&Value::from(3)));
+        assert_eq!(get(f0, "bytes"), Some(&Value::from(4500)));
+        assert_eq!(get(f0, "zlib"), Some(&Value::from(2)));
+        assert_eq!(get(f0, "ms").and_then(Value::as_f64), Some(9.0));
+        assert_eq!(get(f0, "max_ms").and_then(Value::as_f64), Some(6.0));
+        assert_eq!(get(f0, "frame"), Some(&Value::from(6)));
+        assert_eq!(get(&evs[1].1, "requests"), Some(&Value::from(1)));
+        assert_eq!(get(&evs[1].1, "frame"), Some(&Value::from(6)));
+        assert!(!agg.pending());
+    }
+
+    // ---- part 3: GPU ----
+
+    fn rig_pass(ty: D3D12_COMMAND_LIST_TYPE) -> Option<Rig> {
+        let mut r = rig(ty, LIST_SLOTS, None)?;
+        r.tel = r.tel.with_pass(true);
+        Some(r)
+    }
+
+    /// A compute kernel with the console dispatch ABI (u2 = memory) that does `iters` dependent steps.
+    fn spin_hlsl(iters: u32) -> String {
+        format!(
+            "RWByteAddressBuffer mem : register(u2);\n[numthreads(64, 1, 1)]\nvoid main(uint3 t : SV_DispatchThreadID) {{\n  uint a = t.x;\n  [loop] for (uint i = 0; i < {iters}u; i++) {{ a = a * 1664525u + 1013904223u; a ^= a >> 7; }}\n  mem.Store(t.x * 4, a);\n}}\n"
+        )
+    }
+
+    fn trans(r: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: unsafe { std::mem::transmute_copy(r) },
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        }
+    }
+
+    fn uav_all() -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 { UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }) },
+        }
+    }
+
+    /// A closed compute list: `reps` dispatches of `groups` groups, each after a UAV barrier, and
+    /// with `passes` a pass boundary before each barrier (the call a title's barrier site makes).
+    struct Work {
+        list: ID3D12GraphicsCommandList,
+        _alloc: ID3D12CommandAllocator,
+        _buf: ID3D12Resource,
+        _pso: ID3D12PipelineState,
+        _rs: ID3D12RootSignature,
+        _heaps: [ID3D12DescriptorHeap; 2],
+    }
+
+    fn compute_work(r: &Rig, ty: D3D12_COMMAND_LIST_TYPE, dxil: &[u8], groups: u32, reps: usize, passes: bool) -> Option<Work> {
+        let dev = &r.dev;
+        // SAFETY: plain D3D12 calls on the test's own device, as the test runner records a dispatch.
+        unsafe {
+            let rs = crate::gpu::recomp::pso::abi_root_signature(dev, false).ok()?;
+            let pso: ID3D12PipelineState = dev
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&rs),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr().cast(), BytecodeLength: dxil.len() },
+                    ..Default::default()
+                })
+                .ok()?;
+            let mut buf: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 1 << 20,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buf,
+            )
+            .ok()?;
+            let buf = buf?;
+            let heap = |ty: D3D12_DESCRIPTOR_HEAP_TYPE| -> Option<ID3D12DescriptorHeap> {
+                dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: ty, NumDescriptors: 1, Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0 }).ok()
+            };
+            let heaps = [heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)?, heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)?];
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).ok()?;
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, &pso).ok()?;
+            list.SetDescriptorHeaps(&[Some(heaps[0].clone()), Some(heaps[1].clone())]);
+            list.SetComputeRootSignature(&rs);
+            let va = buf.GetGPUVirtualAddress();
+            for i in 0..6 {
+                list.SetComputeRootUnorderedAccessView(i, va);
+            }
+            list.ResourceBarrier(&[trans(&buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            for _ in 0..reps {
+                if passes {
+                    r.tel.pass_boundary(list.as_raw(), 1);
+                }
+                list.ResourceBarrier(&[uav_all()]);
+                list.Dispatch(groups, 1, 1);
+            }
+            list.Close().ok()?;
+            Some(Work { list, _alloc: alloc, _buf: buf, _pso: pso, _rs: rs, _heaps: heaps })
+        }
+    }
+
+    fn submit_to(tel: &GpuTel, qraw: *mut c_void, qf: &QueueFns, raw: &[*mut c_void], evs: &mut Vec<Ev>) {
+        let mut sink = |ev: &str, f: Vec<(&'static str, Value)>| evs.push((ev.to_string(), f));
+        tel.execute(qraw, raw, "submit", |c| qf.execute(c), &mut sink);
+    }
+
+    /// The `seq` of the `list` event of PC list `list` in `frame`, nth submission first.
+    fn seqs_of(evs: &[Ev], list: *mut c_void, frame: u64) -> Vec<u64> {
+        lists_of(evs)
+            .iter()
+            .filter(|f| get(f, "id").and_then(Value::as_u64) == Some(list as u64) && get(f, "frame").and_then(Value::as_u64) == Some(frame))
+            .filter_map(|f| get(f, "seq").and_then(Value::as_u64))
+            .collect()
+    }
+
+    /// The `pass` events of submission `seq`, in pass order.
+    fn passes_of(evs: &[Ev], seq: u64) -> Vec<&Vec<(&'static str, Value)>> {
+        let mut v: Vec<_> = evs.iter().filter(|(n, f)| n == "pass" && get(f, "list").and_then(Value::as_u64) == Some(seq)).map(|(_, f)| f).collect();
+        v.sort_by_key(|f| get(f, "i").and_then(Value::as_u64));
+        v
+    }
+
+    fn span_ms(f: &[(&'static str, Value)]) -> Option<(f64, f64)> {
+        Some((get(f, "start_ms")?.as_f64()?, get(f, "end_ms")?.as_f64()?))
+    }
+
+    fn median(mut v: Vec<f64>) -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    }
+
+    #[test]
+    fn the_reset_makes_a_resubmission_a_new_recording_and_only_a_second_submit_is_resubmitted() {
+        let direct = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        let Some(r) = rig(direct, LIST_SLOTS, None) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+        let (Some(l0), Some(tail)) = (test_list(&r.dev, direct, false), test_list(&r.dev, direct, false)) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        let mut evs = Vec::new();
+        r.tel.set_frame(1);
+        submit(&r, &[&l0], &mut evs);
+        r.tel.list_reset(l0.list.as_raw(), false); // the title Resets the list and records it again
+        submit(&r, &[&l0], &mut evs);
+        submit(&r, &[&l0], &mut evs); // the same recording again
+        r.tel.set_frame(2);
+        submit(&r, &[&tail], &mut evs);
+        settle(&r);
+        r.tel.set_frame(3);
+        harvest(&r, &mut evs);
+        let ls = lists_of(&evs);
+        let mine: Vec<_> = ls.iter().filter(|f| get(f, "id").and_then(Value::as_u64) == Some(l0.list.as_raw() as u64)).collect();
+        assert_eq!(mine.len(), 3, "{evs:?}");
+        let flags: Vec<_> = mine.iter().map(|f| get(f, "resubmitted").cloned()).collect();
+        assert_eq!(flags, vec![Some(Value::Bool(false)), Some(Value::Bool(false)), Some(Value::Bool(true))]);
+    }
+
+    #[test]
+    fn a_resubmitted_list_has_null_pass_ticks_and_valid_list_ticks() {
+        let direct = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        let Some(r) = rig_pass(direct) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+        let Ok(dxil) = crate::gpu::recomp::dxc::compile(&spin_hlsl(1000), "main", "cs_6_6", &[]) else { return crate::gpu::recomp::runner::skip_test("no DXC") };
+        let (Some(w), Some(tail)) = (compute_work(&r, direct, &dxil, 8, 2, true), test_list(&r.dev, direct, false)) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        let mut evs = Vec::new();
+        let raw = w.list.as_raw();
+        r.tel.set_frame(1);
+        submit_to(&r.tel, r.qraw, &r.qf, &[raw], &mut evs);
+        submit_to(&r.tel, r.qraw, &r.qf, &[raw], &mut evs); // before a Reset: the same recording
+        r.tel.set_frame(2);
+        submit(&r, &[&tail], &mut evs);
+        settle(&r);
+        r.tel.set_frame(3);
+        harvest(&r, &mut evs);
+        let seqs = seqs_of(&evs, raw, 1);
+        assert_eq!(seqs.len(), 2, "{evs:?}");
+        let ls = lists_of(&evs);
+        for s in &seqs {
+            let l = ls.iter().find(|f| get(f, "seq").and_then(Value::as_u64) == Some(*s)).expect("list event");
+            assert!(span_ms(l).is_some(), "list ticks stay valid: {l:?}");
+            let ps = passes_of(&evs, *s);
+            assert!(!ps.is_empty());
+            assert!(ps.iter().all(|p| get(p, "why") == Some(&Value::from("resubmitted")) && matches!(get(p, "start_tick"), Some(Value::Null)) && get(p, "resubmitted") == Some(&Value::Bool(true))), "{ps:?}");
+        }
+        assert_eq!(passes_of(&evs, seqs[0]).len(), 3, "two boundaries: three passes");
+    }
+
+    #[test]
+    fn one_dispatch_timed_through_the_pass_path_matches_dispatch_timed() {
+        let _t = GPU_TIMING.lock().unwrap_or_else(|e| e.into_inner());
+        let direct = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        let Some(r) = rig_pass(direct) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+        let Ok(dxil) = crate::gpu::recomp::dxc::compile(&spin_hlsl(100_000), "main", "cs_6_6", &[]) else { return crate::gpu::recomp::runner::skip_test("no DXC") };
+        let (groups, reps) = (256u32, 21usize);
+        let mem = vec![0u32; groups as usize * 64];
+        let base = match crate::gpu::recomp::runner::dispatch_timed(&dxil, [groups, 1, 1], &[], &mem, reps) {
+            Ok(t) => t,
+            Err(e) => {
+                println!("dispatch_timed: {e}");
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            }
+        };
+        let (Some(w), Some(tail)) = (compute_work(&r, direct, &dxil, groups, reps, true), test_list(&r.dev, direct, false)) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        let mut evs = Vec::new();
+        let raw = w.list.as_raw();
+        {
+            // the GPU is ours while the pass path runs (`dispatch_timed` above took the same lock)
+            let _g = crate::gpu::recomp::runner::hold_gpu();
+            r.tel.set_frame(1);
+            submit_to(&r.tel, r.qraw, &r.qf, &[raw], &mut evs);
+            r.tel.set_frame(2);
+            submit(&r, &[&tail], &mut evs);
+            settle(&r);
+        }
+        r.tel.set_frame(3);
+        harvest(&r, &mut evs);
+        let seqs = seqs_of(&evs, raw, 1);
+        assert_eq!(seqs.len(), 1, "{evs:?}");
+        let ps = passes_of(&evs, seqs[0]);
+        assert_eq!(ps.len(), reps + 1, "one pass before the first barrier and one per dispatch");
+        // pass 0 is the start of the list; pass k >= 1 is a barrier and a dispatch. The first of each is cold.
+        let through: Vec<f64> = ps[2..].iter().map(|p| span_ms(p).map(|(s, e)| e - s).expect("pass ticks")).collect();
+        let timed: Vec<f64> = base[1..].to_vec();
+        assert_eq!((through.len(), timed.len()), (20, 20));
+        let spans = || ps.iter().map(|p| span_ms(p).map(|(s, e)| e - s)).collect::<Vec<_>>();
+        // the passes tile the list: their ticks add up to the list's, exactly
+        let tick = |f: &[(&'static str, Value)], k: &str| get(f, k).and_then(Value::as_u64);
+        let mut sum = 0u64;
+        for p in &ps {
+            let (Some(s0), Some(e0)) = (tick(p, "start_tick"), tick(p, "end_tick")) else { panic!("a pass has no ticks: {p:?}") };
+            sum += e0 - s0;
+        }
+        let ls = lists_of(&evs);
+        let l = ls.iter().find(|f| get(f, "seq").and_then(Value::as_u64) == Some(seqs[0])).expect("list event");
+        let (Some(l0), Some(l1)) = (tick(l, "start_tick"), tick(l, "end_tick")) else { panic!("the list has no ticks: {l:?}") };
+        assert_eq!(sum, l1 - l0, "the passes do not tile the list; pass spans (ms): {:?}", spans());
+        // contention only lengthens a span: no pass is shorter than the kernel
+        let (min_through, min_timed) = (through.iter().cloned().fold(f64::MAX, f64::min), timed.iter().cloned().fold(f64::MAX, f64::min));
+        assert!(min_through >= 0.85 * min_timed, "a pass ({min_through:.4} ms) is shorter than the kernel ({min_timed:.4} ms); pass spans (ms): {:?}", spans());
+        let (a, b) = (median(through), median(timed));
+        println!("pass path median {a:.4} ms, dispatch_timed median {b:.4} ms");
+        assert!((a - b).abs() <= (0.15 * b).max(0.05), "pass path {a:.4} ms vs dispatch_timed {b:.4} ms; pass spans (ms): {:?}", spans());
+    }
+
+    #[test]
+    fn passes_of_lists_on_two_queues_overlap_and_the_frame_takes_the_union() {
+        let _t = GPU_TIMING.lock().unwrap_or_else(|e| e.into_inner());
+        let direct = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        let compute = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        let Some(r) = rig_pass(direct) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+        // SAFETY: a second queue on the test's own device.
+        let Ok(q2): Result<ID3D12CommandQueue, _> = (unsafe { r.dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: compute, ..Default::default() }) }) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        let Some(qf2) = QueueFns::plain(&q2) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+        let Ok(dxil) = crate::gpu::recomp::dxc::compile(&spin_hlsl(1_500_000), "main", "cs_6_6", &[]) else { return crate::gpu::recomp::runner::skip_test("no DXC") };
+        let (Some(wd), Some(wc), Some(t1), Some(t2)) = (
+            compute_work(&r, direct, &dxil, 256, 3, true),
+            compute_work(&r, compute, &dxil, 256, 3, true),
+            test_list(&r.dev, direct, false),
+            test_list(&r.dev, compute, false),
+        ) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        let (rd, rc) = (wd.list.as_raw(), wc.list.as_raw());
+        let q2raw = q2.as_raw();
+        let mut evs = Vec::new();
+        r.tel.set_frame(1);
+        submit_to(&r.tel, r.qraw, &r.qf, &[rd], &mut evs);
+        submit_to(&r.tel, q2raw, &qf2, &[rc], &mut evs);
+        r.tel.set_frame(2);
+        submit_to(&r.tel, r.qraw, &r.qf, &[t1.list.as_raw()], &mut evs);
+        submit_to(&r.tel, q2raw, &qf2, &[t2.list.as_raw()], &mut evs);
+        settle_key(&r.tel, r.qraw);
+        settle_key(&r.tel, q2raw);
+        r.tel.set_frame(3);
+        harvest(&r, &mut evs);
+        let ls = lists_of(&evs);
+        let seq_d = seqs_of(&evs, rd, 1);
+        let seq_c = seqs_of(&evs, rc, 1);
+        assert_eq!((seq_d.len(), seq_c.len()), (1, 1), "{evs:?}");
+        let list_span = |s: u64| ls.iter().find(|f| get(f, "seq").and_then(Value::as_u64) == Some(s)).and_then(|f| span_ms(f));
+        let (Some(a), Some(b)) = (list_span(seq_d[0]), list_span(seq_c[0])) else { panic!("a list has no ticks: {evs:?}") };
+        for s in [seq_d[0], seq_c[0]] {
+            let ps = passes_of(&evs, s);
+            assert_eq!(ps.len(), 4);
+            for (i, p) in ps.iter().enumerate() {
+                let (st, en) = span_ms(p).unwrap_or_else(|| panic!("pass {i} of {s} has no ticks: {p:?}"));
+                assert!(if i == 0 { st <= en } else { st < en }, "pass {i} of {s}: {st} .. {en}");
+            }
+        }
+        println!("direct {a:?} ms, compute {b:?} ms");
+        let mut iv = [a, b];
+        let union = xlog::union_ms(&mut iv).expect("union");
+        let sum = (a.1 - a.0) + (b.1 - b.0);
+        let overlap = (a.1.min(b.1) - a.0.max(b.0)).max(0.0);
+        println!("overlap {overlap:.4} ms ({})", if overlap > 0.0 { "the queues ran together" } else { "this GPU serialised them" });
+        assert!((union - (sum - overlap)).abs() <= 1e-6, "union {union} ms != sum {sum} ms - overlap {overlap} ms");
+        assert!(union >= (a.1 - a.0).max(b.1 - b.0) - 1e-6 && union <= sum + 1e-6);
+    }
+
+    #[test]
+    fn engine_stamps_around_a_fixed_workload_cost_what() {
+        let _t = GPU_TIMING.lock().unwrap_or_else(|e| e.into_inner());
+        let direct = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        let Some(r) = rig(direct, LIST_SLOTS, None) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+        let Ok(dxil) = crate::gpu::recomp::dxc::compile(&spin_hlsl(20_000), "main", "cs_6_6", &[]) else { return crate::gpu::recomp::runner::skip_test("no DXC") };
+        let Some(freq) = r.qf.frequency().filter(|f| *f >= 1000) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+        let Some(dfns) = DevFns::plain(&r.dev) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+        let works: Option<Vec<Work>> = (0..24).map(|_| compute_work(&r, direct, &dxil, 64, 2, false)).collect();
+        // the test's own outer stamp pair: EndQuery 0 in the first list, EndQuery 1 and the resolve in the last
+        let (Some(works), Some(heap), Some(readback), Some(fence)) = (works, dfns.query_heap(D3D12_QUERY_HEAP_TYPE_TIMESTAMP, 2), dfns.readback(16), dfns.fence()) else {
+            return crate::gpu::recomp::runner::skip_test("no GPU");
+        };
+        let mut mapped: *mut c_void = std::ptr::null_mut();
+        // SAFETY: plain D3D12 calls on the test's own device.
+        let (a, b) = unsafe {
+            if readback.Map(0, None, Some(&mut mapped)).is_err() || mapped.is_null() {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            }
+            let mk = |close_with_resolve: bool| -> Option<(ID3D12GraphicsCommandList, ID3D12CommandAllocator)> {
+                let alloc: ID3D12CommandAllocator = r.dev.CreateCommandAllocator(direct).ok()?;
+                let list: ID3D12GraphicsCommandList = r.dev.CreateCommandList(0, direct, &alloc, None::<&ID3D12PipelineState>).ok()?;
+                list.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, close_with_resolve as u32);
+                if close_with_resolve {
+                    list.ResolveQueryData(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &readback, 0);
+                }
+                list.Close().ok()?;
+                Some((list, alloc))
+            };
+            let (Some(a), Some(b)) = (mk(false), mk(true)) else { return crate::gpu::recomp::runner::skip_test("no GPU") };
+            (a, b)
+        };
+        let mut raw: Vec<*mut c_void> = vec![a.0.as_raw()];
+        raw.extend(works.iter().map(|w| w.list.as_raw()));
+        raw.push(b.0.as_raw());
+        let mut value = 0u64;
+        let ticks = mapped as *const u64;
+        // the outer duration in ms of one run; None when the fence never passed or the stamps are bad
+        let mut run = |engine: Option<(&mut u64, &mut Vec<Ev>)>| -> Option<f64> {
+            match engine {
+                None => r.qf.execute(&raw),
+                Some((frame, evs)) => {
+                    *frame += 1;
+                    r.tel.set_frame(*frame);
+                    submit_to(&r.tel, r.qraw, &r.qf, &raw, evs);
+                }
+            }
+            value += 1;
+            r.qf.signal(&fence, value);
+            let end = Instant::now() + Duration::from_secs(10);
+            // SAFETY: CPU-side read of the test's fence.
+            while unsafe { fence.GetCompletedValue() } < value {
+                if Instant::now() > end {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            // SAFETY: the resolve ran before the fence value passed.
+            let (t0, t1) = unsafe { (*ticks, *ticks.add(1)) };
+            (t0 != 0 && t1 >= t0).then(|| (t1 - t0) as f64 * 1000.0 / freq as f64)
+        };
+        let (mut plain, mut stamped) = (Vec::new(), Vec::new());
+        let (mut frame, mut evs) = (0u64, Vec::new());
+        for _ in 0..8 {
+            plain.push(run(None));
+            stamped.push(run(Some((&mut frame, &mut evs))));
+            harvest(&r, &mut evs);
+            evs.clear();
+        }
+        assert!(plain.iter().chain(stamped.iter()).all(Option::is_some), "a run did not complete: {plain:?} {stamped:?}");
+        let (p, s) = (median(plain.into_iter().flatten().collect()), median(stamped.into_iter().flatten().collect()));
+        println!("serialisation check, 24 lists: without the engine's stamps {p:.4} ms, with {s:.4} ms, difference {:+.4} ms ({:+.1} %)", s - p, (s - p) / p * 100.0);
     }
 }
