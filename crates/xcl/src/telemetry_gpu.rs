@@ -13,7 +13,7 @@
 #![allow(dead_code)]
 
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, TryLockError};
@@ -25,7 +25,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 use crate::hle::d3d12x::{frame as dframe, layout, real};
-use crate::log::{self as xlog, ListFacts, Tier};
+use crate::log::{self as xlog, FrameFacts, ListFacts, MemoryFacts, Tier};
 
 /// Stamp sets per queue: frames in flight + 1.
 const SETS: usize = 4;
@@ -616,7 +616,7 @@ impl QueueClock {
 }
 
 /// The `clock` event of a queue.
-fn clock_event(c: &QueueClock, qpf: i64) -> Vec<(&'static str, Value)> {
+fn clock_event(c: &QueueClock, qpf: i64, frame: u64) -> Vec<(&'static str, Value)> {
     let (tick, qpc) = c.cal.unwrap_or((0, 0));
     let mut f = xlog::clock_fields(c.id, c.kind.name(), tick, qpc, c.freq, qpf);
     if c.cal.is_none() {
@@ -630,6 +630,8 @@ fn clock_event(c: &QueueClock, qpf: i64) -> Vec<(&'static str, Value)> {
     if c.kind == QueueKind::Copy {
         f.push(("copy_timestamps", Value::Bool(c.cap)));
     }
+    // the engine's frame index when the calibration was taken
+    f.push(("frame", Value::from(frame)));
     f
 }
 
@@ -687,6 +689,8 @@ pub(super) struct GpuTel {
     /// debug counters of the "never read in the writing frame" rule
     reads: AtomicU64,
     early_reads: AtomicU64,
+    /// lists submitted per frame: (frame low 32 bits << 32 | count), one slot per frame modulo 64
+    counts: [AtomicU64; 64],
 }
 
 impl GpuTel {
@@ -720,6 +724,7 @@ impl GpuTel {
             stopped: AtomicBool::new(false),
             reads: AtomicU64::new(0),
             early_reads: AtomicU64::new(0),
+            counts: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -761,9 +766,40 @@ impl GpuTel {
         self.removed.load(Ordering::Acquire)
     }
 
+    /// Whether the title has shown a frame or submitted to a queue. Before that the exit flush has
+    /// nothing to write, and must not stop the engine: `write_final` also runs once before the
+    /// title starts (host.rs, the report written in case the title crashes).
+    pub(super) fn started(&self) -> bool {
+        self.frame() > 0 || !self.queues.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
     /// Harvested list intervals since the last call (the frame glue drains it on the thread).
     pub(super) fn take_harvested(&self) -> Vec<HarvestedList> {
         plock(&self.harvested).drain(..).collect()
+    }
+
+    /// Counts `n` lists submitted in `frame`.
+    fn note_lists(&self, frame: u64, n: u32) {
+        let slot = &self.counts[(frame % 64) as usize];
+        let tag = frame & 0xffff_ffff;
+        let mut cur = slot.load(Ordering::Relaxed);
+        loop {
+            let new = if cur >> 32 == tag { (tag << 32) | ((cur & 0xffff_ffff) + n as u64).min(0xffff_ffff) } else { (tag << 32) | n as u64 };
+            match slot.compare_exchange_weak(cur, new, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return,
+                Err(v) => cur = v,
+            }
+        }
+    }
+
+    /// Lists submitted in `frame` (0 once its slot was reused).
+    fn lists_in(&self, frame: u64) -> u32 {
+        let v = self.counts[(frame % 64) as usize].load(Ordering::Relaxed);
+        if v >> 32 == frame & 0xffff_ffff {
+            (v & 0xffff_ffff) as u32
+        } else {
+            0
+        }
     }
 
     fn find_queue(&self, key: usize) -> Option<Arc<Mutex<QueueClock>>> {
@@ -776,24 +812,34 @@ impl GpuTel {
     }
 
     /// The clock of `key`, made (and its first `clock` event written) on first use.
-    fn queue_clock(&self, key: *mut c_void, sink: Sink) -> Option<Arc<Mutex<QueueClock>>> {
+    fn queue_clock(&self, key: *mut c_void, frame: u64, sink: Sink) -> Option<Arc<Mutex<QueueClock>>> {
         let k = key as usize;
         if let Some(q) = self.find_queue(k) {
             return Some(q);
         }
-        let dev = self.dev()?;
-        let qf = (self.queue_fns)(key)?;
+        let Some(dev) = self.dev() else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("telemetry: no PC device functions (device not created or a slot missing in the layout table) - lists are not timed"));
+            return None;
+        };
+        let Some(qf) = (self.queue_fns)(key) else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("telemetry: no PC queue functions for queue {key:p} - its lists are not timed"));
+            return None;
+        };
         let (q, ev) = {
             let mut w = self.queues.write().unwrap_or_else(|e| e.into_inner());
             if let Some((_, q)) = w.iter().find(|(kk, _)| *kk == k) {
                 return Some(q.clone());
             }
             if w.len() >= MAX_QUEUES {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::xlog_warn!("telemetry: more than {MAX_QUEUES} queues - lists of the others are not timed"));
                 return None;
             }
             let id = self.next_queue.fetch_add(1, Ordering::Relaxed);
             let c = QueueClock::new(&dev, qf, id, self.slots, self.copy_ts);
-            let ev = clock_event(&c, self.qpf);
+            let ev = clock_event(&c, self.qpf, frame);
             let q = Arc::new(Mutex::new(c));
             w.push((k, q.clone()));
             (q, ev)
@@ -806,17 +852,33 @@ impl GpuTel {
     /// `[R?, S0, L0, S1, L1, ..., Sn]`. One driver call either way.
     pub(super) fn execute(&self, queue: *mut c_void, lists: &[*mut c_void], origin: &'static str, submit: impl FnOnce(&[*mut c_void]), sink: Sink) {
         let n = lists.len();
-        if n == 0 || self.stopped.load(Ordering::Relaxed) || self.removed.load(Ordering::Relaxed) {
+        if n == 0 {
+            submit(lists);
+            return;
+        }
+        if self.stopped.load(Ordering::Relaxed) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("telemetry: command lists submitted after the stamp engine finished are not timed (frame {})", self.frame()));
+            submit(lists);
+            return;
+        }
+        if self.removed.load(Ordering::Relaxed) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("telemetry: the device was removed - command lists are no longer timed"));
+            self.note(DROP_REMOVED, n as u64);
             submit(lists);
             return;
         }
         let frame = self.frame.load(Ordering::Acquire);
         let sampled = xlog::sample_due(frame, self.sample);
-        let Some(qc) = self.queue_clock(queue, sink) else {
+        let Some(qc) = self.queue_clock(queue, frame, sink) else {
+            self.note(DROP_UNSUPPORTED, n as u64);
             submit(lists);
             return;
         };
         let Some(mut guard) = lock_wait(&qc, Duration::from_secs(1)) else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("telemetry: a queue's stamp lock was busy for 1 s - lists submitted untimed"));
             self.note(DROP_FULL, n as u64);
             submit(lists);
             return;
@@ -891,10 +953,15 @@ impl GpuTel {
         if let (Some((i, _)), Some(f)) = (resolve, c.fence.as_ref()) {
             let value = c.fence_value + 1;
             c.fence_value = value;
-            c.q.signal(f, value);
+            let hr = c.q.signal(f, value);
+            if hr < 0 {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::xlog_warn!("telemetry: Signal on the stamp fence failed ({hr:#x}) - that frame's stamps will be late"));
+            }
             c.sets[i].state = SetState::Resolving(value);
         }
 
+        self.note_lists(frame, n as u32);
         if matches!(plan, Plan::Skip) {
             return;
         }
@@ -1091,7 +1158,7 @@ impl GpuTel {
                     c.cal = Some(cal);
                     c.cal_frame = frame;
                 }
-                clock_event(&c, self.qpf)
+                clock_event(&c, self.qpf, frame)
             };
             sink("clock", ev);
         }
@@ -1147,6 +1214,10 @@ pub fn telemetry_execute(queue: *mut c_void, lists: &[*mut c_void], submit: impl
         return;
     }
     let Some(tel) = GPU.get() else {
+        if !lists.is_empty() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("telemetry: the GPU stamp engine is not running - command lists are not timed"));
+        }
         submit(lists);
         return;
     };
@@ -1185,6 +1256,7 @@ pub(super) fn telemetry_gpu_start() {
     if GPU.set(tel).is_err() {
         return;
     }
+    super::update_manifest(|m| m.sample = sample);
     let Some(tel) = GPU.get() else { return };
     if let Err(e) = std::thread::Builder::new().name("xcl-telemetry".into()).spawn(move || thread_main(tel)) {
         crate::xlog_warn!("telemetry: cannot start the xcl-telemetry thread: {e}");
@@ -1194,8 +1266,32 @@ pub(super) fn telemetry_gpu_start() {
 /// The last harvest and the null flush (called from `telemetry_final`).
 pub(super) fn telemetry_gpu_final() {
     if let Some(t) = GPU.get() {
-        t.finish(&mut global_sink);
+        gpu_final(t);
     }
+}
+
+/// The body of `telemetry_gpu_final` on an engine (the tests call it on their own).
+fn gpu_final(t: &GpuTel) {
+    // `write_final` also runs once before the title starts: nothing to flush, and `finish` would
+    // stop the engine for the whole run
+    if !t.started() {
+        return;
+    }
+    // valid data first, then every frame still waiting is written with null GPU fields
+    t.harvest(&mut global_sink);
+    frames_step(t, &mut global_sink);
+    let why = if t.is_removed() { "removed" } else { "exit" };
+    let facts = lock_wait(&FRAMES, Duration::from_millis(200)).map(|mut b| b.flush(why)).unwrap_or_default();
+    write_frames(facts, &mut global_sink);
+    t.finish(&mut global_sink);
+    let names = ["full", "late", "unsupported", "resubmitted", "removed", "sampled_out"];
+    let mut drops: BTreeMap<String, u64> = names.iter().zip(t.drops()).map(|(k, v)| (k.to_string(), v)).collect();
+    drops.insert("frames".into(), FRAMES_DROPPED.load(Ordering::Relaxed));
+    let sample = t.sample;
+    super::update_manifest(|m| {
+        m.sample = sample;
+        m.gpu_drops = drops;
+    });
 }
 
 /// Wakes on every frame (or every 50 ms) and harvests; every 60 frames it calibrates again.
@@ -1208,14 +1304,398 @@ fn thread_main(tel: &'static GpuTel) {
             *g = false;
         }
         if tel.stopped.load(Ordering::Acquire) {
+            crate::xlog_info!("telemetry: the xcl-telemetry thread ends (frame {})", tel.frame());
             break;
         }
         tel.harvest(&mut global_sink);
+        frames_step(tel, &mut global_sink);
         let f = tel.frame();
         if f >= next_clock {
             tel.refresh_clocks(&mut global_sink);
+            global_sink("memory", xlog::memory_fields(&memory_snapshot(f)));
             next_clock = (f / 60 + 1) * 60;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// frames: spans, frame records, the memory event
+// ---------------------------------------------------------------------------------------
+
+/// `WaitFrameEventX` time and calls, all threads.
+static WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static WAIT_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Frame records dropped because their lock was busy.
+static FRAMES_DROPPED: AtomicU64 = AtomicU64::new(0);
+static FRAMES: Mutex<FrameBook> = Mutex::new(FrameBook::new());
+
+thread_local! {
+    /// The frame (1-based) a `present_now` on this thread showed; 0: none yet.
+    static SHOWN: Cell<u64> = const { Cell::new(0) };
+    /// This thread's own `WaitFrameEventX` time so far, and its value at its last frame close.
+    static THREAD_WAIT_NS: Cell<u64> = const { Cell::new(0) };
+    static THREAD_WAIT_MARK: Cell<u64> = const { Cell::new(0) };
+}
+
+fn set_shown(n: u64) {
+    SHOWN.with(|c| c.set(n));
+}
+
+fn take_shown() -> u64 {
+    SHOWN.with(|c| c.replace(0))
+}
+
+/// A `present_now` call. Closes the frame it showed (if it showed one) when it ends.
+pub struct PresentSpan(Option<i64>, bool);
+
+/// A `WaitFrameEventX` call.
+pub struct WaitSpan(Option<i64>);
+
+/// The start of `present_now`: marks submissions on this thread as `origin: "present"`.
+pub fn telemetry_present_begin() -> PresentSpan {
+    if !xlog::telemetry_on(Tier::Frame) {
+        return PresentSpan(None, false);
+    }
+    let was = IN_PRESENT_SPAN.with(|c| c.replace(true));
+    PresentSpan(Some(dframe::qpc()), was)
+}
+
+/// `present_now` showed frame `n` (the running count of shown frames, 1-based).
+pub fn telemetry_frame_shown(n: u64) {
+    if xlog::telemetry_on(Tier::Frame) {
+        set_shown(n);
+    }
+}
+
+/// The start of `WaitFrameEventX`.
+pub fn telemetry_wait_begin() -> WaitSpan {
+    if !xlog::telemetry_on(Tier::Frame) {
+        return WaitSpan(None);
+    }
+    WaitSpan(Some(dframe::qpc()))
+}
+
+impl Drop for WaitSpan {
+    fn drop(&mut self) {
+        let Some(t0) = self.0 else { return };
+        let ns = ((dframe::qpc() - t0).max(0) as i128 * 1_000_000_000 / qpf() as i128).min(u64::MAX as i128) as u64;
+        WAIT_NS.fetch_add(ns, Ordering::Relaxed);
+        WAIT_CALLS.fetch_add(1, Ordering::Relaxed);
+        THREAD_WAIT_NS.with(|c| c.set(c.get().saturating_add(ns)));
+    }
+}
+
+impl Drop for PresentSpan {
+    fn drop(&mut self) {
+        let Some(t0) = self.0 else { return };
+        IN_PRESENT_SPAN.with(|c| c.set(self.1));
+        let shown = take_shown();
+        if shown == 0 {
+            return; // returned early (re-entry, lock busy, nothing to show): not a frame
+        }
+        let Some(tel) = GPU.get() else { return };
+        let qpc_end = dframe::qpc();
+        let cum = THREAD_WAIT_NS.with(|c| c.get());
+        let thread_wait_ms = cum.saturating_sub(THREAD_WAIT_MARK.with(|c| c.replace(cum))) as f64 / 1e6;
+        let close = Close {
+            n: shown,
+            qpc_end,
+            qpc0: tel.qpc0,
+            qpf: tel.qpf,
+            present_ms: (qpc_end - t0) as f64 * 1000.0 / tel.qpf as f64,
+            thread_wait_ms,
+            lists: tel.lists_in(shown - 1),
+            sampled: xlog::sample_due(shown - 1, tel.sample),
+            counters: Counters::now(),
+        };
+        close_if_shown(&FRAMES, shown, close, &mut global_sink);
+        tel.set_frame(shown);
+    }
+}
+
+/// What a frame record is made from at its close.
+struct Close {
+    n: u64,
+    qpc_end: i64,
+    qpc0: i64,
+    qpf: i64,
+    present_ms: f64,
+    thread_wait_ms: f64,
+    lists: u32,
+    sampled: bool,
+    counters: Counters,
+}
+
+/// The counters a frame record takes deltas of.
+#[derive(Clone, Copy, Default)]
+struct Counters {
+    draws: u64,
+    dispatches: u64,
+    pso_us: u64,
+    look_us: u64,
+    wait_ns: u64,
+    wait_calls: u64,
+}
+
+impl Counters {
+    /// bind::activity (draws, dispatches), pso_async::blocked (total us, graphics + compute),
+    /// sparse::look_counters()[0] (whole looks, us), and the wait counters above.
+    fn now() -> Counters {
+        let (draws, dispatches) = crate::hle::d3d12x::bind::activity();
+        let b = crate::hle::d3d12x::pso_async::blocked();
+        Counters {
+            draws,
+            dispatches,
+            pso_us: b[0][1] + b[1][1],
+            look_us: crate::hle::d3d12x::sparse::look_counters()[0],
+            wait_ns: WAIT_NS.load(Ordering::Relaxed),
+            wait_calls: WAIT_CALLS.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// One shown frame waiting for its GPU data.
+struct FrameRec {
+    i: u64,
+    interval_ms: f64,
+    present_ms: f64,
+    thread_wait_ms: f64,
+    wait_ms: f64,
+    wait_calls: u64,
+    draws: u64,
+    dispatches: u64,
+    pso_wait_ms: f64,
+    look_ms: f64,
+    lists: u32,
+    sampled: bool,
+    /// calibrated [start, end) of this frame's lists with valid ticks
+    intervals: Vec<(f64, f64)>,
+    /// lists of this frame the harvest has handed over (valid or null)
+    got: u32,
+}
+
+/// Frames waiting (bounded `PENDING_FRAMES`), harvested intervals waiting for their frame.
+struct FrameBook {
+    pending: VecDeque<FrameRec>,
+    waiting: Vec<HarvestedList>,
+    prev: Counters,
+    last_qpc: Option<i64>,
+    last_written: u64,
+}
+
+impl FrameBook {
+    const fn new() -> FrameBook {
+        FrameBook {
+            pending: VecDeque::new(),
+            waiting: Vec::new(),
+            prev: Counters { draws: 0, dispatches: 0, pso_us: 0, look_us: 0, wait_ns: 0, wait_calls: 0 },
+            last_qpc: None,
+            last_written: 0,
+        }
+    }
+
+    /// Adds the record of frame `c.n`. When `PENDING_FRAMES` are waiting, the oldest is written
+    /// at once with null GPU fields (`late`): that is returned.
+    fn close(&mut self, c: Close) -> Vec<FrameFacts> {
+        let d = |a: u64, b: u64| a.saturating_sub(b);
+        let interval = c.qpc_end - self.last_qpc.unwrap_or(c.qpc0);
+        self.last_qpc = Some(c.qpc_end);
+        let (p, n) = (self.prev, c.counters);
+        self.prev = n;
+        self.pending.push_back(FrameRec {
+            i: c.n,
+            interval_ms: interval as f64 * 1000.0 / c.qpf as f64,
+            present_ms: c.present_ms,
+            thread_wait_ms: c.thread_wait_ms,
+            wait_ms: d(n.wait_ns, p.wait_ns) as f64 / 1e6,
+            wait_calls: d(n.wait_calls, p.wait_calls),
+            draws: d(n.draws, p.draws),
+            dispatches: d(n.dispatches, p.dispatches),
+            pso_wait_ms: d(n.pso_us, p.pso_us) as f64 / 1000.0,
+            look_ms: d(n.look_us, p.look_us) as f64 / 1000.0,
+            lists: c.lists,
+            sampled: c.sampled,
+            intervals: Vec::new(),
+            got: 0,
+        });
+        let mut out = Vec::new();
+        while self.pending.len() > PENDING_FRAMES {
+            if let Some(r) = self.pending.pop_front() {
+                self.last_written = r.i;
+                out.push(frame_facts(&r, r.lists, Some("late")));
+            }
+        }
+        out
+    }
+
+    /// Hands harvested list intervals to the frames they belong to (list frame `f` is frame `f + 1`).
+    fn attach(&mut self, new: Vec<HarvestedList>) {
+        self.waiting.extend(new);
+        let last = self.last_written;
+        let pending = &mut self.pending;
+        self.waiting.retain(|h| {
+            let i = h.frame + 1;
+            if i <= last {
+                return false; // its frame was written already
+            }
+            match pending.iter_mut().find(|r| r.i == i) {
+                Some(r) => {
+                    r.got += 1;
+                    if let (Some(s), Some(e)) = (h.start_ms, h.end_ms) {
+                        r.intervals.push((s, e));
+                    }
+                    false
+                }
+                None => true, // its frame is not closed yet
+            }
+        });
+        if self.waiting.len() > HARVESTED_MAX {
+            let extra = self.waiting.len() - HARVESTED_MAX;
+            self.waiting.drain(..extra);
+        }
+    }
+
+    /// Frames, in order of `i`, whose lists have all been harvested (`lists_of(frame)` = lists
+    /// submitted in that frame) or that are `LATE_FRAMES` old at frame `now`.
+    fn complete(&mut self, now: u64, lists_of: &dyn Fn(u64) -> u32) -> Vec<FrameFacts> {
+        let mut out = Vec::new();
+        while let Some(r) = self.pending.front() {
+            let want = if r.sampled { lists_of(r.i - 1).max(r.lists) } else { r.lists };
+            if r.sampled && r.got < want && now < r.i + LATE_FRAMES {
+                break;
+            }
+            if let Some(r) = self.pending.pop_front() {
+                self.last_written = r.i;
+                out.push(frame_facts(&r, want, None));
+            }
+        }
+        out
+    }
+
+    /// Every waiting frame, GPU fields null with `why` (`exit` / `removed`).
+    fn flush(&mut self, why: &'static str) -> Vec<FrameFacts> {
+        let mut out = Vec::new();
+        while let Some(r) = self.pending.pop_front() {
+            self.last_written = r.i;
+            out.push(frame_facts(&r, r.lists, Some(why)));
+        }
+        out
+    }
+}
+
+/// The `frame` facts of a record. `forced`: GPU fields null with this reason.
+fn frame_facts(r: &FrameRec, want: u32, forced: Option<&'static str>) -> FrameFacts {
+    let lists = r.lists.max(want);
+    let (mut gpu_ms, mut first, mut last, mut why) = (None, None, None, None);
+    let mut lists_null = 0;
+    if !r.sampled {
+        why = Some("sampled_out");
+    } else if let Some(w) = forced {
+        why = Some(w);
+        lists_null = lists;
+    } else {
+        let mut iv = r.intervals.clone();
+        gpu_ms = xlog::union_ms(&mut iv);
+        first = iv.first().map(|p| p.0);
+        last = iv.iter().map(|p| p.1).reduce(f64::max);
+        lists_null = lists.saturating_sub(r.intervals.len() as u32);
+        if gpu_ms.is_none() {
+            why = Some(if lists == 0 {
+                "no_lists"
+            } else if r.got < want {
+                "late"
+            } else {
+                "no_ticks"
+            });
+        }
+    }
+    FrameFacts {
+        i: r.i,
+        interval_ms: r.interval_ms,
+        cpu_ms: xlog::frame_cpu_ms(r.interval_ms, r.present_ms, r.thread_wait_ms),
+        present_ms: r.present_ms,
+        wait_ms: r.wait_ms,
+        wait_calls: r.wait_calls,
+        gpu_ms,
+        gpu_first_ms: first,
+        gpu_last_ms: last,
+        gpu_lists_null: lists_null,
+        lists,
+        draws: r.draws,
+        dispatches: r.dispatches,
+        barriers: None,
+        pso_wait_ms: r.pso_wait_ms,
+        look_ms: r.look_ms,
+        sampled: r.sampled,
+        why,
+    }
+}
+
+fn write_frames(facts: Vec<FrameFacts>, sink: Sink) {
+    for f in &facts {
+        sink("frame", xlog::frame_fields(f));
+    }
+}
+
+/// The end of a present span: when it showed frame `shown` (non-zero), the frame is recorded.
+/// The lock is waited for at most 1 ms (else the frame is counted as dropped). The events are
+/// written after the lock is released. Returns whether a frame was recorded.
+fn close_if_shown(book: &Mutex<FrameBook>, shown: u64, close: Close, sink: Sink) -> bool {
+    if shown == 0 {
+        return false;
+    }
+    let facts = match lock_wait(book, Duration::from_millis(1)) {
+        Some(mut b) => b.close(close),
+        None => {
+            FRAMES_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    };
+    write_frames(facts, sink);
+    true
+}
+
+/// On the thread: harvested intervals into their frames, finished frames written in order.
+fn frames_step(tel: &GpuTel, sink: Sink) {
+    let facts = {
+        let Some(mut b) = lock_wait(&FRAMES, Duration::from_millis(5)) else { return };
+        let h = tel.take_harvested();
+        b.attach(h);
+        b.complete(tel.frame(), &|f| tel.lists_in(f))
+    };
+    write_frames(facts, sink);
+}
+
+/// The `memory` event: a source the tree cannot give is None. MiB.
+fn memory_snapshot(frame: u64) -> MemoryFacts {
+    let mb = |b: u64| Some(b >> 20);
+    let committed = {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+        // SAFETY: a zeroed counters structure with its size set, filled for this process.
+        unsafe {
+            let mut c: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+            c.cb = std::mem::size_of_val(&c) as u32;
+            let ok = K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
+            (ok != 0).then_some(c.PrivateUsage as u64)
+        }
+    };
+    let video = real::video_memory();
+    // these two lock title-side state that a panic may have poisoned: a panic is no value
+    let arenas = std::panic::catch_unwind(crate::hle::d3d12x::vram::arena_bytes).ok();
+    let pages = std::panic::catch_unwind(crate::hle::d3d12x::vram::page_bytes).ok();
+    let pools = std::panic::catch_unwind(crate::hle::d3d12x::sparse::pool_bytes).ok();
+    MemoryFacts {
+        frame,
+        committed_mb: committed.and_then(mb),
+        vram_local_mb: video.and_then(|v| mb(v.0)),
+        vram_nonlocal_mb: video.and_then(|v| mb(v.1)),
+        vram_budget_mb: video.and_then(|v| mb(v.2)),
+        arenas_mb: arenas.and_then(|a| mb(a.0 as u64)),
+        arenas_made_mb: arenas.and_then(|a| mb(a.1 as u64)),
+        pages_mb: pages.and_then(|p| mb(p.0 as u64)),
+        page_pools_mb: pages.and_then(|p| mb(p.1 as u64)),
+        sparse_mb: pools.and_then(|p| mb(p.0 as u64)),
+        sparse_mapped_mb: pools.and_then(|p| mb(p.1 as u64)),
     }
 }
 
@@ -1510,5 +1990,162 @@ mod tests {
         let ls = lists_of(&evs);
         assert_eq!(ls.len(), 1, "{evs:?}");
         assert_eq!(get(ls[0], "why"), Some(&Value::from("exit")));
+    }
+
+    #[test]
+    fn started_is_true_once_a_frame_is_shown() {
+        let tel = GpuTel::new(Box::new(|| None), Box::new(|_| None), 1, 8, None);
+        assert!(!tel.started());
+        tel.set_frame(1);
+        assert!(tel.started());
+    }
+
+    #[test]
+    fn the_exit_flush_before_the_first_frame_does_not_stop_the_engine() {
+        let tel = GpuTel::new(Box::new(|| None), Box::new(|_| None), 1, 8, None);
+        gpu_final(&tel); // what write_final does before the title starts (host.rs)
+        assert!(!tel.stopped.load(Ordering::Acquire), "the pre-run report write stopped the engine");
+        // a list submitted afterwards is still handled by the engine, not passed through
+        let mut evs: Vec<Ev> = Vec::new();
+        let mut submitted = 0;
+        let mut sink = |ev: &str, f: Vec<(&'static str, Value)>| evs.push((ev.to_string(), f));
+        let l = 0x10usize as *mut c_void;
+        tel.execute(0x20usize as *mut c_void, &[l], "submit", |_| submitted += 1, &mut sink);
+        assert_eq!(submitted, 1);
+        // no device in this engine: the list is counted as unsupported, which only the live path does
+        assert_eq!(tel.drops()[DROP_UNSUPPORTED], 1);
+    }
+
+    // ---- frame glue (no GPU, no global tier) ----
+
+    fn close_of(n: u64, qpc_end: i64, lists: u32, sampled: bool) -> Close {
+        Close { n, qpc_end, qpc0: 0, qpf: 1000, present_ms: 1.0, thread_wait_ms: 0.0, lists, sampled, counters: Counters::default() }
+    }
+
+    fn hl(frame: u64, s: f64, e: f64) -> HarvestedList {
+        HarvestedList { frame, queue: 0, start_ms: Some(s), end_ms: Some(e) }
+    }
+
+    #[test]
+    fn a_present_span_closes_a_frame_only_when_it_showed_one() {
+        assert_eq!(take_shown(), 0);
+        set_shown(7);
+        assert_eq!(take_shown(), 7);
+        assert_eq!(take_shown(), 0, "taking it clears it");
+        let book = Mutex::new(FrameBook::new());
+        let mut evs: Vec<Ev> = Vec::new();
+        let mut sink = |ev: &str, f: Vec<(&'static str, Value)>| evs.push((ev.to_string(), f));
+        assert!(!close_if_shown(&book, 0, close_of(1, 100, 0, true), &mut sink));
+        assert!(plock(&book).pending.is_empty());
+        assert!(close_if_shown(&book, 5, close_of(5, 100, 0, true), &mut sink));
+        let b = plock(&book);
+        assert_eq!(b.pending.len(), 1);
+        assert_eq!(b.pending[0].i, 5);
+        assert_eq!(b.pending[0].interval_ms, 100.0, "the first frame counts from the start");
+    }
+
+    #[test]
+    fn cpu_ms_is_clamped_at_zero() {
+        assert_eq!(xlog::frame_cpu_ms(1.0, 2.0, 3.0), 0.0);
+        let mut b = FrameBook::new();
+        let mut c = close_of(1, 5, 0, false);
+        c.present_ms = 10.0; // longer than the 5 ms interval
+        b.close(c);
+        let f = b.complete(1, &|_| 0);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].cpu_ms, 0.0);
+        assert_eq!(f[0].why, Some("sampled_out"));
+        assert!(f[0].gpu_ms.is_none() && !f[0].sampled);
+    }
+
+    #[test]
+    fn a_frame_completes_when_its_lists_are_harvested() {
+        let mut b = FrameBook::new();
+        assert!(b.close(close_of(1, 16, 2, true)).is_empty());
+        assert!(b.complete(2, &|_| 2).is_empty(), "nothing harvested yet");
+        b.attach(vec![hl(0, 1.0, 2.0)]);
+        assert!(b.complete(3, &|_| 2).is_empty(), "one of two lists");
+        b.attach(vec![hl(0, 2.0, 4.0)]);
+        let f = b.complete(3, &|_| 2);
+        assert_eq!(f.len(), 1);
+        assert_eq!((f[0].i, f[0].lists, f[0].gpu_lists_null, f[0].why), (1, 2, 0, None));
+        assert_eq!((f[0].gpu_ms, f[0].gpu_first_ms, f[0].gpu_last_ms), (Some(3.0), Some(1.0), Some(4.0)));
+    }
+
+    #[test]
+    fn overlapping_lists_count_once_and_null_lists_are_counted() {
+        let mut b = FrameBook::new();
+        b.close(close_of(1, 16, 3, true));
+        b.attach(vec![hl(0, 1.0, 5.0), hl(0, 2.0, 4.0), HarvestedList { frame: 0, queue: 0, start_ms: None, end_ms: None }]);
+        let f = b.complete(3, &|_| 3);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].gpu_ms, Some(4.0), "the union, not the sum");
+        assert_eq!(f[0].gpu_lists_null, 1);
+    }
+
+    #[test]
+    fn a_frame_gives_up_after_late_frames() {
+        let mut b = FrameBook::new();
+        b.close(close_of(1, 16, 2, true));
+        b.attach(vec![hl(0, 1.0, 2.0)]);
+        assert!(b.complete(1 + LATE_FRAMES - 1, &|_| 2).is_empty());
+        let f = b.complete(1 + LATE_FRAMES, &|_| 2);
+        assert_eq!(f.len(), 1);
+        assert_eq!((f[0].gpu_ms, f[0].gpu_lists_null), (Some(1.0), 1), "a lower bound");
+        b.close(close_of(2, 32, 1, true));
+        let f = b.complete(2 + LATE_FRAMES, &|_| 1);
+        assert_eq!((f[0].i, f[0].gpu_ms, f[0].why), (2, None, Some("late")));
+    }
+
+    #[test]
+    fn frames_are_written_in_order_of_i() {
+        let mut b = FrameBook::new();
+        for n in 1..=3 {
+            b.close(close_of(n, n as i64 * 16, 1, true));
+        }
+        b.attach(vec![hl(2, 5.0, 6.0), hl(1, 3.0, 4.0)]);
+        assert!(b.complete(4, &|_| 1).is_empty(), "frame 1 is not done: 2 and 3 wait behind it");
+        b.attach(vec![hl(0, 1.0, 2.0)]);
+        let f = b.complete(4, &|_| 1);
+        assert_eq!(f.iter().map(|x| x.i).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(b.last_written, 3);
+        // an interval for a frame written already is dropped, not kept
+        b.attach(vec![hl(0, 1.0, 2.0)]);
+        assert!(b.waiting.is_empty());
+    }
+
+    #[test]
+    fn the_pending_frames_are_bounded() {
+        let mut b = FrameBook::new();
+        let mut written = Vec::new();
+        for n in 1..=(PENDING_FRAMES as u64 + 3) {
+            written.extend(b.close(close_of(n, n as i64, 1, true)));
+        }
+        assert_eq!(b.pending.len(), PENDING_FRAMES);
+        assert_eq!(written.iter().map(|f| f.i).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(written.iter().all(|f| f.why == Some("late") && f.gpu_ms.is_none() && f.gpu_lists_null == 1));
+    }
+
+    #[test]
+    fn the_exit_flush_nulls_every_waiting_frame() {
+        let mut b = FrameBook::new();
+        b.close(close_of(1, 16, 2, true));
+        b.close(close_of(2, 32, 0, false));
+        let f = b.flush("exit");
+        assert_eq!(f.len(), 2);
+        assert_eq!((f[0].why, f[0].gpu_ms, f[0].gpu_lists_null), (Some("exit"), None, 2));
+        assert_eq!(f[1].why, Some("sampled_out"));
+        assert!(b.pending.is_empty());
+    }
+
+    #[test]
+    fn lists_are_counted_per_frame() {
+        let t = GpuTel::new(Box::new(|| None), Box::new(|_| None), 1, 4, None);
+        t.note_lists(5, 2);
+        t.note_lists(5, 1);
+        assert_eq!(t.lists_in(5), 3);
+        assert_eq!(t.lists_in(5 + 64), 0, "another frame on the same slot");
+        t.note_lists(5 + 64, 1);
+        assert_eq!((t.lists_in(5), t.lists_in(5 + 64)), (0, 1));
     }
 }

@@ -216,6 +216,14 @@ unsafe extern "system" fn set_flag(ctx: *mut c_void, canceled: bool) {
 fn main() {
     println!("xcl_testtitle: start");
 
+    // fork telemetry e2e: `--frames N` runs only the frame scenario (see gpu::frame_scenario)
+    if let Some(n) = gpu::frames_arg() {
+        check("D3D12.X: frame scenario (direct draws, compute, DMA copy, PresentX)", || gpu::frame_scenario(n));
+        let failures = FAILURES.load(Ordering::SeqCst);
+        println!("xcl_testtitle: done, failures: {failures}");
+        std::process::exit(failures as i32);
+    }
+
     check("argv: command line belongs to the game", || {
         let args: Vec<String> = std::env::args().collect();
         ensure!(args[0].to_lowercase().ends_with("xcl_testtitle.exe"), "argv[0] = {}", args[0]);

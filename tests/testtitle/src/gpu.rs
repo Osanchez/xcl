@@ -1882,3 +1882,242 @@ pub fn committed_textures_leave_room_for_readback() -> Result<(), String> {
         Ok(())
     }
 }
+
+/// `--frames N` on the command line (fork telemetry e2e, `crates/xcl/tests/telemetry_e2e.rs`):
+/// N frames of the scenario below, 120 when no number follows. `--uncapped` needs nothing here:
+/// the frame clock is uncapped by XCL's `XCL_FRAME_INTERVAL_US=uncapped`, which the caller sets.
+pub fn frames_arg() -> Option<u32> {
+    let args: Vec<String> = std::env::args().collect();
+    let i = args.iter().position(|a| a == "--frames")?;
+    Some(args.get(i + 1).and_then(|n| n.parse().ok()).filter(|&n| n > 0).unwrap_or(120))
+}
+
+/// Waits until `fence` has reached `value`.
+fn fence_reached(fence: &ID3D12Fence, value: u64, ev: &EventHandle) -> Result<(), String> {
+    unsafe {
+        if fence.GetCompletedValue() >= value {
+            return Ok(());
+        }
+        fence.SetEventOnCompletion(value, ev.handle()).map_err(e)?;
+        ensure!(WaitForSingleObject(ev.0, 10_000) == 0, "GPU fence {value} not reached (at {})", fence.GetCompletedValue());
+        Ok(())
+    }
+}
+
+/// A frame loop as a title runs one: per frame a direct list (a clear and three draws) on a
+/// direct queue, an empty list on a compute queue and a copy on the console's DMA queue, then `PresentX` with the token of `WaitFrameEventX`.
+/// Frame 10 submits its closed direct list twice in a row (two driver calls), before anything
+/// could have been read back. Lists are recorded again every frame from a ring of three
+/// allocators, as titles do. Prints the loop's own timing (the telemetry run is measured by it).
+pub fn frame_scenario(frames: u32) -> Result<(), String> {
+    const RING: usize = 3;
+    const TWICE: u64 = 10;
+    const DMA: u32 = 0x10;
+    const IID_DMA_LIST: windows::core::GUID = windows::core::GUID::from_u128(0x30bc77b9_8379_4b25_95de_b8588c42275d);
+    const COPY_BYTES: u64 = 0x1_0000;
+    type PsoX = unsafe extern "system" fn(*mut c_void, *const D3D12_GRAPHICS_PIPELINE_STATE_DESC, u32, *const c_void, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+    type QueueX = unsafe extern "system" fn(*mut c_void, *const u32, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+    type ListX = unsafe extern "system" fn(*mut c_void, *const u32, *mut c_void, *mut c_void, *const windows::core::GUID, *mut *mut c_void) -> HRESULT;
+    type CopyBuffer = unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u64);
+    unsafe {
+        let dev = device()?;
+        let d = dev.as_raw();
+        let slot = |obj: *mut c_void, i: usize| *(*(obj as *const *const usize)).add(i);
+        let set_interval: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, u32) -> HRESULT = std::mem::transmute(slot(d, 78));
+        let schedule: unsafe extern "system" fn(*mut c_void, u32, u32, *const u8, u32) -> HRESULT = std::mem::transmute(slot(d, 79));
+        let wait_event: unsafe extern "system" fn(*mut c_void, u32, u32, *const u8, u32, *mut u64) -> HRESULT = std::mem::transmute(slot(d, 80));
+
+        // queues: direct (PresentX), compute, and the console's DMA engine as the copy queue
+        let direct: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+        let compute: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COMPUTE, ..Default::default() }).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+        let mut raw = std::ptr::null_mut();
+        let hr = std::mem::transmute::<usize, QueueX>(slot(d, 48))(d, [DMA, 0, 0, 0].as_ptr(), &ID3D12CommandQueue::IID, &mut raw);
+        ensure!(hr >= 0 && !raw.is_null(), "CreateCommandQueueX (DMA) hr={hr:#x}");
+        let copy = ID3D12CommandQueue::from_raw(raw);
+
+        // pipelines: the triangle's graphics pipeline (console creation, #60)
+        let rs = root_signature(&dev)?;
+        let vs = compile(
+            "float4 main(uint id : SV_VertexID) : SV_Position { float2 p[3] = { float2(-0.5,-0.5), float2(0.0,0.5), float2(0.5,-0.5) }; return float4(p[id], 0, 1); }",
+            "vs_5_0",
+        )?;
+        let ps = compile("float4 main() : SV_Target { return float4(0, 1, 0, 1); }", "ps_5_0")?;
+        let desc = pso_desc(&rs, bc(&vs), bc(&ps));
+        let mut raw = std::ptr::null_mut();
+        let hr = std::mem::transmute::<usize, PsoX>(slot(d, 60))(d, &desc, 0, std::ptr::null(), &ID3D12PipelineState::IID, &mut raw);
+        ensure!(hr >= 0 && !raw.is_null(), "CreateGraphicsPipelineStateX hr={hr:#x}");
+        let pso = ID3D12PipelineState::from_raw(raw);
+
+        // the back buffer handed to PresentX, its render target view, and the copy's buffers
+        let (w, h) = (640u32, 360u32);
+        let tex = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: w as u64,
+            Height: h,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let mut bb: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &tex, D3D12_RESOURCE_STATE_PRESENT, None, &mut bb)
+            .map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+        let bb = bb.ok_or("no back buffer")?;
+        let heap: ID3D12DescriptorHeap = dev
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() })
+            .map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+        let start: unsafe extern "system" fn(*mut c_void) -> usize = std::mem::transmute(slot(heap.as_raw(), 9));
+        let rtv = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start(heap.as_raw()) };
+        dev.CreateRenderTargetView(&bb, None, rtv);
+        let buffer = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: COPY_BYTES,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let (mut src, mut dst): (Option<ID3D12Resource>, Option<ID3D12Resource>) = (None, None);
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COMMON, None, &mut src)
+            .map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut dst)
+            .map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+        let (src, dst) = (src.ok_or("no copy source")?, dst.ok_or("no copy destination")?);
+
+        // allocators and lists: a ring of RING frames per queue (lists start closed)
+        let mut direct_ring: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> = Vec::new();
+        let mut compute_ring: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> = Vec::new();
+        let mut copy_ring: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> = Vec::new();
+        let list_x: ListX = std::mem::transmute(slot(d, 73));
+        for _ in 0..RING {
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+            list.Close().map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+            direct_ring.push((alloc, list));
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, &alloc, None).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+            list.Close().map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+            compute_ring.push((alloc, list));
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE(DMA as i32)).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+            let mut raw = std::ptr::null_mut();
+            let hr = list_x(d, [DMA, 0, 1, 0].as_ptr(), alloc.as_raw(), std::ptr::null_mut(), &IID_DMA_LIST, &mut raw);
+            ensure!(hr >= 0 && !raw.is_null(), "CreateCommandListX (DMA) hr={hr:#x}");
+            let list = ID3D12GraphicsCommandList::from_raw(raw);
+            list.Close().map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+            copy_ring.push((alloc, list));
+        }
+        let direct_f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+        let compute_f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+        let copy_f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+        let ev = EventHandle::new()?;
+        let barrier = |before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES| D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: transmute_copy(&bb),
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        };
+        let present: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const u8) -> HRESULT = std::mem::transmute(slot(direct.as_raw(), 30));
+        let submit = |queue: &ID3D12CommandQueue, list: &ID3D12GraphicsCommandList| -> Result<(), String> {
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(|x| format!("gpu.rs:{}: {x}", line!()))?)]);
+            Ok(())
+        };
+
+        ensure!(set_interval(d, std::ptr::null_mut(), 16667, 1, 0) >= 0, "SetFrameIntervalX");
+        let cur = std::cell::Cell::new(0u64);
+        let res = (|| -> Result<(f64, Vec<f64>), String> {
+            ensure!(schedule(d, 0, 0, std::ptr::null(), 0) >= 0, "ScheduleFrameEventX (origin)");
+            let mut frame_ms: Vec<f64> = Vec::with_capacity(frames as usize);
+            let begin = std::time::Instant::now();
+            for frame in 1..=frames as u64 {
+                cur.set(frame);
+                let t = std::time::Instant::now();
+                let s = (frame as usize - 1) % RING;
+                if frame > RING as u64 {
+                    // the allocators of this ring slot are free once the frame RING back is done
+                    let old = frame - RING as u64;
+                    fence_reached(&direct_f, old, &ev)?;
+                    fence_reached(&compute_f, old, &ev)?;
+                    fence_reached(&copy_f, old, &ev)?;
+                }
+                let mut token = 0u64;
+                let hr = wait_event(d, 0, 500, std::ptr::null(), 0, &mut token);
+                ensure!(hr == 0 && token != 0, "WaitFrameEventX hr={hr:#x} token={token}");
+
+                // compute queue: an empty list (a console dispatch of an untranslated shader is skipped by XCL)
+                let (alloc, list) = &compute_ring[s];
+                alloc.Reset().map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+                list.Reset(alloc, None).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+                list.Close().map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+                submit(&compute, list)?;
+                compute.Signal(&compute_f, frame).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+
+                // copy queue: one copy on the DMA list (CopyBufferRegion is its #11)
+                let (alloc, list) = &copy_ring[s];
+                alloc.Reset().map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+                list.Reset(alloc, None).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+                std::mem::transmute::<usize, CopyBuffer>(slot(list.as_raw(), 11))(list.as_raw(), dst.as_raw(), 0, src.as_raw(), 0, COPY_BYTES);
+                list.Close().map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+                submit(&copy, list)?;
+                copy.Signal(&copy_f, frame).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+
+                // direct queue: a clear and three draws
+                let (alloc, list) = &direct_ring[s];
+                alloc.Reset().map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+                list.Reset(alloc, None).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+                list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+                xslot::<OmSetRenderTargets>(list, X_OM_SET_RENDER_TARGETS)(list.as_raw(), 1, &rtv, 0, std::ptr::null());
+                xslot::<ClearRtv>(list, X_CLEAR_RENDER_TARGET_VIEW)(list.as_raw(), rtv, &[0.1, 0.5, 0.9, 1.0], 0, std::ptr::null());
+                list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: w as f32, Height: h as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+                list.RSSetScissorRects(&[RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 }]);
+                xslot::<SetRootSignature>(list, X_SET_GRAPHICS_ROOT_SIGNATURE)(list.as_raw(), rs.as_raw());
+                list.SetPipelineState(&pso);
+                list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                for _ in 0..3 {
+                    list.DrawInstanced(3, 1, 0, 0);
+                }
+                // consoles want the back buffer in COMMON / PRESENT for PresentX
+                list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
+                list.Close().map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+                submit(&direct, list)?;
+                if frame == TWICE {
+                    // the same closed list again, in its own driver call, before anything is read back
+                    submit(&direct, list)?;
+                }
+
+                // plane 0: { u64 frame token; u32 resource count @8; ID3D12Resource** @0x10 }
+                let resources = [bb.as_raw()];
+                let mut plane = [0u8; 0x40];
+                plane[..8].copy_from_slice(&token.to_le_bytes());
+                plane[8..12].copy_from_slice(&1u32.to_le_bytes());
+                plane[0x10..0x18].copy_from_slice(&(resources.as_ptr() as u64).to_le_bytes());
+                let hr = present(direct.as_raw(), 1, plane.as_ptr(), std::ptr::null());
+                ensure!(hr == 0, "PresentX hr={hr:#x} (frame {frame})");
+                direct.Signal(&direct_f, frame).map_err(|x| format!("gpu.rs:{}: {x}", line!()))?;
+                frame_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            let elapsed = begin.elapsed().as_secs_f64() * 1000.0;
+            fence_reached(&direct_f, frames as u64, &ev)?;
+            fence_reached(&compute_f, frames as u64, &ev)?;
+            fence_reached(&copy_f, frames as u64, &ev)?;
+            Ok((elapsed, frame_ms))
+        })()
+        .map_err(|m| format!("frame {}: {m}", cur.get()));
+        let stop = set_interval(d, std::ptr::null_mut(), 0, 0, 0);
+        let (elapsed, mut frame_ms) = res?;
+        ensure!(stop >= 0, "stopping the frame clock");
+        frame_ms.sort_by(|a, b| a.total_cmp(b));
+        let pct = |p: f64| frame_ms[(((frame_ms.len() - 1) as f64) * p).round() as usize];
+        println!("frames: {frames}, elapsed_ms: {elapsed:.3}, p50_ms: {:.3}, p95_ms: {:.3}", pct(0.5), pct(0.95));
+        Ok(())
+    }
+}

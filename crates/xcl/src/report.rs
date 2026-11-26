@@ -298,6 +298,10 @@ struct Manifest {
     diagnostic: Vec<String>,
     /// the same joined by `,`; `""` for a normal run (runs are compared only when equal)
     compare_key: String,
+    /// `XCL_TELEMETRY_SAMPLE`: GPU stamps on every n-th frame
+    sample: u32,
+    /// lists and frames that got null GPU data, by reason (written at exit)
+    gpu_drops: BTreeMap<String, u64>,
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -790,14 +794,18 @@ mod telemetry_tests {
         let m = new_manifest(&boot, "20261125T180411Z-918d42c1f0aa", Tier::Frame, "2026-11-25T18:04:11Z", switches, None);
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string_pretty(&m).unwrap()).unwrap();
         let o = v.as_object().unwrap();
-        for k in [
+        let keys = [
             "schema", "run_id", "xcl_version", "commit", "commit_source", "dirty", "rust", "profile", "os", "cpu", "cores", "threads", "ram_mb", "adapter", "driver",
             "vram_mb", "wave_lane_count_min", "wave_lane_count_max", "dxc", "title", "title_version", "exe", "log", "tier", "switches", "started", "events_dropped",
-            "present_mode", "window_size", "loop_budget", "loop_counters", "split_wave64", "diagnostic", "compare_key",
-        ] {
+            "present_mode", "window_size", "loop_budget", "loop_counters", "split_wave64", "diagnostic", "compare_key", "sample", "gpu_drops",
+        ];
+        for k in keys {
             assert!(o.contains_key(k), "manifest lacks {k}");
         }
-        assert_eq!(o.len(), 34);
+        for k in o.keys() {
+            assert!(keys.contains(&k.as_str()), "manifest has a key the test does not list: {k}");
+        }
+        assert_eq!(o.len(), 36);
         assert_eq!(o["schema"], 1);
         assert!(o["commit"].is_null() && o["commit_source"].is_null() && o["dirty"].is_null() && o["rust"].is_null());
         assert!(o["cores"].is_null() && o["adapter"].is_null() && o["title_version"].is_null());

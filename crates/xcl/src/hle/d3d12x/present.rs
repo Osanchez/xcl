@@ -1017,6 +1017,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
 }
 
 unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, Option<[i32; 4]>)>)>) {
+    let _telemetry = crate::report::telemetry_present_begin();
     if IN_PRESENT.with(|c| c.replace(true)) {
         return;
     }
@@ -1243,6 +1244,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, Vec<(usize, 
 
 fn frame_shown(w: u32, h: u32) {
     let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
+    crate::report::telemetry_frame_shown(n + 1);
     if super::pso_manifest::present_milestone(n + 1) {
         super::pso_manifest::note(super::pso_manifest::Event::Present { n: n + 1 });
     }
