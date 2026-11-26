@@ -4261,6 +4261,7 @@ fn big_compile_turn(slots: &'static Slots, need: u64, commit_free: impl Fn(u64) 
         }
     }
     let mut waiting: Option<Waiting> = None;
+    let mut parked: Option<super::pso_async::Parked> = None;
     let mut n = slots.n.lock().unwrap();
     loop {
         let is_wanted = wanted();
@@ -4284,6 +4285,9 @@ fn big_compile_turn(slots: &'static Slots, need: u64, commit_free: impl Fn(u64) 
             }
         } else {
             waiting = None;
+        }
+        if parked.is_none() {
+            parked = Some(super::pso_async::park());
         }
         n = slots.cv.wait_timeout(n, LOOK).unwrap().0;
     }

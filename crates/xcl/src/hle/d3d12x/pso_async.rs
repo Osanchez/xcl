@@ -301,26 +301,100 @@ fn drop_unstarted_job(p: &Pending) {
 
 type Work = Box<dyn FnOnce() + Send>;
 
+/// The receiver of the work queue, kept so that more workers can be started (`park`).
+static RECEIVER: OnceLock<Arc<Mutex<mpsc::Receiver<Work>>>> = OnceLock::new();
+/// Worker threads started (the initial pool and the extra ones).
+static WORKERS: AtomicUsize = AtomicUsize::new(0);
+/// Workers now waiting at the big-compile gate.
+static PARKED: AtomicUsize = AtomicUsize::new(0);
+/// Extra workers started so far (names `xcl-pso-x{k}`).
+static EXTRA_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// this thread is one of the pool's workers (initial or extra)
+    static IS_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn worker_loop(rx: Arc<Mutex<mpsc::Receiver<Work>>>) {
+    IS_WORKER.with(|w| w.set(true));
+    loop {
+        let next = rx.lock().unwrap().recv();
+        let Ok(work) = next else { return };
+        while let Some(p) = next_needed() {
+            build_queued(&p);
+        }
+        work();
+    }
+}
+
 fn queue() -> &'static Mutex<mpsc::Sender<Work>> {
     static Q: OnceLock<Mutex<mpsc::Sender<Work>>> = OnceLock::new();
     Q.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<Work>();
         let rx = Arc::new(Mutex::new(rx));
+        let _ = RECEIVER.set(rx.clone());
         // translation recurses deeply on big programs; DXC itself runs on its own pool
         let n = crate::gpu::recomp::dxc::compile_threads();
+        WORKERS.fetch_add(n, Ordering::SeqCst);
         for k in 0..n {
             let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(work) = next else { return };
-                while let Some(p) = next_needed() {
-                    build_queued(&p);
-                }
-                work();
-            });
+            if std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || worker_loop(rx)).is_err() {
+                WORKERS.fetch_sub(1, Ordering::SeqCst);
+            }
         }
         Mutex::new(tx)
     })
+}
+
+/// A worker is short of a free place when fewer than `n` of its `workers` are not parked, up to
+/// `2 * n` threads in all.
+fn extra_needed(workers: usize, parked: usize, n: usize) -> bool {
+    workers.saturating_sub(parked) < n && workers < 2 * n
+}
+
+/// A worker waiting at the big-compile gate, counted until it is dropped.
+pub(super) struct Parked(bool);
+
+impl Drop for Parked {
+    fn drop(&mut self) {
+        if self.0 {
+            PARKED.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The calling worker is about to wait at the gate: count it and, when the queued builds would
+/// otherwise have too few workers, start one more (never exits). Other threads count nothing.
+pub(super) fn park() -> Parked {
+    if !IS_WORKER.with(|w| w.get()) {
+        return Parked(false);
+    }
+    PARKED.fetch_add(1, Ordering::SeqCst);
+    let parked = Parked(true);
+    let Some(rx) = RECEIVER.get() else { return parked };
+    let n = crate::gpu::recomp::dxc::compile_threads();
+    // reserve the place with a compare-and-swap, so two parking workers never take the same one
+    let mut w = WORKERS.load(Ordering::SeqCst);
+    loop {
+        if !extra_needed(w, PARKED.load(Ordering::SeqCst), n) {
+            return parked;
+        }
+        match WORKERS.compare_exchange(w, w + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(now) => w = now,
+        }
+    }
+    let k = EXTRA_STARTED.fetch_add(1, Ordering::SeqCst);
+    let rx = rx.clone();
+    if std::thread::Builder::new().name(format!("xcl-pso-x{k}")).stack_size(64 << 20).spawn(move || worker_loop(rx)).is_err() {
+        WORKERS.fetch_sub(1, Ordering::SeqCst);
+    }
+    parked
+}
+
+/// (worker threads started, workers parked at the gate now)
+pub fn workers() -> (usize, usize) {
+    (WORKERS.load(Ordering::SeqCst), PARKED.load(Ordering::SeqCst))
 }
 
 fn enqueue(p: Arc<Pending>) {
@@ -995,6 +1069,70 @@ mod used_tests {
     }
 
     static WORKER_SATURATION_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn extra_workers_follow_the_parked_count() {
+        assert!(!extra_needed(15, 0, 15));
+        assert!(extra_needed(15, 1, 15));
+        assert!(!extra_needed(16, 1, 15));
+        assert!(!extra_needed(30, 16, 15));
+    }
+
+    /// With every worker parked at the gate, a job queued meanwhile still runs.
+    #[test]
+    fn queued_work_runs_while_every_worker_is_parked() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::time::{Duration, Instant};
+
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        let before = workers().1;
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut blockers = Vec::with_capacity(n);
+        for k in 0..n {
+            let standin = 0x7E57_9730usize + k;
+            let gate = gate.clone();
+            submit(standin, false, Box::new(move || {
+                let _parked = park();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut open = gate.0.lock().unwrap();
+                while !*open {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    open = gate.1.wait_timeout(open, left).unwrap().0;
+                }
+                0x9730 + k
+            }));
+            blockers.push(standin);
+        }
+        let start = Instant::now();
+        while workers().1 < before + n && start.elapsed() < Duration::from_secs(4) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(workers().1 >= before + n, "every job parked");
+        assert!(workers().0 <= 2 * n, "never more than 2 * compile_threads workers");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let target = 0x7E57_973Fusize;
+        submit(target, false, Box::new(move || {
+            let _ = done_tx.send(());
+            0x973F
+        }));
+        let ran = done_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        for standin in blockers.iter().copied().chain(std::iter::once(target)) {
+            let start = Instant::now();
+            while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            released(standin);
+        }
+        assert!(ran, "queued work ran while every worker was parked");
+        assert_eq!(workers().1, before, "parked count returns");
+    }
 
     /// A queued normal worker job whose stand-in was released before a worker starts it is
     /// skipped as orphaned instead of entering the compiler.
