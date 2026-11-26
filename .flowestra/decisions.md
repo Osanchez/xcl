@@ -4835,3 +4835,61 @@ shorter than R-A's.
 | 6 | as 3, telemetry off | same growth: 82 GB commit; title asserts on E_OUTOFMEMORY at 194.5 s, device removed |
 
 The memory growth of runs 4-6 is not covered by this entry.
+
+## 2026-11-26 Memory growth in the intro: adopt the upstream allocator-pool fixes (user chose "all four now")
+
+Measured on the RTX 5080 PC (16 GB, 63 GB RAM, driver 32.0.16.2140), switches of run 3
+(`XCL_PSO_WAIT_MS=50`, `XCL_HUGE_PSO_CONCURRENCY=4`, `XCL_HUGE_PSO_WANTED_CONCURRENCY=6`,
+`XCL_PSO_PRELOAD=0`). Not tested on AMD.
+
+### Problem
+
+From the first intro frames (about 120 s) process commit grows by 0.6-0.8 GB/s and non-local video
+memory from 6 GB to 45 GB in about 60 s, while every pool on the `memory:` log line stays flat.
+
+| Run | Difference | Non-local at about 190 s | End |
+|---|---|---|---|
+| 4 | telemetry all | 44.6 GB | device removed 0x887A0001 at 190 s |
+| 5 | + `XCL_DEVICE_TYPE=lockhart` | 45.9 GB | closed by hand |
+| 6 | telemetry off | 45.4 GB | XCL's split `Close` returns E_OUTOFMEMORY, the title asserts, device removed at 194.5 s |
+| 7 | build d045a094, + `XCL_ALLOC_SWAP=0` | 16.3 GB (17.3 GB at 238 s) | still presenting at 250 s |
+
+So it is not telemetry and not the console profile. Run 7 confirms the cause named by the Opus
+debug worker (analysis in the session scratch folder, citations against 99a76e3e):
+
+- `alloc_pool` swaps the PC command allocator behind a title allocator when the title resets it
+  while lists still hold recordings on it. A put-aside allocator is reused only when no list is
+  still a user of it, and only by the same title allocator (`alloc_pool.rs:34-35`, `:289`). It is
+  never Reset or Released while the title allocator lives (`:317`); busy ones are leaked on
+  `forget` (`:250`).
+- XCL's own extra lists (split segments, stand-ins, put-off segments in `title_list`'s spare
+  pools) stay users of the allocator they last recorded on. So almost every swap makes a new
+  allocator: about 25 a second in runs 4-6, 5-8 MB of non-local each.
+- Dispatches put off to the submit add a PC list and an own allocator each (the amplifier).
+
+Run 7 still rises by about 10 GB of non-local when the intro starts; that part is not explained yet.
+
+### Decision
+
+Adopt through `scripts/dev/merge-pr.py`, after the stall-fix units U4 and U6 are committed:
+
+| PR | Change | Size |
+|---|---|---|
+| #2725 | a title allocator takes a free spare another one put aside | +44 -3 |
+| #2549 | a reused spare keeps the allocator of deferred work still on the GPU | +128 -1 |
+| #2581 | with bounded pipeline waits, dispatches are not put off to the submit | +13 |
+| #2707 | detach retired segments and reclaim idle put-aside allocators | +942 -61 (over the usual size; the user chose to take it now) |
+
+On a merge conflict the user is told before it is resolved.
+
+### Acceptance
+
+Run 6's settings without `XCL_ALLOC_SWAP=0` on the merged build: non-local video memory stays
+under 20 GB for 300 s after the first intro frame, no `Close` failure, no device removal.
+
+### Later
+
+- An `allocators` telemetry event (made, live, put aside free/busy, orphaned) is specified after
+  the adoptions, against the merged `alloc_pool`.
+- A commit and video-memory budget with back-pressure (option C of the analysis) once usage has
+  settled.
