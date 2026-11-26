@@ -4164,3 +4164,674 @@ Tree: xcl-adopt at HEAD 96388e40 plus part 3. I worked this out by reading the c
   - The first submission's split passes stay poisoned through `poisoned`, because their stamps can be overwritten.
   - Test (no GPU): `pass_facts(&PassRec::new(1, 1), &PassCtx { resubmitted: true, start: Some(10), end: Some(20), ..ctx() }, &|t| Some(t as f64))` returns one pass with ticks 10..20 and `why` None. A rec with `total = 1` still gives `why: "resubmitted"`.
 - **Cheapest runtime check: none exists that decides this directly.** Close and Reset on wrapper lists are not traced, `XCL_LIST_TRACE` logs only when a Close fails, and the #35 log is written once. The check needs one temporary line, which the orchestrator must allow first: `crate::xlog_info!("title_list reset {primary:p}")` at title_list.rs:170 (`if hr >= 0 {`). If `0x414E0C0` never appears after start-up while the title keeps submitting it, (1) is confirmed.
+
+## 2026-11-26 Stall fix: frames through loading and into the world by default (user approved all units, and "wait" as the default for compute)
+
+Approved by the user on 2026-11-26 after runs 1-6 on the RTX 5080 (driver 32.0.16.2140, build
+99a76e3e). Decisions the user made: approve all units; by default a compute pass whose pipeline
+is still building is waited for (option C1), skipping stays the opt-in `XCL_PSO_WAIT_MS`.
+Adoptions through the gate: #2579, #2098, #2698 and #751. Units below keep their ids (U0-U9).
+The draft was written by an Opus design worker and reviewed by the orchestrator (citations
+spot-checked: `bind.rs:270-278`, `bind.rs:586-592`, `pso_async.rs:214-223`, `run3/log.txt:1186`,
+`1228`, `1397-1411`).
+
+Status: draft for review. Nothing here is built or run. Paths are `crates/xcl/src/...` on `dev`
+(094cbbbb, same code as the runs' 99a76e3e). Run data: `/Users/osanchez/xcl-pc/out/runs/runN/`.
+Upstream PRs were read as text with `gh pr view/diff -R xcl-dev/xcl` on 2026-11-26.
+
+### Summary (recommendation first)
+
+**Recommendation.** Write our own changes for draws, the gate and the worker pool. Adopt only
+three small upstream PRs through the gate: #2698, #2579 and #2098. Do not adopt #1798, #2615,
+#1931 or #2114.
+
+1. **Draws (option A): no title thread ever builds a pipeline.** A draw or graphics
+   ExecuteIndirect that binds an unbuilt pipeline waits only inside a **shared per-frame budget
+   of 100 ms** (all threads together, reset at each present). Then it gets the stand-in, which
+   draws nothing. The build goes to the front of the workers' queue, marked wanted.
+2. **Compute (options B, C): keep waiting at the submit, but only for a worker.** The submit
+   thread never builds. Put-off builds are wanted from the moment they are put off (#2579).
+   Preloads may hold at most one big-compile slot, and none while a wanted build waits. Slot
+   defaults scale with cores (#2098) and with RAM (ours). Big compute programs that write only
+   images are skipped by default (`XCL_PSO_IMAGE_SKIP` on). A 120 s safety valve skips a dispatch
+   whose build never finishes.
+3. **The 90-110 s gap in run 3 has two causes.** The first is the per-bind 50 ms budget, paid
+   once per new pipeline, one after another: 335 graphics waits took 14.7 s and then 256 or more
+   compute waits took 12.9 s. Item 1 removes this. The second is **worker starvation**: at the
+   end all 15 `xcl-pso` workers sat on huge compute builds (6 in the NVIDIA compiler, 9 parked
+   in `big_compile_turn`), so no graphics pipeline was built after 100 s. Items 1 and 2 do not
+   fix that. New unit U7 does: a worker that parks at the gate is replaced by an extra worker.
+4. **`XCL_RUN_SECONDS` / `XCL_STALL_DUMP` always end the run.** Each arms a terminate watchdog
+   first, before the log line, the report and `end_title`.
+5. **Telemetry proves it.** New `frame` and `activity` fields: draws and dispatches left out
+   for unbuilt pipelines, wait time split into draw and dispatch, builds on title threads
+   (target 0), and workers parked at the gate. `pipeline` build events get `by` and `wanted`.
+
+Nothing is keyed on a vendor. On a GPU whose driver compiles fast, the budget is rarely used up,
+draws are rarely left out, compute waits are short and no extra workers start.
+
+### 1. Goal and scope
+
+**Goal.** With default switches, the title keeps presenting through its loading screen and
+reaches in-world frames. No title thread enters DXC or the driver compiler for a pipeline build.
+
+**In scope.**
+- What a draw, a graphics ExecuteIndirect, a dispatch and a dispatching ExecuteIndirect do
+  when their pipeline is not built.
+- Who builds pipelines, in what order, and how many huge compiles run at once.
+- Making `XCL_RUN_SECONDS` and `XCL_STALL_DUMP` always end the process.
+- Telemetry that shows all of the above per frame and per 2 s.
+
+**Out of scope (stated explicitly).**
+- The texture-upload crash at 131.97 s in run 3 (`run3/log.txt:1288`). Another worker owns it.
+- DirectStorage submit timing.
+- The unmodelled queue method `ID3D12GraphicsCommandList10::#101` (`hle/d3d12x/real.rs:775-780`).
+- Heap windows (option D, #2427/#2428, `XCL_HEAP_WINDOWS`).
+- Pipeline persistence (option E, #758/#759/#1006/#2001).
+- Shader size and the cost of each compile.
+- `XCL_PSO_WAIT_MS` stays as an opt-in switch with today's meaning. Its put-off problem (#2581)
+  is not fixed here.
+
+### 2. Architecture and data flow
+
+#### Today
+
+- **Create.** With lazy pipelines (default, `hle/d3d12x/pso_async.rs:383-386`) the title gets a
+  stand-in. The build is stored, not queued (`submit_lazy`, `hle/d3d12x/real.rs:5748`).
+  Pipelines an earlier run used go to 2-4 `xcl-pso-pre-*` threads at the lowest priority
+  (`pso_async.rs:509-563`).
+- **SetPipelineState** calls `resolve` (`real.rs:7062`). This sends the build to the back of the
+  workers' FIFO (`pso_async.rs:1057-1069`, `enqueue` at `322-324`).
+- **Draw.** `graphics_bound` calls `resolve_wait` (`hle/d3d12x/bind.rs:552`). With
+  `XCL_PSO_WAIT_MS` unset there is no budget (`pso_async.rs:1125-1128`). If no worker has
+  started the job, the draw takes it and builds it on the title thread (`pso_async.rs:1100-1104`),
+  then waits without a limit (`1106-1110`).
+- **Graphics ExecuteIndirect** does the same through `resolve_wait` (`bind.rs:278`).
+- **Dispatch.** A pending compute pipeline's dispatch is put off to the submit
+  (`bind.rs:879-881`, `list_x.rs:2704-2714`) and `need_by_submit` puts the build in `NEEDED`
+  (`pso_async.rs:1377-1384`). Workers drain `NEEDED` before each FIFO item (`pso_async.rs:312-314`).
+  At the submit, `record_deferred` marks the next 4 put-off builds wanted (`list_x.rs:2717-2729`)
+  and records each call through `bind::dispatch` → `resolve_wait` (`list_x.rs:2762`). With no
+  budget the submit thread may again build the job itself.
+- **Gate.** A driver compile of 256 KB or more on an `xcl-pso*` thread with no driver blob waits
+  in `big_compile_turn` (`real.rs:4148-4150`, `4194-4206`). Unwanted: 1 slot
+  (`real.rs:4072-4075`) and 3 GB free commit (`real.rs:4213-4229`). Wanted: 2 slots
+  (`real.rs:4081-4087`), no commit check. 4 MiB and more: a lane of 1 (`real.rs:4124-4129`).
+  Graphics and compute share the 256 KB lane (`real.rs:5378`). Preloads compete for it as
+  unwanted builds.
+- **A worker waiting at the gate keeps its thread.** The pool has `compile_threads()` workers
+  (cores - 1, `gpu/recomp/dxc.rs:409-415`; `pso_async.rs:300-320`). Nothing replaces a parked one.
+
+#### What the runs show
+
+| Run | Switches | Result | Cause in the data |
+|---|---|---|---|
+| 1 | default | 0 presents from 201.7 s to the copy at 293 s | title thread 18196 builds graphics in its draws, 24 holds of 1.4-6.5 s back to back (`freeze-analysis.md` Q1) |
+| 2 | default, soak | last frame 42 s after "press A", then 1,322 s with none, closed by hand | 316 graphics waits, 1,281.8 s in all, 294 built in the call, longest 19.5 s (`run2/log.txt:4631`) |
+| 3 | E4: `XCL_PSO_WAIT_MS=50`, `XCL_HUGE_PSO_CONCURRENCY=4`, `..._WANTED_CONCURRENCY=6`, `XCL_PSO_PRELOAD=0` | frames to ~86.7 s, one frame of 32.2 s (`frame` i=2121, `pso_wait_ms` 33,304), then 13 in-world frames to 132 s; crash at 131.97 s | see section 2.1 |
+
+#### 2.1 The run 3 gap (item 3)
+
+Times are from `run3/log.txt` and `run3/events.jsonl`.
+
+1. **86.8-100 s: graphics waits, one at a time.** The render thread (31276) waits 50 ms per new
+   graphics pipeline (first at `log.txt:810`). By 100.26 s: 335 graphics waits, 14,708 ms, longest
+   51 ms, 0 built in the call (`log.txt:1186`). Activity shows 0 presents and 0 submits from
+   90 s (`log.txt:1144`). The title records about one draw per wait.
+2. **100-113 s: compute waits at the submit, one at a time.** The submit thread (36692) records
+   the put-off dispatches. Each waits 50 ms. 256 compute waits, 12,854 ms, by 112.94 s
+   (`log.txt:1228`).
+3. **Meanwhile the workers build compute, not graphics.** From 86.7 to 100 s the workers made
+   336 compute pipelines (184 from blobs) and only 28 graphics. From 100 to 140 s they made
+   **0 graphics** pipelines (`pipeline` events). Put-off compute goes through `NEEDED`, ahead of
+   the FIFO that holds the graphics builds.
+4. **At the crash (132 s) every worker holds a huge compute build.** `xcl-pso-0, -2, -3, -5, -6,
+   -11` are in the NVIDIA compiler. The other nine wait in `big_compile_turn`
+   (`log.txt:1397-1411`). No worker is free for a graphics build. That is why 110-132 s show
+   280-357 draws per frame but thousands left out.
+5. Commit grows from 30.4 to 34.7 GB with 0 submits (90-118 s). That is the driver compiles.
+
+**Do items 1-2 remove it?** Item 1 (shared 100 ms budget) bounds cause 1 to 100 ms per frame.
+Cause 2 changes: compute waits until built (item 2), so its length becomes the build time of the
+compute the submit needs. Cause 3-4 is **not** removed by items 1-2. U7 (extra workers when
+workers park at the gate) is needed. U6 (graphics get their own big-compile lane) keeps a
+graphics build from waiting behind compute slots.
+
+#### After
+
+```
+SetPipelineState ── resolve ──> FIFO (as today)
+Draw / graphics EI ── resolve_draw ──> built?  yes: real pipeline
+                                       no:  want + NEEDED front; wait <= frame allowance (100 ms
+                                            shared per present); then stand-in, draw left out
+Dispatch / compute EI ── pending? ──> put off (as today) + wanted now (#2579)
+    submit: record_deferred ── resolve_wait ──> want + NEEDED front; wait for the worker
+                                               (never build here); after 120 s: skip, warn
+    image-only big program: never waits, never put off, skipped until built
+Workers: NEEDED first, then FIFO. A worker that must wait at the gate parks; if fewer than
+    n workers are unparked, one extra worker starts (at most 2n threads).
+Gate: compute lane (base / base+1), graphics lane (base / base+1), giant lane (1).
+    Preloads: at most 1 slot of a lane, and none while a wanted build waits.
+    base = min(clamp(cpus/4, 1, 4), max(1, RAM GiB / 12)).
+```
+
+### 3. Dependencies
+
+#### 3.1 Upstream PRs, one by one
+
+| PR | State | Size | Tests | Applies to dev? | Review comments | Defects I see | Decision |
+|---|---|---|---|---|---|---|---|
+| #1798 draws use `resolve_for_bind` | open, CONFLICTING | +38 -4, `bind.rs` | 1 unit test, timing based (1.5 s sleep) | No. Its `bind.rs:253-256` hunk predates our `telemetry_indirect` call site and #2118's put-off (`bind.rs:270-277`); its `graphics_bound` hunk predates `telemetry_draw` (`bind.rs:553`) and `two_pass_of` | Linux RADV: graphics wait gone, title then stuck on compute builds on the title thread. RTX 3060 Windows: past main's stop, then `DXGI_ERROR_DEVICE_HUNG` at 144.9 s (not tied to it). | No wait at all, no budget. It does not mark the build wanted, so a huge graphics build stays unwanted at the gate. Compute still builds on the title thread (`resolve_for_bind` → `resolve_wait`). | **Do not adopt.** Take the idea. |
+| #2615 a bind never builds on the title thread | open, MERGEABLE vs main | +179 -86, 7 files | 1 new test, list_x and e2e tests changed | No. Its `resolve_wait_for` hunk removes the inline-build block that our #899 adoption changed (`already`, `OpenWait`, `note_blocked`, `pso_async.rs:1086-1122`; merge `db65000d`). | AMD RDNA2: presents to 361 s, 12-14 % of dispatches skipped. Linux RTX 4060 Ti with #2404: 18 of 18 runs lost the device (one control without it also did). Linux RTX 4070: 1 of 3 lost the device. | It makes **compute** skip by default and turns off the put-off for everyone (`waits_until_built()` false). That ignores the hang warning at `pso_async.rs:1168-1169`. Good parts: it wants the build before sending it, and no title thread builds. | **Do not adopt.** Take `resolve_unwaited`'s order (want, then send). |
+| #1931 opt-in `XCL_PSO_FRAME_WAIT_MS` | open, CONFLICTING | +124 -7 | 1 unit test | No (old `pso_async.rs` base, before shared stand-ins) | RTX 4090: past the stop at 500 ms, then a crawl; 163 `queue.Wait` watchdog lines; peak commit 46.9 GB; one crash with a warm cache. | The budget is taken after the wait ends, so several threads can each wait the whole remainder at once. Opt-in only. | **Do not adopt.** Own budget in U4. |
+| #2114 per-frame cap | open, CONFLICTING | +474 -39 | 6 unit tests | No | Reviewer: the cap is per thread (`thread_local!`), not per frame; it changes the default to skip compute (250 ms / 2,000 ms). RTX 4080: no device removal, presents to 134 s. | Over the 400-line limit. Skips compute by default. | **Do not adopt.** |
+| #2579 put-off builds are wanted at once | open, MERGEABLE | +26 -20, 3 files | `a_build_a_submit_needs_is_wanted` (red without the change, confirmed by a reviewer on RX 7800 XT) | Yes. Its `record_deferred` context matches `list_x.rs:2716-2729`. `want_bound` / `pso_async::want` have no other callers (`bind.rs:125-127`, `list_x.rs:2728`). | Collaborator: "good within the reviewed scope". Gate waits after `#101` fell from 1,064-1,079 s to 161-342 s (cap 6, Linux). A reviewer notes it competes with every put-off build at a cap of 2. | More builds skip the commit check at once (least free RAM 7-8 GB against 13 GB). Bounded by the wanted cap. | **Adopt** (gate). |
+| #2098 slots scale with CPUs | open, MERGEABLE | +170 -39, `real.rs`, README | 4 new unit tests, reservation tests | Probably. Its `real.rs` hunks sit at `real.rs:4066-4214` on our tree; the gate's merge check decides. | RTX 5070 Ti: 7 programs 87.5 s → 38.8 s at 4. RDNA4: 2.6x at 4, but **2.3 GB per extra build**. A 16-thread RTX 5080 peaks at 4. | Wanted builds still skip the commit check (they reserve, though). No RAM term: a 16 GB, 16-thread AMD machine gets 4 slots. | **Adopt** (gate), then U6 adds the RAM term. |
+| #1996 cap of 2 for wanted | **merged** 2026-11-25 | +127 -68 | in `big_compile_tests` | Already in dev (`real.rs:4077-4087`, `4232` on) | - | - | Kept; #2098 changes its default to base+1. |
+| #2698 watchdog ends through the real `NtTerminateProcess` | open, MERGEABLE | +53 -1, `eh.rs`, `real.rs` | `the_process_ends_while_another_thread_holds_the_heap` (red with the old ending) | Probably; small. | Linux: 3 of 4 runs without it never exited. | None seen. Conflicts with #967 by design (same function name). | **Adopt** (gate) before U1. |
+| #2581 no put-off with `XCL_PSO_WAIT_MS` | open, MERGEABLE | +13 | 1 test changed | Yes | RTX 3050: `Close` → `E_OUTOFMEMORY` and device removal with `XCL_PSO_WAIT_MS=1` without it. | - | Not needed for the default. Optional later. |
+
+Ideas only, no code: a sibling GPL-3.0 project gives slow pipelines a quarter of the workers and
+shares a 500 ms per-frame wait across threads. U4's shared budget and U7's extra workers are
+written from this spec, not from that project.
+
+#### 3.2 Order
+
+1. Gate: adopt #2698, #2579 and #2098 (the user's `scripts/dev/merge-pr.py`). They touch
+   different files except that #2579 and #2098 do not overlap at all.
+2. U1 after #2698. U2 (telemetry fields that need no new counters) at any time.
+3. U4 after #2579 (both edit `pso_async.rs` near `need_by_submit`).
+4. U6 after #2098 (both edit the gate in `real.rs`).
+5. U5 after U4 (same functions in `pso_async.rs` and `bind.rs`).
+6. U7 after U5 and U6 (`pso_async.rs` worker loop and one line in `real.rs::big_compile_turn`).
+7. U8 (counters for unbuilt draws/dispatches and parked workers) after U7.
+8. Docs unit U9 (README, `docs/guide/telemetry.md`) last.
+
+### 4. Constraints
+
+- **Performance.** The title's frame cost from pipeline waits is at most the draw budget
+  (100 ms) plus compute build time on frames that need a new compute pipeline. No title thread
+  runs DXC or the driver compiler.
+- **Compatibility.** `XCL_ASYNC_PSO=0` and `XCL_LAZY_PSO=0` keep today's behaviour.
+  `XCL_PSO_WAIT_MS=<ms>` keeps its meaning for both kinds (per-bind bound, late mark). When it is
+  set, a draw waits `min(XCL_PSO_WAIT_MS, frame allowance)`.
+- **Memory.** Run 3 reached 42 GB commit with 4/6 slots (`activity` at 132 s) and 15,168 of
+  15,200 MB video memory. #2098 measured 0.34 GiB per extra huge compile on NVIDIA and 2.3 GB on
+  RDNA4. The RAM term (one slot per 12 GiB) caps a 16 GB machine at 1 slot, 2 when wanted.
+  Extra workers reserve 64 MB of stack each (`pso_async.rs:309`), virtual, not commit: at most
+  15 extra here.
+- **The title's 30 s watchdog.** It counts the time of the title's `Sleep`. While a bind waits,
+  `title_held()` is true and `kernelx::Sleep` does not count that time (`pso_async.rs:216-222`,
+  `hle/kernelx.rs:1529-1541`). Long compute waits at the submit stay inside `Held`. The 120 s
+  safety valve is far above 30 s on purpose: the watchdog is already paused.
+- **Platform.** The crate builds and runs on Windows only. This Mac cannot build or test it.
+  Every acceptance check runs on the Windows PC.
+- **Repo rules.** One logical change per PR, under about 400 changed lines, a test with every
+  logic change, no `cargo fmt`. Telemetry code goes in `telemetry_gpu.rs` / `telemetry_run.rs`
+  (and the appended parts of `log.rs`); upstream files get one-line call sites.
+
+### 5. Considerations
+
+- **What could hang the GPU.**
+  - Skipping a compute pass whose counts or arguments a later ExecuteIndirect reads
+    (`pso_async.rs:1162-1169`). This spec keeps waiting for compute that writes memory. Only
+    image-only big programs (`gpu/effects.rs:99-105`) are skipped by default. They write no
+    buffer, so no ExecuteIndirect can read stale counts from them.
+  - The 120 s safety valve can skip such a pass. It fires only for a build that has not
+    finished after 120 s. Without it the run stalls forever (#2615 saw an AMD compile that never
+    finished in 466 s). It logs a warning and an `error` of kind `pipeline_wait_expired`.
+  - A draw left out is safe for the GPU. Its occlusion query is forced visible
+    (`list_x.rs:225-237`, called at `bind.rs:589-591`).
+  - Upstream reports device losses after the title passes its old stop with #1798 (RTX 3060) and
+    #2615 (Linux NVIDIA). None is tied to the change. Our acceptance run checks for removals.
+- **The first in-world frame can still take long.** It waits for every compute pipeline it needs
+  that writes memory. On a cold cache with N huge programs of ~10 s each and 4-5 slots, that is
+  about N × 10 / 4.5 s. The second run has driver blobs and is fast (`freeze-analysis.md` Q5).
+  This is the price of not risking a GPU hang. The alternative (C2 below) trades it for that risk.
+- **Draws left out for long.** If a graphics build is slow, its geometry is missing for that long.
+  On the loading screen this can mean a missing logo for a few frames.
+- **Budget accounting across threads.** Waits on different threads at the same time overlap in
+  wall time. The shared counter adds their elapsed times, so the sum can exceed 100 ms while the
+  frame is delayed about 100 ms. Sequential waits are capped at 100 ms in total.
+- **Race in ExecuteIndirect.** It reads `is_pending` after resolving (`bind.rs:278`, `286`). A
+  build that ends between the two sends the stand-in to the PC call. U4 uses the resolve result
+  instead (as #2615's description says #2598 does).
+- **Preloads.** With the restriction, an earlier run's 1 MB preload can still hold one slot for up
+  to 34 s (run 1). It cannot start while a wanted build waits.
+- **Deadlock.** A wanted build never waits for commit (`real.rs:4198-4201`), and slots always free.
+  Preload restriction only makes preloads wait. Extra workers are bounded at 2n.
+- **Open risk.** The 9-10 DXIL instructions per console instruction make cold compute builds
+  slow (`freeze-analysis.md` Q4). That stays.
+
+#### Alternatives considered (with tradeoffs)
+
+| Choice | Option | For | Against | Decision |
+|---|---|---|---|---|
+| Draw wait | A1 none (#1798/#2615) | simplest, frames never wait | on a fast driver many first draws are left out that 10-50 ms would have saved | rejected |
+| | A2 fixed per bind (`XCL_PSO_WAIT_MS=50`) | exists | multiplies: run 3 paid 335 × 44 ms = 14.7 s with no frame | rejected |
+| | **A3 shared per frame, 100 ms** | bounded frame cost; a fast driver finishes small builds inside it | a few more ms per frame on a slow driver | **chosen** |
+| Compute | C1 wait for a worker at the submit | no GPU-hang risk from skipped passes | first in-world frame waits for the compute it needs | **chosen**, with image-only skip and 120 s valve |
+| | C2 bound compute like draws | frames flow sooner | the hang risk the source warns about; #2581's put-off memory failure with a bound | rejected; stays opt-in as `XCL_PSO_WAIT_MS` |
+| Starvation | dedicated graphics workers (n/4) | simple | small compute the submit needs can still starve behind parked huge compute | rejected |
+| | **extra worker when one parks** | fixes both kinds | up to 2n threads | **chosen** |
+
+### 6. Work breakdown
+
+Each unit is one PR. Line numbers are on `dev` 094cbbbb; after earlier units land, find the
+code by the function names given.
+
+#### U0. Gate adoptions (no code written by us)
+
+- **Inputs:** #2698 (`eh.rs`, `real.rs`), #2579 (`pso_async.rs`, `list_x.rs`, `bind.rs`),
+  #2098 (`real.rs`, README).
+- **Outputs:** three merges into `dev` through `python scripts/dev/merge-pr.py <N>`, run by the
+  user. Never `git merge` / `cherry-pick` them by hand.
+- **Acceptance:** each merge builds on the PC; `cargo test -p xcl --lib -- pso_async:: list_x::
+  bind:: big_compile_tests eh::` passes; their own tests are among them
+  (`a_build_a_submit_needs_is_wanted`, `default_huge_pso_slots_scale_with_available_cpus`,
+  `a_wanted_huge_compile_has_a_slot_above_the_background_ones`,
+  `the_process_ends_while_another_thread_holds_the_heap`).
+
+#### U1. `XCL_RUN_SECONDS` and `XCL_STALL_DUMP` always end the run (option F)
+
+- **Inputs:** `host.rs:149-191`; `eh::end_process_now` from #2698.
+- **Files:** `host.rs` only.
+- **Change.**
+  1. Add to `host.rs`:
+     ```rust
+     /// The process ends `after` from now whatever the rest of the ending does.
+     fn arm_end_watchdog(after: std::time::Duration, fire: impl FnOnce() + Send + 'static) {
+         let _ = std::thread::Builder::new().name("xcl-run-end-watchdog".into()).spawn(move || {
+             std::thread::sleep(after);
+             fire();
+         });
+     }
+     const END_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+     ```
+  2. In the `XCL_RUN_SECONDS` thread, right after the `sleep` and before `counters()` and the
+     log line: `arm_end_watchdog(END_GRACE, || crate::eh::end_process_now(0));`.
+  3. In the `XCL_STALL_DUMP` thread, right after `stalled(...)` is true and before the
+     `xlog_warn!`: `arm_end_watchdog(END_GRACE, || crate::eh::end_process_now(0));`.
+  4. Leave the order of the other steps as it is. `telemetry_end` is already before
+     `write_final` in the run-seconds thread (`host.rs:186-187`).
+- **Why 30 s.** `end_title`'s own watchdog is 15 s after `end_title` starts (`real.rs:3599-3609`).
+  30 s leaves `write_final` 15 s before the backstop cuts the drain short.
+- **Tests (`host.rs` `mod tests`):**
+  - `an_armed_end_watchdog_fires_while_the_ending_blocks`: arm with 50 ms and a closure that
+    sends on a channel; then block the test thread on `recv_timeout(2 s)`; assert it got the
+    message within 2 s.
+  - `an_armed_end_watchdog_waits_its_time`: arm with 300 ms; assert nothing arrives in 100 ms.
+- **Acceptance:** the two tests pass; `telemetry_e2e::a_normal_run_ends_with_end_and_exit`
+  still passes; on the PC, a run with `XCL_RUN_SECONDS=600` that stalls (default switches, as
+  run 2) exits by 630 s with `end.reason` `run_seconds`, or with an `exit` event if `write_final`
+  blocked.
+- **Size:** about 30 lines.
+
+#### U2. Telemetry fields that need no new counters
+
+- **Files:** `telemetry_gpu.rs`, `telemetry_run.rs`, the appended telemetry part of `log.rs`
+  (`FrameFacts` at `log.rs:721`, `PipelineFacts` at `log.rs:797`, `frame_fields` at `827`,
+  `pipeline_fields_built` at `940`).
+- **Change.**
+  1. `frame`: add `pso_wait_draw_ms` and `pso_wait_dispatch_ms`, from
+     `pso_async::blocked()[0][1]` and `[1][1]` (µs, deltas per frame, as `pso_us` is taken in
+     `Counters::now`, `telemetry_gpu.rs:2694-2700`). Keep `pso_wait_ms` as their sum.
+  2. `pipeline` (build shape): add `by`: from the current thread's name in
+     `telemetry_pipeline_built` (`telemetry_gpu.rs:2406`): `preload` for `xcl-pso-pre-*`,
+     `extra` for `xcl-pso-x*` (U7), `worker` for other `xcl-pso*`, `xcl` for other `xcl-*`,
+     else `title`. Add `wanted`: `crate::hle::d3d12x::pso_async::wanted_here()()` taken at
+     the start of the function.
+  3. `activity` (written by `telemetry_run.rs` every 2 s): add `pso_wait_ms` (delta of the sum),
+     and `builds_title` (count of `pipeline` builds with `by` = `title` since the last
+     `activity`). Keep a static counter in `telemetry_gpu.rs` bumped in `telemetry_pipeline_built`.
+- **Tests:** unit tests next to the existing `frame_fields_serialise_flat_with_nulls`
+  (`log.rs:1087`): the new fields serialise flat and null-safe; a test of the thread-name
+  mapping (a pure `fn built_by(name: Option<&str>) -> &'static str`) for the five cases.
+- **Acceptance:** `cargo test -p xcl --lib -- log:: telemetry` passes;
+  `telemetry_e2e::telemetry_frame_events_match_the_run` passes and its frames carry the two new
+  fields.
+- **Size:** about 120 lines.
+
+(There is no U3: the adoptions it would have held are in U0.)
+
+#### U4. Draws never build and wait only inside a shared frame budget (option A)
+
+- **Inputs:** `pso_async.rs` after #2579; `bind.rs:269-330`, `548-592`.
+- **Files:** `hle/d3d12x/pso_async.rs`, `hle/d3d12x/bind.rs`.
+- **Change in `pso_async.rs`.**
+  1. A process-wide frame budget:
+     ```rust
+     /// Draw waits per shown frame, all threads together (`XCL_PSO_FRAME_WAIT_MS`, default 100;
+     /// 0: a draw never waits).
+     fn frame_wait_budget() -> std::time::Duration  // OnceLock, parse u64 ms, default 100
+     /// (frames shown when the spending began, µs spent)
+     static FRAME_SPENT: Mutex<(u64, u64)> = Mutex::new((0, 0));
+     /// What is left for frame `frame` (resets when `frame` differs from the stored one).
+     fn frame_allowance(frame: u64) -> std::time::Duration
+     /// Adds `spent` to frame `frame` (ignored if a newer frame has started).
+     fn frame_spend(frame: u64, spent: std::time::Duration)
+     ```
+     The frame number is `super::present::presents()` (`present.rs:1269`). No change to
+     `present.rs`.
+  2. A helper that moves a build to the front, used by U4 and U5:
+     ```rust
+     /// A title thread needs `p` now: wanted, and ahead of the workers' FIFO.
+     fn need_now(p: &Arc<Pending>) {
+         p.want();
+         if !std::mem::replace(&mut p.demand.lock().unwrap().by_submit, true) {
+             NEEDED.lock().unwrap().push_back(p.clone());
+             let _ = queue().lock().unwrap().send(Box::new(|| ()));
+         }
+         p.sent.store(true, Ordering::Release);
+     }
+     ```
+     `need_by_submit` (after #2579 it calls `want()`) becomes a call to `need_now`.
+     `sent` is set so a later `resolve` does not enqueue it again; the worker that takes it
+     from `NEEDED` builds it (`build_queued` takes `job`; a second taker finds `None`).
+  3. The draw resolve:
+     ```rust
+     /// The pipeline a draw or graphics ExecuteIndirect uses now, and whether it is not built
+     /// (the stand-in). A compute pipeline goes to `resolve_wait`.
+     pub fn resolve_draw(pso: usize) -> (usize, bool)
+     ```
+     - `entry(pso)` is None: `(pso, false)`.
+     - `p.compute`: `let r = resolve_wait(pso);` then return `(r, is_pending(pso))`.
+     - Built (`real != 0`): `(real, false)`. Build failed (`done` and `real == 0`):
+       `(p.stand(pso), false)`.
+     - Not built: call `need_now(&p)`. Then the allowance is
+       `frame_allowance(frame)`, capped by `wait_budget()` when that is set. If the
+       pipeline is `late`, or the allowance is zero: return `(p.stand(pso), true)` at once and
+       do **not** set `late`. Otherwise wait on `p.cv` up to the allowance, inside `Held::new()`
+       and an `OpenWait` (kind graphics, `built_here` false), then `frame_spend(frame,
+       elapsed)` and `note_blocked(false, false, elapsed)`. If it is built now, return
+       `(real, false)`. If not, set `late` and return `(p.stand(pso), true)`.
+     - Never take `p.job`.
+  4. In `resolve_wait_for` (the `budget == None` path, `pso_async.rs:1100-1104` today), a
+     **graphics** entry no longer takes the job: replace with `need_now(&p)` and wait. (U5 does
+     the same for compute; doing graphics here keeps any other graphics caller of
+     `resolve_wait` off the compiler.)
+  5. Fix the module doc line "A graphics pipeline draws nothing until then"
+     (`pso_async.rs:5-7`): say a draw waits at most the frame budget, then draws nothing.
+- **Change in `bind.rs`.**
+  1. `graphics_bound` (`bind.rs:552`): `let (real, unbuilt) = super::pso_async::resolve_draw(pso);`.
+     Use `unbuilt` instead of `super::pso_async::is_pending(pso)` at `bind.rs:589`.
+     `telemetry_draw` stays right after (`bind.rs:553`).
+  2. The trace-only `resolve_wait(pso)` at `bind.rs:577` becomes `resolve(pso)`.
+  3. `execute_indirect` (`bind.rs:278`): `let (pso, unbuilt) = super::pso_async::resolve_draw(raw_pso);`
+     and use `unbuilt` instead of `is_pending(raw_pso)` at `bind.rs:286`. The compute put-off
+     above it (`bind.rs:274-277`) is unchanged.
+- **Tests.**
+  - `pso_async` `mod used_tests`:
+    - `a_draw_never_builds_the_pipeline_on_its_thread`: `submit_lazy` a graphics stand-in whose
+      job records `std::thread::current().name()` and blocks on a channel; call `resolve_draw`
+      from a test thread with `XCL_PSO_FRAME_WAIT_MS` effectively 100 ms (call an inner
+      `resolve_draw_with(pso, frame, allowance)` taking the allowance as a parameter, so no env
+      var is needed); assert it returns `(standin, true)` within 400 ms, the job ran on an
+      `xcl-pso*` thread, and `build_is_wanted` was true inside it.
+    - `the_frame_budget_is_shared_and_resets_on_the_next_frame`: two slow graphics stand-ins,
+      allowance 60 ms for frame 7: the first waits about 60 ms, the second returns in under
+      15 ms; for frame 8 the second waits again.
+    - `a_spent_budget_does_not_mark_the_pipeline_late`: with allowance 0 the stand-in is
+      returned and `late` stays false; with a timed-out wait `late` is true.
+    - `a_built_graphics_pipeline_is_returned_at_once`: built job, `(real, false)`.
+    - Keep `a_wait_that_builds_the_pipeline_is_counted_with_its_time` (`pso_async.rs:1397`)
+      working for compute only; if it uses a graphics entry, switch it to compute and say so in
+      the PR.
+  - `bind.rs` `mod tests`: `a_draw_does_not_wait_past_the_frame_budget` (as #1798's test, but
+    through `graphics_bound`'s resolve: a 1.5 s graphics job returns the stand-in in under
+    400 ms; once built, the real one).
+- **Acceptance:** the tests above pass; `cargo test -p xcl --lib -- pso_async:: bind:: list_x::`
+  and `--test gpu_pso_e2e` pass (report SKIPPED); in the acceptance run, `pipeline` events with
+  `by` = `title` and stage `graphics` are 0, and no log line "held up its caller ... (built in
+  the call)" appears for graphics.
+- **Size:** about 180 lines with tests.
+
+#### U5. Compute waits for a worker, never builds on the title thread (options B)
+
+- **Inputs:** U4 merged.
+- **Files:** `hle/d3d12x/pso_async.rs`, `hle/d3d12x/bind.rs`.
+- **Change in `pso_async.rs`.**
+  1. `resolve_wait_for` with `budget == None` for a **compute** entry: no `p.job.take()`.
+     Call `need_now(&p)`, then wait on `p.cv` in a loop of `wait_timeout` steps until `done`
+     or until `compute_wait_limit()` has passed since `started`. Keep `Held`, `OpenWait`
+     (`built_here` false) and `note_blocked(true, false, elapsed)` as today.
+  2. `compute_wait_limit()`: `XCL_PSO_COMPUTE_WAIT_MS`, default 120,000; `0` means no limit.
+     When it passes: set `late`, log once per pipeline
+     `"D3D12.X: a compute pipeline was not built after {ms} ms: its dispatches are skipped until it is"`,
+     call `crate::report::telemetry_pipeline_wait_expired(true, ms)` (one line; U8 defines it,
+     until then add the function as an empty stub in `telemetry_gpu.rs` in this PR), and return
+     `p.stand(pso)`.
+  3. `image_skip()` (`pso_async.rs:1170-1173`) defaults to **on**: off only with
+     `XCL_PSO_IMAGE_SKIP=0`. Update its doc.
+  4. `pub fn is_spared(pso: usize) -> bool`: the entry's `spared` flag.
+- **Change in `bind.rs`.**
+  1. `dispatch` (`bind.rs:879`): put off only when `is_pending(pso) && !is_spared(pso)`.
+  2. `execute_indirect` (`bind.rs:274`): `unbuilt_compute` also requires `!is_spared(raw_pso)`.
+     A spared pipeline then goes to `resolve_draw` → `resolve_wait` → `resolve_spared`
+     (`pso_async.rs:1185-1203`) and is skipped at once.
+- **Tests (`pso_async` `mod used_tests`).**
+  - `a_compute_wait_never_builds_on_the_waiting_thread`: lazy compute job records its thread
+    name; `resolve_wait_for(standin, None)` from a test thread returns the real pipeline; the
+    job ran on `xcl-pso*`.
+  - `a_compute_wait_goes_ahead_of_the_fifo`: fill the FIFO with 64 lazy graphics jobs sent by
+    `resolve` that each sleep 20 ms; then a compute wait; assert it returns in under 1 s.
+  - `a_compute_wait_ends_at_its_limit`: an inner `resolve_wait_limited(pso, limit)` with 50 ms
+    and a job that blocks: returns the stand-in after about 50 ms, `late` is true.
+  - `image_skip_is_on_unless_turned_off`: a pure `fn image_skip_from(v: Option<&str>) -> bool`
+    for `None`, `"1"`, `"0"`, `" 0 "`.
+  - `bind.rs`: `a_spared_dispatch_is_not_put_off` (a spared pending compute pipeline:
+    `dispatch` does not call `defer`; the dispatch is skipped and `DISPATCHES_SKIPPED` grows).
+  - Update `list_x` test `a_dispatch_with_a_pipeline_still_building_waits_at_the_submit`
+    (`list_x.rs:7198-7249`) only if it relied on the submit thread building; it must still
+    show the submit waits.
+- **Acceptance:** tests pass; `--test gpu_compute_e2e` passes (report SKIPPED); in the
+  acceptance run, compute `pipeline` events with `by` = `title` are 0 and compute waits at a
+  bind are each no longer than that build's `waited_ms + compile_ms` plus 1 s.
+- **Size:** about 150 lines with tests.
+
+#### U6. The gate: a graphics lane, preloads give way, RAM-scaled slots (options B, C)
+
+- **Inputs:** `real.rs` after #2098 (`big_compile_turn` takes `need`, `commit_free(u64)`,
+  `wanted`; `Slots` has `reserved`; defaults `default_huge_pso_concurrency(cpus)` and
+  `default_huge_pso_wanted_concurrency(base)`).
+- **Files:** `hle/d3d12x/real.rs` only.
+- **Change.**
+  1. **RAM term.** `default_huge_pso_concurrency(cpus, ram_gib)` =
+     `min((cpus / 4).clamp(1, 4), (ram_gib / 12).max(1))`. `ram_gib` is
+     `GlobalMemoryStatusEx().ullTotalPhys >> 30` (the same call as
+     `big_compile_commit_free`, `real.rs:4218-4223`); 0 when the call fails, which gives 1.
+     `XCL_HUGE_PSO_CONCURRENCY` still overrides. This machine: 16 threads, 63 GiB → 4; wanted 5.
+  2. **Graphics lane.** `static GRAPHICS_COMPILES: Slots` like `BIG_COMPILES` (most 0,
+     wanted_most 0, same `reserved` pool). `compile_slots(bytes, graphics: bool)`: giant lane
+     for `bytes >= 4 MiB` whatever the kind, else `GRAPHICS_COMPILES` when `graphics`, else
+     `BIG_COMPILES`. In `driver_compile_identified`, `graphics = !kind.contains("compute")`
+     (the rule `telemetry_pipeline_built` already uses, `telemetry_gpu.rs:2414`).
+  3. **Preloads give way.** `Slots` gets `preloads: Mutex<usize>` (or count under `n`'s lock)
+     and `wanted_waiting: AtomicUsize`. `big_compile_turn` gets `preload: bool` (true when the
+     thread name starts with `xcl-pso-pre`). While `wanted()` is true and the build cannot take
+     a slot, it counts itself in `wanted_waiting` (increment once, decrement on leaving). An
+     unwanted preload takes a slot only if `preloads < 1` and `wanted_waiting == 0`, on top of
+     the existing cap and commit rules. Its `SlotGuard` decrements `preloads`.
+- **Tests (`real.rs` `mod big_compile_tests`).**
+  - `slots_scale_with_ram_too`: table over (cpus, ram_gib): (16, 63)→4, (16, 32)→2,
+    (16, 16)→1, (32, 8)→1, (4, 64)→1, (64, 0)→1.
+  - `a_preload_holds_at_most_one_slot`: `Slots { most: 3 }`: one preload takes a slot; a
+    second preload waits 120 ms while 2 slots are free; an ordinary unwanted build takes one.
+  - `a_preload_waits_while_a_wanted_build_waits`: `most 1, wanted_most 1`, slot held; a wanted
+    build waits; a preload started after it does not get the slot when it frees; the wanted
+    one does.
+  - `graphics_and_compute_take_separate_lanes`: `compile_slots(300 << 10, true)` and
+    `(300 << 10, false)` are different lanes; `(5 << 20, true)` is the giant lane.
+  - Existing `big_compile_tests` keep passing.
+- **Acceptance:** tests pass; in the acceptance run, no `pipeline` event with `by` =
+  `preload` starts a driver compile (log `driver compile start`) while another build with
+  `wanted` true is in the gate (read from `waited_ms` intervals); graphics `waited_ms` stays
+  under 5 s.
+- **Size:** about 140 lines with tests.
+
+#### U7. A worker parked at the gate is replaced (the starvation fix)
+
+- **Inputs:** U5 and U6 merged.
+- **Files:** `hle/d3d12x/pso_async.rs`; one line in `hle/d3d12x/real.rs::big_compile_turn`.
+- **Change in `pso_async.rs`.**
+  1. Keep the receiver: `queue()` stores `rx` (`Arc<Mutex<Receiver<Work>>>`) in a static
+     `OnceLock` so more workers can be started later. Move the worker loop body
+     (`pso_async.rs:309-316`) into `fn worker_loop(rx)`. It sets a thread-local `IS_WORKER = true`.
+  2. Counters: `static WORKERS: AtomicUsize` (threads started, base and extra) and
+     `static PARKED: AtomicUsize`.
+  3. ```rust
+     /// A guard while a worker waits at the gate; starts an extra worker when fewer than
+     /// `compile_threads()` workers are free, up to twice that many threads.
+     pub(super) struct Parked(bool);
+     pub(super) fn park() -> Parked
+     ```
+     `park()`: if `!IS_WORKER` return `Parked(false)` (preload threads and title threads do not
+     count). Else `PARKED += 1`; if `WORKERS - PARKED < n` and `WORKERS < 2 * n`, start one
+     thread named `xcl-pso-x{k}` running `worker_loop` and `WORKERS += 1`. `Drop`:
+     `PARKED -= 1` when it counted. Extra workers do not exit.
+     A pure policy `fn extra_needed(workers: usize, parked: usize, n: usize) -> bool` holds the
+     rule for testing.
+  4. `pub fn workers() -> (usize, usize)`: (threads, parked), for U8.
+- **Change in `real.rs`.** In `big_compile_turn`, the first time the loop is about to wait
+  (`slots.cv.wait_timeout`), create `let _parked = super::pso_async::park();` and keep it until
+  the function returns. A build that gets a slot at once never parks.
+- **Tests (`pso_async` `mod used_tests`).**
+  - `extra_workers_follow_the_parked_count`: table: (15, 0, 15)→false, (15, 1, 15)→true,
+    (16, 1, 15)→false, (30, 16, 15)→false (cap 2n).
+  - `queued_work_runs_while_every_worker_is_parked`: submit `compile_threads()` jobs that each
+    call `park()` and block on a shared channel (with a 5 s timeout so a failure cannot hang
+    the suite); then submit one more job; assert it completes within 2 s; release the blocked
+    jobs.
+- **Acceptance:** tests pass; in the acceptance run, `activity.workers` rises above 15 when
+  `activity.gate_parked` > 0 (U8), and graphics `pipeline` events keep arriving while huge
+  compute builds wait at the gate (no 10 s window with gate_parked > 0 and 0 graphics builds
+  while draws are left out).
+- **Size:** about 120 lines with tests.
+
+#### U8. Telemetry for left-out work, parked workers, expired waits
+
+- **Inputs:** U4, U5, U7.
+- **Files:** `telemetry_gpu.rs`, `telemetry_run.rs`, `log.rs` (appended part); one-line call
+  sites in `bind.rs`, `console_list.rs`, `list_x.rs`.
+- **Change.**
+  1. `pub fn telemetry_unbuilt(compute: bool)` in `telemetry_gpu.rs` (tier `frame`; one relaxed
+     load when off): bumps `UNBUILT_DRAWS` or `UNBUILT_DISPATCHES`.
+  2. Call sites (one line each):
+     - `bind.rs` `graphics_bound`, in the `unbuilt` branch: `crate::report::telemetry_unbuilt(false);`
+     - `bind.rs` `execute_indirect`, the "still being built skipped" branch (`bind.rs:286-293`):
+       `telemetry_unbuilt(!gfx_signature)` where a dispatching signature counts as compute
+       (`signature_dispatches(sig)`).
+     - `bind.rs` `dispatch`, when the resolved pipeline is a stand-in of a pending pipeline
+       (the `!is_translated_compute` branch with `is_pending(raw)` true):
+       `telemetry_unbuilt(true);`
+     - `console_list.rs:887-890` skip branch when `is_pending((*p).pc)`: `telemetry_unbuilt(true);`
+  3. `pub fn telemetry_pipeline_wait_expired(compute: bool, ms: u64)` (replaces U5's stub):
+     writes an `error` of kind `pipeline_wait_expired`, not fatal, fields `stage`, `ms`, `n`
+     (volume rule as `io_failed`).
+  4. `frame`: add `draws_unbuilt`, `dispatches_unbuilt` (deltas), `pso_budget_out` (binds that
+     found the budget spent: a counter bumped in `resolve_draw` through a one-line
+     `crate::report::telemetry_budget_out()`).
+  5. `activity`: add `draws_unbuilt`, `dispatches_unbuilt` (deltas over the 2 s), `workers` and
+     `gate_parked` (from `pso_async::workers()` at the sample). These matter most: during a
+     stall there are no `frame` events.
+- **Tests:** serialisation tests in `log.rs` for the new fields; a `telemetry_gpu` unit test
+  that `telemetry_unbuilt` counts per kind and the frame delta takes them; extend
+  `telemetry_e2e::activity_events_mirror_the_log` to assert the new `activity` fields exist.
+- **Acceptance:** tests pass; the fields appear in the acceptance run.
+- **Size:** about 150 lines.
+
+#### U9. Docs
+
+- **Files:** `README.md` (the huge-pipeline paragraph at `README.md:271-282`; the switches
+  `XCL_PSO_FRAME_WAIT_MS`, `XCL_PSO_COMPUTE_WAIT_MS`, `XCL_PSO_IMAGE_SKIP` default),
+  `docs/guide/telemetry.md` (5.3 `frame` table, 5.5 `pipeline`, 5.8 `activity` and `error`
+  kinds).
+- **PR note:** `HANDOFF.md` statements that draws wait for pipelines become wrong (#2615's
+  description names `HANDOFF.md:1051` and `1420-1421` upstream). Say so; do not edit it.
+- **Acceptance:** review only.
+
+### 7. Concurrency plan
+
+| Wave | Units in parallel | Files | Why they can run together |
+|---|---|---|---|
+| 1 | U0 (#2698, #2579, #2098 through the gate) | `eh.rs`+`real.rs` (end_title), `pso_async.rs`+`list_x.rs`+`bind.rs`, `real.rs` (gate)+README | #2698 and #2098 both touch `real.rs` but far apart (3604 vs 4066-4214); the gate merges them one at a time anyway |
+| 1 | U2 | `telemetry_gpu.rs`, `telemetry_run.rs`, `log.rs` | no file shared with U0 |
+| 2 | U1 | `host.rs` | needs #2698 |
+| 2 | U4 | `pso_async.rs`, `bind.rs` | needs #2579 |
+| 2 | U6 | `real.rs` | needs #2098; no file shared with U4 or U1 |
+| 3 | U5 | `pso_async.rs`, `bind.rs` | same files as U4 |
+| 4 | U7 | `pso_async.rs`, `real.rs` | same files as U5 and U6 |
+| 5 | U8 | telemetry files, `bind.rs`, `console_list.rs`, `list_x.rs` | needs U4, U5, U7's counters; shares telemetry files with U2 |
+| 6 | U9 | README, telemetry guide | describes what was built |
+
+Each unit is built and tested on the Windows PC (`cargo build --workspace`,
+`cargo test --workspace -- --test-threads=4`, counts and SKIPPED reported). Runtime units (U1,
+U4-U8) also need a `scripts/smoke.ps1` pair before any upstream PR.
+
+### 8. Acceptance run
+
+**Build:** `dev` with U0-U8, clean tree, release, on the RTX 5080 PC (driver 32.0.16.2140).
+Run it after the texture-upload crash fix lands. If that crash comes back, the run counts up
+to the crash and is marked partial.
+
+**Two runs, same input as runs 1-3 (press A at the same point):**
+
+- **R-A (default switches):** `XCL_TELEMETRY=all XCL_ACTIVITY=1 XCL_RUN_SECONDS=900
+  XCL_STALL_DUMP=120 XCL_UMA_MB=4095 XCL_THREAD_DUMP_AT=240,480`. No other `XCL_PSO_*` or
+  `XCL_HUGE_*` switch. Caches as runs 1-3 left them.
+- **R-B:** the same again right after, for the warm-cache numbers.
+
+**Success (each from events unless named):**
+
+| Measure | Run 1 | Run 2 | Run 3 (E4) | Target R-A |
+|---|---|---|---|---|
+| Driver compiles with `by` = `title` | many (24 holds ≥1.4 s) | 294 graphics + 16 compute built in the call (`run2/log.txt:4631`) | 0 (bounded waits) | **0** |
+| Longest 2 s `activity` run with 0 presents after "press A" | ≥90 s | 1,322 s | ~32 s (one 32.2 s frame) | each gap explained by `pso_wait_dispatch_ms` (compute) only; draw waits ≤ 100 ms per frame |
+| `frame.pso_wait_draw_ms` | - | - | - (33,304 ms summed in one frame) | ≤ 110 per frame, every frame |
+| First frame with ≥ 280 draws | never | never | 110-120 s | reached; time reported against run 3 |
+| `draws_unbuilt` / (draws + draws_unbuilt) per frame, 60 s after the first in-world frame | - | - | 9,461 draws skipped by 130 s | < 5 % |
+| `activity.gate_parked` > 0 with 0 graphics builds for 10 s while `draws_unbuilt` > 0 | - | - | yes (100-132 s) | **never** |
+| Preload compile start while a wanted build waits | 62.5 s of 90 held by preloads | - | preload off | **never** |
+| `error` `pipeline_wait_expired` | - | - | - | 0 expected; any is listed |
+| Device removals / GPU hang | 0 | 0 | 0 in 22 s | **0** |
+| Peak `committed_mb` | 31.3 GB | - | 42.1 GB | ≤ 45 GB |
+| Run end | not ended by `XCL_RUN_SECONDS` | closed by hand | crash | `end.reason` `run_seconds` by 930 s, or `stall` with dumps |
+
+R-B: the same rows, plus the time from "press A" to the first frame with ≥ 280 draws must be
+shorter than R-A's.
+
+### 9. What I could not check
+
+- No build or run was made. Effects are predictions from runs 1-3 and the code.
+- How many compute pipelines the first in-world frame needs, so how long C1's wait is on a cold
+  cache, is unknown.
+- Upstream measurements are theirs, not ours.
+- Whether #2098 and #2698 merge cleanly into `dev` (18 adopted PRs) was not tried; the gate
+  decides.
+
+### 10. Texture-read crash of run 3: adopt upstream #751 (added to U0)
+
+- Crash: run 3 at 131.966 s, access violation reading `0x821a30000` in `memcpy` <-
+  `gpu::tiling::Chain::detile_level` <- `hle::d3d12x::title_textures::subresources`, on a worker
+  thread spawned in `subresources_on`.
+- Cause (Opus debug worker, checked by the orchestrator at `title_textures.rs:1520-1526`):
+  `title_bytes` borrows title memory once `gpu::shader::readable` passes; nothing keeps the pages
+  alive during the hash and the detile, so a decommit in between faults. It is a race: it did not
+  repeat in runs 4-6.
+- Fix: adopt upstream PR #751 ("title texture reads outside the coherent window use the safe
+  copy", +196 -36) through `scripts/dev/merge-pr.py`. It is unit U0's fourth adoption.
+- Not in this entry: a `texture_read_hole` telemetry counter, logging which path decommits, and
+  modelling queue method #31. They get their own entries if needed.
+
+### 11. Measurements this entry rests on (RTX 5080 16 GB, 63 GB RAM, Windows 11; not tested on AMD)
+
+| Run | Switches | Result |
+|---|---|---|
+| 1 | defaults, telemetry all | last frame 43 s after "press A"; a title thread builds graphics pipelines in its draws, 24 holds of 1.4-6.5 s in 90 s |
+| 2 | defaults, soak | 1,322 s with no frame; about 200 graphics pipelines cold-built at about 9 per minute |
+| 3 | `XCL_PSO_WAIT_MS=50`, `XCL_HUGE_PSO_CONCURRENCY=4`, `XCL_HUGE_PSO_WANTED_CONCURRENCY=6`, `XCL_PSO_PRELOAD=0` | gap 90-110 s, then 13 frames with 280-357 draws; texture-read crash at 132 s |
+| 4 | as 3 | intro cutscene from about 120 s at 1-2 fps; commit 37 -> 80 GB in 60 s; device removed 0x887A0001 at 190 s |
+| 5 | as 3 + `XCL_DEVICE_TYPE=lockhart` | same growth: 77.7 GB commit, 45.9 GB non-local video memory at 186 s |
+| 6 | as 3, telemetry off | same growth: 82 GB commit; title asserts on E_OUTOFMEMORY at 194.5 s, device removed |
+
+The memory growth of runs 4-6 is not covered by this entry.
