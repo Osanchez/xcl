@@ -23,6 +23,8 @@ pub mod frame;
 pub mod guard;
 mod late_release;
 pub mod layout;
+#[allow(dead_code)] // wired in by the next unit
+mod leave_out;
 pub mod list_x;
 pub mod null;
 pub mod present;

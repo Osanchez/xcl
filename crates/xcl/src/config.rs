@@ -54,6 +54,14 @@ pub struct Config {
     /// "auto" (host GPU tier), "tier1_1" (11), "tier1_0" (10), or "off" (0).
     /// `XCL_RAYTRACING` overrides.
     pub raytracing: String,
+    /// Compute programs to leave out of the run (see `hle::d3d12x::leave_out`): tokens separated
+    /// by commas or spaces, `@file` reads a list from a file. Empty: none.
+    pub leave_out: String,
+    /// The programs of the ray-tracing chain that cannot be recognised from their code (see
+    /// `hle::d3d12x::leave_out::parse_chain`): entries `<16-hex record> [producer|consumer]` or
+    /// `name:<glob> [role]`, separated by commas or newlines; `@file` reads a list from a file.
+    /// Empty: none. Whether the chain runs is `raytracing`.
+    pub raytracing_chain: String,
     pub window_width: u32,
     pub window_height: u32,
     /// The XCL window's position: "auto" (CW_USEDEFAULT – Windows may place it on any monitor),
@@ -181,6 +189,8 @@ impl Default for Config {
             d3d12_debug: false,
             present: "auto".into(),
             raytracing: "auto".into(),
+            leave_out: String::new(),
+            raytracing_chain: String::new(),
             window_width: 1280,
             window_height: 720,
             window_pos: "auto".into(),
@@ -256,6 +266,14 @@ impl Config {
         parse_raytracing_tier(mode)
     }
 
+    /// Whether the ray-tracing chain runs: `XCL_RAYTRACING` first, else `raytracing`, read as
+    /// `raytracing_tier_override` does.
+    pub fn raytracing_chain_mode(&self) -> ChainMode {
+        let env = std::env::var("XCL_RAYTRACING").ok();
+        let mode = env.as_deref().unwrap_or(self.raytracing.as_str()).trim();
+        parse_raytracing_chain(mode, RT_PROVEN)
+    }
+
     /// `XCL_WINDOW_SIZE=<w>x<h>` (1..=16384 each, `x` any case) overrides window_width/height;
     /// an invalid value warns once and keeps xcl.toml's.
     pub fn window_size(&self) -> (u32, u32) {
@@ -287,6 +305,26 @@ pub fn parse_raytracing_tier(mode: &str) -> Option<u32> {
         Some(11)
     } else {
         None
+    }
+}
+
+/// Whether the ray-tracing chain runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainMode {
+    Off,
+    On,
+}
+
+/// The ray-tracing chain has not been proven on any GPU yet, so `auto` leaves it out.
+pub const RT_PROVEN: bool = false;
+
+/// "off" / "none" / "0" -> Off; "on" / "tier1_0" / "tier1_1" / "1.0" / "1.1" / "10" / "11" -> On;
+/// "auto" or empty -> On when `proven`, else Off; anything else -> Off. ASCII case-insensitive.
+pub fn parse_raytracing_chain(mode: &str, proven: bool) -> ChainMode {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "on" | "tier1_0" | "tier1_1" | "1.0" | "1.1" | "10" | "11" => ChainMode::On,
+        "auto" | "" if proven => ChainMode::On,
+        _ => ChainMode::Off,
     }
 }
 
@@ -447,6 +485,29 @@ mod tests {
         assert_eq!(parse_raytracing_tier("tier1_1"), Some(11));
         assert_eq!(parse_raytracing_tier("1.1"), Some(11));
         assert_eq!(parse_raytracing_tier("11"), Some(11));
+    }
+
+    #[test]
+    fn tier_parsing_accepts_on_as_host_tier() {
+        assert_eq!(parse_raytracing_tier("on"), None);
+    }
+
+    #[test]
+    fn raytracing_chain_parsing() {
+        for v in ["off", "none", "0", "OFF", " None "] {
+            assert_eq!(parse_raytracing_chain(v, true), ChainMode::Off, "{v:?}");
+            assert_eq!(parse_raytracing_chain(v, false), ChainMode::Off, "{v:?}");
+        }
+        for v in ["on", "tier1_0", "tier1_1", "1.0", "1.1", "10", "11", "ON", "Tier1_1", "  on  "] {
+            assert_eq!(parse_raytracing_chain(v, true), ChainMode::On, "{v:?}");
+            assert_eq!(parse_raytracing_chain(v, false), ChainMode::On, "{v:?}");
+        }
+        for v in ["auto", "", "AUTO", " auto ", "  "] {
+            assert_eq!(parse_raytracing_chain(v, true), ChainMode::On, "{v:?}");
+            assert_eq!(parse_raytracing_chain(v, false), ChainMode::Off, "{v:?}");
+        }
+        assert_eq!(parse_raytracing_chain("maybe", true), ChainMode::Off);
+        assert_eq!(parse_raytracing_chain("maybe", false), ChainMode::Off);
     }
 
     #[test]

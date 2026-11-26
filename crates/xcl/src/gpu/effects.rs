@@ -19,6 +19,10 @@ pub struct Effects {
     pub images: bool,
     /// instructions in the program
     pub instructions: usize,
+    /// the program has a ray-intersection instruction (`IMAGE_BVH_INTERSECT_RAY` or the 64-bit one)
+    pub traces: bool,
+    /// the program has a backward branch (a loop)
+    pub loops: bool,
 }
 
 /// The writes of the RDNA2 program `code` (one program, as `xbox::Fssm::programs` cuts it).
@@ -61,6 +65,8 @@ pub fn of(code: &[u8]) -> Option<Effects> {
         }
         e.instructions += 1;
         let n = d.inst.name;
+        e.traces |= n == "IMAGE_BVH_INTERSECT_RAY" || n == "IMAGE_BVH64_INTERSECT_RAY";
+        e.loops |= d.inst.flags & rdna2::F_BRANCH != 0 && rdna2::branch_target(d).is_some_and(|t| t <= d.pc);
         let writes = n.contains("_STORE") || n.contains("_ATOMIC");
         match d.enc.name {
             "ENC_MIMG" => e.images |= writes,
@@ -74,6 +80,12 @@ pub fn of(code: &[u8]) -> Option<Effects> {
         }
     }
     Some(e)
+}
+
+/// The facts of the compute shader `blob` (a console shader container): `of` its code. None when
+/// the container cannot be read or `of` says nothing.
+pub fn compute_facts(blob: &[u8]) -> Option<Effects> {
+    of(&compute_code(blob)?)
 }
 
 /// The compute program of a console shader container (the hardware CS variant of an FSSM, or
@@ -121,8 +133,8 @@ mod tests {
     fn images_and_memory_are_told_apart() {
         // loads of either kind write nothing
         let load: (&str, &str, &[(&str, u64)]) = ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("SRSRC", 2)]);
-        assert_eq!(of(&asm(&[MOV, IMAGE_LOAD, load, END])), Some(Effects { memory: false, images: false, instructions: 4 }));
-        assert_eq!(of(&asm(&[MOV, IMAGE_STORE, END])), Some(Effects { memory: false, images: true, instructions: 3 }));
+        assert_eq!(of(&asm(&[MOV, IMAGE_LOAD, load, END])), Some(Effects { memory: false, images: false, instructions: 4, ..Default::default() }));
+        assert_eq!(of(&asm(&[MOV, IMAGE_STORE, END])), Some(Effects { memory: false, images: true, instructions: 3, ..Default::default() }));
         let image_atomic: (&str, &str, &[(&str, u64)]) = ("IMAGE_ATOMIC_ADD", "ENC_MIMG", &[("DMASK", 1), ("VADDR", 0), ("VDATA", 4), ("SRSRC", 2)]);
         assert_eq!(of(&asm(&[image_atomic, END])).map(|e| (e.memory, e.images)), Some((false, true)));
         // every way into memory another pass or an indirect call reads
@@ -148,13 +160,35 @@ mod tests {
         // a branch can jump past an early s_endpgm: a store after it is the program's (were it
         // constant data instead, taking it for a store only makes binds wait, as before)
         let store: (&str, &str, &[(&str, u64)]) = ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("SRSRC", 2)]);
-        assert_eq!(of(&asm(&[IMAGE_STORE, END, store, END])), Some(Effects { memory: true, images: true, instructions: 4 }));
+        assert_eq!(of(&asm(&[IMAGE_STORE, END, store, END])), Some(Effects { memory: true, images: true, instructions: 4, ..Default::default() }));
         // what does not decode after the end is trailing data
         let mut code = asm(&[IMAGE_STORE, END]);
         code.extend_from_slice(&[0xff; 8]);
         if rdna2::decode(&[0xff; 8], 0).is_err() {
-            assert_eq!(of(&code), Some(Effects { memory: false, images: true, instructions: 2 }));
+            assert_eq!(of(&code), Some(Effects { memory: false, images: true, instructions: 2, ..Default::default() }));
         }
+    }
+
+    #[test]
+    fn effects_flag_bvh_programs_as_traces() {
+        let args: &[(&str, u64)] = &[("VDATA", 100), ("VADDR", 0), ("SRSRC", 2), ("DMASK", 15)];
+        let bvh: (&str, &str, &[(&str, u64)]) = ("IMAGE_BVH_INTERSECT_RAY", "ENC_MIMG", args);
+        let bvh64: (&str, &str, &[(&str, u64)]) = ("IMAGE_BVH64_INTERSECT_RAY", "ENC_MIMG", args);
+        assert_eq!(of(&asm(&[bvh, END])).map(|e| e.traces), Some(true));
+        assert_eq!(of(&asm(&[MOV, bvh64, END])).map(|e| e.traces), Some(true));
+        assert_eq!(of(&asm(&[MOV, IMAGE_LOAD, END])).map(|e| e.traces), Some(false));
+    }
+
+    #[test]
+    fn effects_flag_backward_branches_as_loops() {
+        let sub: (&str, &str, &[(&str, u64)]) = ("S_SUB_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)]);
+        // 0x00: s_sub, 0x04: s_cbranch_scc1 -2 (-> 0x00), 0x08: s_endpgm
+        let back = asm(&[sub, ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFE)]), END]);
+        assert_eq!(of(&back).map(|e| e.loops), Some(true));
+        // 0x00: s_cbranch_scc1 +1 (-> 0x08), 0x04: s_sub, 0x08: s_endpgm
+        let fwd = asm(&[("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 1)]), sub, END]);
+        assert_eq!(of(&fwd).map(|e| e.loops), Some(false));
+        assert_eq!(of(&asm(&[sub, END])).map(|e| e.loops), Some(false));
     }
 
     #[test]
@@ -198,7 +232,7 @@ mod tests {
         assert_eq!(of(&asm(&[IMAGE_STORE])), None);
         let mut saved = asm(&[IMAGE_STORE, ("S_ENDPGM_SAVED", "ENC_SOPP", &[])]);
         saved.extend_from_slice(&[0xff; 8]);
-        assert_eq!(of(&saved), Some(Effects { memory: false, images: true, instructions: 2 }));
+        assert_eq!(of(&saved), Some(Effects { memory: false, images: true, instructions: 2, ..Default::default() }));
     }
 
     #[test]
@@ -222,7 +256,7 @@ mod tests {
             END,
             ("S_CODE_END", "ENC_SOPP", &[]),
         ]);
-        assert_eq!(of(&far_ok), Some(Effects { memory: false, images: true, instructions: 7 }));
+        assert_eq!(of(&far_ok), Some(Effects { memory: false, images: true, instructions: 7, ..Default::default() }));
 
         // resolved far jump whose target lands past the decoded slice still fails closed
         let far_oob = asm(&[
