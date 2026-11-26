@@ -4208,22 +4208,40 @@ impl Slots {
     }
 }
 
-/// A slot, the commit its compile reserved, whether a preload holds it, and whether an L build does.
-struct SlotGuard(&'static Slots, u64, bool, bool);
+/// A slot, the commit its compile reserved, whether a preload holds it, whether an L build does,
+/// and whether its count was given back already (`release_count`: the build was abandoned).
+struct SlotGuard(&'static Slots, u64, bool, bool, std::sync::Arc<AtomicBool>);
+
+/// Give back the count of a slot (`n`, and `preloads` and `large` when they hold it) once: a
+/// second call with the same `released` does nothing. Returns whether this call gave it back.
+/// An abandoned build (`compile_watch`) gives it back at its hard limit, so the lane goes on;
+/// its guard's drop then finds it given back and only returns the commit it reserved.
+fn release_count(slots: &Slots, preload: bool, large: bool, released: &AtomicBool) -> bool {
+    if released.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let mut n = slots.n.lock().unwrap();
+    if preload {
+        slots.preloads.fetch_sub(1, Ordering::SeqCst);
+    }
+    if large {
+        slots.large.fetch_sub(1, Ordering::SeqCst);
+    }
+    *n -= 1;
+    drop(n);
+    slots.cv.notify_all();
+    true
+}
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         *self.0.reserved.0.lock().unwrap() -= self.1;
-        let mut n = self.0.n.lock().unwrap();
-        if self.2 {
-            self.0.preloads.fetch_sub(1, Ordering::SeqCst);
+        if !release_count(self.0, self.2, self.3, &self.4) {
+            // (the count went back at the hard limit: only the commit is left; wake the waiters
+            // that were held up by it, after `n`'s lock so none of them misses it)
+            drop(self.0.n.lock().unwrap());
+            self.0.cv.notify_all();
         }
-        if self.3 {
-            self.0.large.fetch_sub(1, Ordering::SeqCst);
-        }
-        *n -= 1;
-        drop(n);
-        self.0.cv.notify_all();
     }
 }
 
@@ -4349,11 +4367,15 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
         });
         crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}");
     }
+    // (watched from here until the call returns, on every path: a guard)
+    let slot_release = _slot.as_ref().map(|g| compile_watch::SlotRelease { slots: g.0, preload: g.2, large: g.3, released: g.4.clone() });
+    let watch = compile_watch::enter(class, !graphics, bytes, record.map(|r| r.0), slot_release);
     let started = std::time::Instant::now();
     let r = {
         let _in_driver = CountGuard::new(&IN_DRIVER);
         build()
     };
+    drop(watch);
     let took = started.elapsed();
     crate::report::telemetry_pipeline_built(kind, bytes, record, took, waited);
     super::pso_manifest::note(super::pso_manifest::Event::Build { kind, bytes, record, driver_ms: took.as_millis(), waited_ms: waited.as_millis() });
@@ -4418,7 +4440,7 @@ fn big_compile_turn(slots: &'static Slots, need: u64, commit_free: impl Fn(u64) 
                 if large {
                     slots.large.fetch_add(1, Ordering::SeqCst);
                 }
-                return SlotGuard(slots, need, preload, large);
+                return SlotGuard(slots, need, preload, large, std::sync::Arc::new(AtomicBool::new(false)));
             }
         }
         if is_wanted {
@@ -4548,6 +4570,29 @@ mod big_compile_tests {
         t.into_iter().for_each(|h| h.join().unwrap());
         assert_eq!(PEAK.load(Ordering::SeqCst), 2, "12 concurrent wanted huge compiles must cap at 2");
         assert_eq!(*S.n.lock().unwrap(), 0);
+    }
+
+    /// A slot's count given back through its flag (`release_count`) is not given back again by
+    /// the guard's drop, which only returns the commit; the lane admits another turn meanwhile.
+    #[test]
+    fn a_released_slot_count_is_given_back_once() {
+        static RESERVED: Reserved = Reserved(Mutex::new(0));
+        static S: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1, reserved: &RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(0), large: AtomicUsize::new(0) };
+        let first = big_compile_turn(&S, 10, |_| true, || false, false, false);
+        assert_eq!(*S.n.lock().unwrap(), 1);
+        assert!(release_count(&S, false, false, &first.4), "the first call gives the count back");
+        assert_eq!((*S.n.lock().unwrap(), *RESERVED.0.lock().unwrap()), (0, 10), "its commit is still reserved");
+        assert!(!release_count(&S, false, false, &first.4), "a second call gives nothing back");
+        assert_eq!(*S.n.lock().unwrap(), 0);
+        // a second turn is admitted while the first still holds its guard (an abandoned build's)
+        let t0 = Instant::now();
+        let second = big_compile_turn(&S, 10, |_| true, || false, false, false);
+        assert!(t0.elapsed() < Duration::from_secs(1), "the second turn waited for the first guard");
+        assert_eq!(*S.n.lock().unwrap(), 1);
+        drop(first);
+        assert_eq!((*S.n.lock().unwrap(), *RESERVED.0.lock().unwrap()), (1, 10), "the first guard took neither the count nor the commit of the second");
+        drop(second);
+        assert_eq!((*S.n.lock().unwrap(), *RESERVED.0.lock().unwrap()), (0, 0));
     }
 
     #[test]
@@ -4980,6 +5025,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
 }
 
 pub(super) mod dispatch_chain;
+pub(super) mod compile_watch;
 pub(crate) use dispatch_chain::log_counts as log_dispatch_chain_counts;
 
 #[derive(Clone, Copy, PartialEq)]

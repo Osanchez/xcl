@@ -60,7 +60,7 @@ struct Facts {
     outcome: std::sync::atomic::AtomicU8,
     /// must-draw (set by a later unit; read by `skipped` and the record)
     must_draw: std::sync::atomic::AtomicBool,
-    /// its driver compile ran past its hard limit (set by a later unit)
+    /// its driver compile ran past its hard limit (`BuildHandle::abandon`)
     abandoned: std::sync::atomic::AtomicBool,
     /// its translated DXIL is class XL (`note_size`): binds do not wait for it
     background: std::sync::atomic::AtomicBool,
@@ -68,6 +68,8 @@ struct Facts {
 
 const OUTCOME_BUILT: u8 = 0;
 const OUTCOME_FAILED: u8 = 1;
+/// its shader key is quarantined (`BuildHandle::abandon`): it was never built
+const OUTCOME_QUARANTINED: u8 = 3;
 
 /// Whether one of the title's threads waits for the pipeline, and the preload worker building it.
 #[derive(Default)]
@@ -108,6 +110,14 @@ fn build(p: &Arc<Pending>, job: Job, preload: bool) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL};
     BUILDING.with(|b| *b.borrow_mut() = Some(p.clone()));
     p.facts.picked_at.lock().unwrap().get_or_insert_with(std::time::Instant::now);
+    if p.key != 0 && is_quarantined(p.key) {
+        // (an XL build of these shaders ran past its hard limit: never built again this session)
+        p.facts.outcome.store(OUTCOME_QUARANTINED, Ordering::Release);
+        drop(job);
+        complete(p, 0);
+        BUILDING.with(|b| *b.borrow_mut() = None);
+        return;
+    }
     if preload {
         let mut d = p.demand.lock().unwrap();
         d.preload_thread = unsafe { GetCurrentThreadId() };
@@ -165,8 +175,13 @@ static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 /// The build is done (`real`: its pipeline, 0 = failed).
 fn complete(p: &Pending, real: usize) {
     if real == 0 {
-        p.facts.outcome.store(OUTCOME_FAILED, Ordering::Release);
-        FAILED.fetch_add(1, Ordering::Relaxed);
+        if matches!(p.facts.outcome.load(Ordering::Acquire), OUTCOME_BUILT | OUTCOME_FAILED) {
+            p.facts.outcome.store(OUTCOME_FAILED, Ordering::Release);
+            FAILED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // (left out on purpose, with its outcome set: not a failure)
+            GATED.fetch_add(1, Ordering::Relaxed);
+        }
     } else {
         BUILT.fetch_add(1, Ordering::Relaxed);
     }
@@ -201,6 +216,10 @@ pub enum Unbuilt {
     Background,
     /// its build ended with no pipeline
     Failed,
+    /// its driver compile ran past its hard limit: binds do not wait for it (`Facts::abandoned`)
+    Abandoned,
+    /// its shader key is quarantined: it is never built
+    Quarantined,
 }
 
 #[allow(dead_code)]
@@ -212,6 +231,8 @@ impl Unbuilt {
             Unbuilt::ImageOnly => "image_only",
             Unbuilt::Background => "background",
             Unbuilt::Failed => "failed",
+            Unbuilt::Abandoned => "abandoned",
+            Unbuilt::Quarantined => "quarantined",
         }
     }
 }
@@ -229,7 +250,9 @@ fn why_of(p: &Pending) -> Option<Unbuilt> {
     if p.real.load(Ordering::Acquire) != 0 {
         None
     } else if *p.done.lock().unwrap() {
-        Some(Unbuilt::Failed)
+        if p.facts.outcome.load(Ordering::Acquire) == OUTCOME_QUARANTINED { Some(Unbuilt::Quarantined) } else { Some(Unbuilt::Failed) }
+    } else if p.facts.abandoned.load(Ordering::Acquire) {
+        Some(Unbuilt::Abandoned)
     } else if p.facts.background.load(Ordering::Acquire) {
         Some(Unbuilt::Background)
     } else if p.spared.load(Ordering::Acquire) {
@@ -256,9 +279,77 @@ pub fn skipped(pso: usize) -> Skipped {
     Skipped { why: why_of(&p), must_draw: p.facts.must_draw.load(Ordering::Relaxed) }
 }
 
-/// A bind's wait for `p` ends without its build: binds do not wait for a program of class XL.
+/// A bind's wait for `p` ends without its build: binds do not wait for a program of class XL, nor
+/// for a build whose driver compile ran past its hard limit.
 fn stop_waiting(p: &Pending) -> bool {
-    p.facts.background.load(Ordering::Acquire)
+    p.facts.background.load(Ordering::Acquire) || p.facts.abandoned.load(Ordering::Acquire)
+}
+
+/// A build in progress, for the compile watcher (`real::compile_watch`).
+#[derive(Clone)]
+pub(crate) struct BuildHandle(Arc<Pending>);
+
+/// The build this thread runs (`None` on a thread that builds no queued pipeline).
+pub(crate) fn current_build() -> Option<BuildHandle> {
+    BUILDING.with(|b| b.borrow().clone()).map(BuildHandle)
+}
+
+/// This thread is one of the pool's general workers (initial or extra).
+pub(crate) fn is_worker() -> bool {
+    IS_WORKER.with(|w| w.get())
+}
+
+/// Shader keys whose XL build ran past its hard limit, for the rest of the session.
+static QUARANTINE: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+
+/// Builds with this key are not run any more (key 0, unknown, is never quarantined).
+pub(crate) fn quarantine(key: u64) {
+    if key != 0 {
+        QUARANTINE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(key);
+    }
+}
+
+pub(crate) fn is_quarantined(key: u64) -> bool {
+    key != 0 && QUARANTINE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&key))
+}
+
+impl BuildHandle {
+    /// Its driver compile ran past its hard limit: binds stop waiting for it (it is `late` and
+    /// `abandoned`, its waiters are woken), and with `also_quarantine` its key is never built again.
+    /// Nothing happens when the build is done. Returns whether the key was quarantined.
+    pub(crate) fn abandon(&self, also_quarantine: bool) -> bool {
+        let p = &self.0;
+        {
+            // (set under `done`'s lock, so a waiter that checked it just before is woken)
+            let done = p.done.lock().unwrap();
+            if *done {
+                return false;
+            }
+            p.facts.abandoned.store(true, Ordering::Release);
+            p.late.store(true, Ordering::Release);
+            p.cv.notify_all();
+        }
+        let quarantined = also_quarantine && p.key != 0;
+        if quarantined {
+            quarantine(p.key);
+        }
+        quarantined
+    }
+}
+
+/// A pipeline of a test, by stand-in: what the compile watcher is given.
+#[cfg(test)]
+pub(crate) fn build_handle_for(standin: usize) -> Option<BuildHandle> {
+    entry(standin).map(BuildHandle)
+}
+
+/// Builds that left the work out on purpose with an outcome set: a quarantined key's.
+static GATED: AtomicUsize = AtomicUsize::new(0);
+
+/// Builds not run because their key is quarantined, so far.
+#[allow(dead_code)]
+pub fn gated() -> usize {
+    GATED.load(Ordering::Relaxed)
 }
 
 /// `p`'s DXIL is known to be class L or XL (a compute pipeline; 0 bytes: not known yet).
@@ -338,6 +429,7 @@ fn record(p: &Pending, real: usize) -> BuildRecord {
     let outcome = match (real, f.outcome.load(Ordering::Acquire)) {
         (0, OUTCOME_FAILED) => "failed",
         (0, OUTCOME_BUILT) => "pending",
+        (0, OUTCOME_QUARANTINED) => "quarantined",
         _ => "built",
     };
     BuildRecord {
@@ -556,6 +648,9 @@ static GENERAL_BUSY: AtomicUsize = AtomicUsize::new(0);
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 /// Workers now waiting at the big-compile gate.
 static PARKED: AtomicUsize = AtomicUsize::new(0);
+/// General workers inside a driver compile that ran past its hard limit (`worker_abandoned`):
+/// not counted as available.
+static ABANDONED: AtomicUsize = AtomicUsize::new(0);
 /// Extra workers started so far (names `xcl-pso-x{k}`).
 static EXTRA_STARTED: AtomicUsize = AtomicUsize::new(0);
 
@@ -684,8 +779,8 @@ fn worker_loop(reserved: bool) {
     }
 }
 
-/// A worker is short of a free place when fewer than `n` of its `workers` are not parked, up to
-/// `2 * n` threads in all.
+/// A worker is short of a free place when fewer than `n` of its `workers` are not parked (or
+/// abandoned: held by a driver compile past its hard limit), up to `2 * n` threads in all.
 fn extra_needed(workers: usize, parked: usize, n: usize) -> bool {
     workers.saturating_sub(parked) < n && workers < 2 * n
 }
@@ -709,15 +804,22 @@ pub(super) fn park() -> Parked {
     }
     PARKED.fetch_add(1, Ordering::SeqCst);
     let parked = Parked(true);
+    top_up();
+    parked
+}
+
+/// Start one more worker (never exits) when the queued builds would otherwise have too few
+/// (`extra_needed`, parked and abandoned workers not counted).
+fn top_up() {
     if POOL.get().is_none() {
-        return parked;
+        return;
     }
     let n = crate::gpu::recomp::dxc::compile_threads();
-    // reserve the place with a compare-and-swap, so two parking workers never take the same one
+    // reserve the place with a compare-and-swap, so two callers never take the same one
     let mut w = WORKERS.load(Ordering::SeqCst);
     loop {
-        if !extra_needed(w, PARKED.load(Ordering::SeqCst), n) {
-            return parked;
+        if !extra_needed(w, PARKED.load(Ordering::SeqCst) + ABANDONED.load(Ordering::SeqCst), n) {
+            return;
         }
         match WORKERS.compare_exchange(w, w + 1, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => break,
@@ -728,7 +830,23 @@ pub(super) fn park() -> Parked {
     if std::thread::Builder::new().name(format!("xcl-pso-x{k}")).stack_size(64 << 20).spawn(|| worker_loop(false)).is_err() {
         WORKERS.fetch_sub(1, Ordering::SeqCst);
     }
-    parked
+}
+
+/// A general worker (`is_worker`) is inside a driver compile past its hard limit: it is no
+/// longer counted as available, and a replacement may start within the pool's cap. Other
+/// threads (a reserved graphics worker, a preload worker, a title thread) count nothing.
+pub(crate) fn worker_abandoned(is_worker: bool) {
+    if is_worker {
+        ABANDONED.fetch_add(1, Ordering::SeqCst);
+        top_up();
+    }
+}
+
+/// The driver call of an abandoned compile returned: its worker counts as available again.
+pub(crate) fn worker_returned(is_worker: bool) {
+    if is_worker {
+        ABANDONED.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// (worker threads started, workers parked at the gate now)
@@ -748,6 +866,8 @@ pub struct QueueGauges {
     pub lanes: [usize; LANES],
     pub general: usize,
     pub parked: usize,
+    /// general workers inside a driver compile past its hard limit (`worker_abandoned`)
+    pub abandoned: usize,
     pub reserved: usize,
     pub reserved_busy: usize,
     pub spared_in_flight: usize,
@@ -774,6 +894,7 @@ pub fn queue_gauges() -> QueueGauges {
         lanes,
         general: WORKERS.load(Ordering::SeqCst),
         parked: PARKED.load(Ordering::SeqCst),
+        abandoned: ABANDONED.load(Ordering::SeqCst),
         reserved: RESERVED.load(Ordering::SeqCst),
         reserved_busy: RESERVED_BUSY.load(Ordering::SeqCst),
         spared_in_flight: SPARED_IN_FLIGHT.load(Ordering::SeqCst),
@@ -1756,6 +1877,179 @@ mod used_tests {
         }
         assert!(ran, "queued work ran while every worker was parked");
         assert_eq!(workers().1, before, "parked count returns");
+    }
+
+    /// Workers inside a driver compile past its hard limit are not counted as available: a
+    /// replacement starts (within the cap), a job queued meanwhile runs, and the count goes back
+    /// when the calls return.
+    #[test]
+    fn an_abandoned_worker_is_replaced() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::time::{Duration, Instant};
+
+        let n = crate::gpu::recomp::dxc::compile_threads();
+        // (other tests queue builds on the same pool: their backlog goes first, so let it drain)
+        let start = Instant::now();
+        while queue_gauges().lanes.iter().any(|&l| l != 0) && start.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let before = ABANDONED.load(Ordering::SeqCst);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _open = OpenGate(gate.clone());
+        let (started_tx, started_rx) = mpsc::channel();
+        let mut standins = Vec::with_capacity(n + 1);
+        for k in 0..n {
+            let standin = 0x5C0A_1000usize + k;
+            let (gate, started_tx) = (gate.clone(), started_tx.clone());
+            submit(standin, true, Box::new(move || {
+                // (as `compile_watch` does at a hard limit, on this general worker)
+                worker_abandoned(true);
+                let _ = started_tx.send(());
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut open = gate.0.lock().unwrap_or_else(|e| e.into_inner());
+                while !*open {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    open = gate.1.wait_timeout(open, left).unwrap_or_else(|e| e.into_inner()).0;
+                }
+                drop(open);
+                worker_returned(true);
+                // (0: a failed build, nothing for `release` whenever the stand-in is released)
+                0
+            }));
+            standins.push(standin);
+        }
+        let mut started = 0;
+        while started < n && started_rx.recv_timeout(Duration::from_secs(20)).is_ok() {
+            started += 1;
+        }
+        assert_eq!(started, n, "every job started");
+        assert_eq!(ABANDONED.load(Ordering::SeqCst), before + n, "every job is counted as abandoned");
+
+        // a replacement is started: the workers not abandoned are n again, or the cap is reached
+        let start = Instant::now();
+        let enough = || {
+            let (w, a) = (workers().0, ABANDONED.load(Ordering::SeqCst));
+            w >= 2 * n || w.saturating_sub(a) >= n
+        };
+        while !enough() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(enough(), "no replacement started: {} workers, {} abandoned, n = {n}", workers().0, ABANDONED.load(Ordering::SeqCst));
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let target = 0x5C0A_10FFusize;
+        submit(target, true, Box::new(move || {
+            let _ = done_tx.send(());
+            0
+        }));
+        standins.push(target);
+        let ran = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        for &standin in &standins {
+            let start = Instant::now();
+            while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            released(standin);
+        }
+        let start = Instant::now();
+        while ABANDONED.load(Ordering::SeqCst) != before && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ran, "a job queued while every worker was abandoned ran");
+        assert_eq!(ABANDONED.load(Ordering::SeqCst), before, "the abandoned count returns");
+    }
+
+    /// A bind waiting for a pipeline stops waiting when its build is abandoned: it gets the
+    /// stand-in, and the pipeline says why it is not built.
+    #[test]
+    fn an_abandoned_pipeline_is_not_waited_for() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::time::{Duration, Instant};
+
+        let standin = 0x5C0A_2001usize;
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let _open = OpenGate(gate.clone());
+        let job_gate = gate.clone();
+        submit_lazy(standin, true, Box::new(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut open = job_gate.0.lock().unwrap_or_else(|e| e.into_inner());
+            while !*open {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                open = job_gate.1.wait_timeout(open, left).unwrap_or_else(|e| e.into_inner()).0;
+            }
+            // (0: a failed build, nothing for `release` whenever the stand-in is released)
+            0
+        }), 0);
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _ = tx.send(resolve_wait(standin));
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(150)).is_err(), "the bind waits for the pipeline");
+        assert_eq!(why_unbuilt(standin), Some(Unbuilt::Building));
+
+        let handle = BuildHandle(entry(standin).unwrap());
+        let abandoned_at = Instant::now();
+        let quarantined = handle.abandon(false);
+        assert!(!quarantined, "nothing asked for a quarantine");
+        let got = rx.recv_timeout(Duration::from_secs(5));
+        let waited = abandoned_at.elapsed();
+        assert_eq!(got, Ok(standin), "the bind goes on with the stand-in");
+        assert!(waited < Duration::from_millis(300), "the bind took {waited:?} to stop waiting");
+        assert_eq!(why_unbuilt(standin), Some(Unbuilt::Abandoned));
+        assert!(entry(standin).unwrap().late.load(Ordering::Acquire));
+
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        waiter.join().unwrap();
+        let start = Instant::now();
+        while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        released(standin);
+    }
+
+    /// A pipeline whose key is quarantined is never built: its job is dropped, it is done with
+    /// the outcome `quarantined`, and it is counted as gated, not failed.
+    #[test]
+    fn a_quarantined_key_is_not_built_again() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        let (standin, key) = (0x5C0A_3001usize, 0x5C0A_B001u64);
+        quarantine(key);
+        quarantine(0);
+        assert!(is_quarantined(key) && !is_quarantined(0), "key 0 is never quarantined");
+        let gated_before = gated();
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        submit_lazy(standin, true, Box::new(move || {
+            flag.store(true, Ordering::Release);
+            0
+        }), key);
+        resolve(standin);
+        // (other tests queue builds on the same pool: their backlog goes first)
+        let start = Instant::now();
+        while is_pending(standin) && start.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let p = entry(standin).unwrap();
+        assert!(!is_pending(standin), "the pipeline was not completed");
+        assert!(!ran.load(Ordering::Acquire), "a quarantined key's job ran");
+        assert_eq!(why_unbuilt(standin), Some(Unbuilt::Quarantined));
+        assert_eq!(record(&p, 0).outcome, "quarantined");
+        assert_eq!(gated(), gated_before + 1, "it was counted as gated");
+        assert_eq!(Unbuilt::Quarantined.name(), "quarantined");
+        released(standin);
     }
 
     /// A queued normal worker job whose stand-in was released before a worker starts it is

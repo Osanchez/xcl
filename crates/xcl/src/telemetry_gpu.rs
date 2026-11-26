@@ -2668,6 +2668,10 @@ pub fn telemetry_first_use(ready: bool) {
 /// A pipeline's build ended (a later unit fills this in).
 pub fn telemetry_pipeline_ready(_r: &crate::hle::d3d12x::pso_async::BuildRecord) {}
 
+/// A driver compile ran past its soft limit (`hard` false) or its hard one: abandoned, and with
+/// `quarantined` its shader key too (a later unit fills this in).
+pub fn telemetry_compile_timeout(_hard: bool, _compute: bool, _class: &str, _bytes: usize, _record: Option<u64>, _ms: u64, _quarantined: bool) {}
+
 /// A pipeline was built by the driver: writes its `pipeline` event. `kind` is the build's label
 /// (`compute` anywhere in it makes the stage compute); `record` is the console record hash and
 /// whether a driver blob was supplied.
