@@ -308,7 +308,15 @@ const HELP: usize = 1;
 const WANTED_COMPUTE: usize = 2;
 const GRAPHICS: usize = 3;
 const COMPUTE: usize = 4;
-const LANES: usize = 5;
+/// Image-only (spared) compute programs: last, and `SPARED_AT_ONCE` at a time.
+const SPARED: usize = 5;
+const LANES: usize = 6;
+/// Image-only builds in flight (taken from the `SPARED` lane, not finished yet).
+static SPARED_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+const SPARED_AT_ONCE: usize = 1;
+/// How often a general worker that left the `SPARED` lane alone looks at it again: the gates'
+/// wanted waiters leave without a push.
+const SPARED_LOOK: std::time::Duration = std::time::Duration::from_millis(250);
 
 struct Pool {
     lanes: Mutex<[std::collections::VecDeque<Item>; LANES]>,
@@ -340,19 +348,21 @@ fn reserved_workers(n: usize) -> usize {
 }
 
 /// The lane a worker takes next, `None` when there is nothing for it. A general worker takes the
-/// first lane with an item; a reserved one only the graphics lanes, wanted first.
-fn pick(lens: &[usize; LANES], reserved: bool) -> Option<usize> {
+/// first lane with an item, the `SPARED` one only when `spared_ok`; a reserved one only the
+/// graphics lanes, wanted first.
+fn pick(lens: &[usize; LANES], reserved: bool, spared_ok: bool) -> Option<usize> {
     if reserved {
         return [WANTED_GRAPHICS, GRAPHICS].into_iter().find(|&l| lens[l] != 0);
     }
-    (0..LANES).find(|&l| lens[l] != 0)
+    (0..SPARED).find(|&l| lens[l] != 0).or((spared_ok && lens[SPARED] != 0).then_some(SPARED))
 }
 
-fn lane_for(compute: bool, wanted: bool) -> usize {
+fn lane_for(compute: bool, wanted: bool, spared: bool) -> usize {
     match (compute, wanted) {
         (false, true) => WANTED_GRAPHICS,
         (true, true) => WANTED_COMPUTE,
         (false, false) => GRAPHICS,
+        (true, false) if spared => SPARED,
         (true, false) => COMPUTE,
     }
 }
@@ -388,8 +398,9 @@ fn push(lane: usize, item: Item) {
     pool.general.notify_one();
 }
 
-/// The next item for a worker of this class, waiting for one.
-fn take(reserved: bool) -> Item {
+/// The next item for a worker of this class and the lane it came from, waiting for one. From the
+/// `SPARED` lane it counts in `SPARED_IN_FLIGHT` (the caller's `SparedGuard` undoes that).
+fn take(reserved: bool) -> (Item, usize) {
     let pool = pool();
     let mut lanes = pool.lanes.lock().unwrap();
     loop {
@@ -397,11 +408,32 @@ fn take(reserved: bool) -> Item {
         for (len, lane) in lens.iter_mut().zip(lanes.iter()) {
             *len = lane.len();
         }
-        if let Some(l) = pick(&lens, reserved) {
-            return lanes[l].pop_front().unwrap();
+        // (atomics only: nothing else is locked under the lanes' lock)
+        let spared_ok = !reserved && SPARED_IN_FLIGHT.load(Ordering::SeqCst) < SPARED_AT_ONCE && super::real::wanted_waiting_at_gates() == 0;
+        if let Some(l) = pick(&lens, reserved, spared_ok) {
+            if l == SPARED {
+                SPARED_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+            }
+            return (lanes[l].pop_front().unwrap(), l);
         }
         let cv = if reserved { &pool.reserved } else { &pool.general };
-        lanes = cv.wait(lanes).unwrap();
+        lanes = if !reserved && lens[SPARED] != 0 {
+            // (the rule for the `SPARED` lane can change with no push: look again)
+            cv.wait_timeout(lanes, SPARED_LOOK).unwrap().0
+        } else {
+            cv.wait(lanes).unwrap()
+        };
+    }
+}
+
+/// An image-only build in flight, counted until it is dropped; a general worker that left the
+/// `SPARED` lane alone is woken then.
+struct SparedGuard;
+
+impl Drop for SparedGuard {
+    fn drop(&mut self) {
+        SPARED_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        pool().general.notify_one();
     }
 }
 
@@ -411,7 +443,8 @@ fn worker_loop(reserved: bool) {
         IS_WORKER.with(|w| w.set(true));
     }
     loop {
-        let item = take(reserved);
+        let (item, lane) = take(reserved);
+        let _spared = (lane == SPARED).then(|| SparedGuard); // (lazily: a guard made and dropped would count down)
         if reserved {
             RESERVED_BUSY.fetch_add(1, Ordering::SeqCst);
         }
@@ -478,7 +511,8 @@ pub fn workers() -> (usize, usize) {
 }
 
 fn enqueue(p: Arc<Pending>) {
-    push(lane_for(p.compute, false), Item::Build(p));
+    let spared = p.spared.load(Ordering::Acquire);
+    push(lane_for(p.compute, false, spared), Item::Build(p));
 }
 
 /// The pool's lane lengths and its workers' states (`queue_gauges`).
@@ -489,6 +523,10 @@ pub struct QueueGauges {
     pub parked: usize,
     pub reserved: usize,
     pub reserved_busy: usize,
+    pub spared_in_flight: usize,
+    /// per gate (compute, graphics, giant): slots held and wanted builds waiting
+    pub gate_held: [usize; 3],
+    pub gate_wanted_waiting: [usize; 3],
 }
 
 /// What the pool holds now. Starts nothing: all zero lanes before the first build is queued.
@@ -501,12 +539,17 @@ pub fn queue_gauges() -> QueueGauges {
             *len = lane.len();
         }
     }
+    // (after the lanes' lock is released: the gates lock their own)
+    let (gate_held, gate_wanted_waiting) = super::real::gate_gauges();
     QueueGauges {
         lanes,
         general: WORKERS.load(Ordering::SeqCst),
         parked: PARKED.load(Ordering::SeqCst),
         reserved: RESERVED.load(Ordering::SeqCst),
         reserved_busy: RESERVED_BUSY.load(Ordering::SeqCst),
+        spared_in_flight: SPARED_IN_FLIGHT.load(Ordering::SeqCst),
+        gate_held,
+        gate_wanted_waiting,
     }
 }
 
@@ -1256,28 +1299,84 @@ mod used_tests {
 
     #[test]
     fn general_workers_take_lanes_in_order() {
-        assert_eq!(pick(&[1, 1, 1, 1, 1], false), Some(0));
-        assert_eq!(pick(&[0, 1, 1, 1, 1], false), Some(1));
-        assert_eq!(pick(&[0, 0, 1, 1, 1], false), Some(2));
-        assert_eq!(pick(&[0, 0, 0, 1, 1], false), Some(3));
-        assert_eq!(pick(&[0, 0, 0, 0, 1], false), Some(4));
-        assert_eq!(pick(&[0, 0, 0, 0, 0], false), None);
+        assert_eq!(pick(&[1, 1, 1, 1, 1, 0], false, true), Some(0));
+        assert_eq!(pick(&[0, 1, 1, 1, 1, 0], false, true), Some(1));
+        assert_eq!(pick(&[0, 0, 1, 1, 1, 0], false, true), Some(2));
+        assert_eq!(pick(&[0, 0, 0, 1, 1, 0], false, true), Some(3));
+        assert_eq!(pick(&[0, 0, 0, 0, 1, 0], false, true), Some(4));
+        assert_eq!(pick(&[0, 0, 0, 0, 0, 0], false, true), None);
     }
 
     #[test]
     fn reserved_workers_take_only_graphics() {
-        assert_eq!(pick(&[1, 1, 1, 1, 1], true), Some(WANTED_GRAPHICS));
-        assert_eq!(pick(&[0, 1, 1, 1, 1], true), Some(GRAPHICS));
-        assert_eq!(pick(&[0, 1, 1, 0, 1], true), None);
-        assert_eq!(pick(&[0, 0, 0, 0, 0], true), None);
+        assert_eq!(pick(&[1, 1, 1, 1, 1, 0], true, true), Some(WANTED_GRAPHICS));
+        assert_eq!(pick(&[0, 1, 1, 1, 1, 0], true, true), Some(GRAPHICS));
+        assert_eq!(pick(&[0, 1, 1, 0, 1, 0], true, true), None);
+        assert_eq!(pick(&[0, 0, 0, 0, 0, 0], true, true), None);
+    }
+
+    #[test]
+    fn image_only_builds_come_last_and_only_when_allowed() {
+        assert_eq!(pick(&[0, 0, 0, 0, 0, 1], false, true), Some(SPARED));
+        assert_eq!(pick(&[0, 0, 0, 0, 0, 1], false, false), None);
+        assert_eq!(pick(&[0, 0, 0, 0, 1, 1], false, true), Some(COMPUTE));
+        assert_eq!(pick(&[0, 0, 0, 0, 0, 1], true, true), None);
     }
 
     #[test]
     fn lanes_follow_kind_and_demand() {
-        assert_eq!(lane_for(false, true), WANTED_GRAPHICS);
-        assert_eq!(lane_for(true, true), WANTED_COMPUTE);
-        assert_eq!(lane_for(false, false), GRAPHICS);
-        assert_eq!(lane_for(true, false), COMPUTE);
+        assert_eq!(lane_for(false, true, false), WANTED_GRAPHICS);
+        assert_eq!(lane_for(true, true, false), WANTED_COMPUTE);
+        assert_eq!(lane_for(false, false, false), GRAPHICS);
+        assert_eq!(lane_for(true, false, false), COMPUTE);
+        assert_eq!(lane_for(true, false, true), SPARED);
+        assert_eq!(lane_for(true, true, true), WANTED_COMPUTE);
+    }
+
+    /// Three image-only builds, all queued at once, run one at a time, and all of them run.
+    #[test]
+    fn at_most_one_image_only_build_runs_at_once() {
+        let _sat = WORKER_SATURATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        use std::time::{Duration, Instant};
+
+        // (other tests queue builds on the same pool: their backlog goes first, so let it drain)
+        let start = Instant::now();
+        while queue_gauges().lanes.iter().any(|&l| l != 0) && start.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let running = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let built = Arc::new(AtomicUsize::new(0));
+        let standins = [0x7E57_E1A0usize, 0x7E57_E1A1, 0x7E57_E1A2];
+        for &standin in &standins {
+            let (running, most, built) = (running.clone(), most.clone(), built.clone());
+            submit_lazy(standin, true, Box::new(move || {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(200));
+                running.fetch_sub(1, Ordering::SeqCst);
+                built.fetch_add(1, Ordering::SeqCst);
+                // (0: a failed build, nothing for `release` whenever the stand-in is released)
+                0
+            }), 0);
+            image_only(standin);
+        }
+        for &standin in &standins {
+            resolve(standin);
+        }
+        let start = Instant::now();
+        while built.load(Ordering::SeqCst) < standins.len() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for &standin in &standins {
+            let start = Instant::now();
+            while is_pending(standin) && start.elapsed() < Duration::from_secs(10) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            released(standin);
+        }
+        assert_eq!(built.load(Ordering::SeqCst), standins.len(), "every image-only build ran");
+        assert_eq!(most.load(Ordering::SeqCst), SPARED_AT_ONCE, "never more than SPARED_AT_ONCE at a time");
     }
 
     #[test]
@@ -1971,7 +2070,7 @@ fn need_now(p: &Arc<Pending>) {
         !std::mem::replace(&mut d.by_submit, true)
     };
     if first {
-        push(lane_for(p.compute, true), Item::Build(p.clone()));
+        push(lane_for(p.compute, true, false), Item::Build(p.clone()));
     }
     p.sent.store(true, Ordering::Release);
 }
@@ -2137,7 +2236,7 @@ pub fn image_only(standin: usize) {
 
 /// `resolve_wait` for a pipeline binds do not wait for (`image_only`): the real one once built,
 /// else the stand-in, with the build sent to the workers. Nobody waits, so the build is not
-/// `wanted`: a big one takes its turn among the driver's compiles and waits for free commit.
+/// `wanted`: it is built when no other build waits (`SPARED_AT_ONCE` at a time).
 fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => {

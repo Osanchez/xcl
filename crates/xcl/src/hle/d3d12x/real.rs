@@ -4178,6 +4178,28 @@ fn compile_slots(bytes: usize, graphics: bool) -> &'static Slots {
     }
 }
 
+/// The wanted builds waiting at these gates, in all.
+fn wanted_waiting_of(lanes: &[&Slots]) -> usize {
+    lanes.iter().map(|s| s.wanted_waiting.load(Ordering::SeqCst)).sum()
+}
+
+/// The wanted builds waiting at any gate now. Atomics only, no lock.
+pub(super) fn wanted_waiting_at_gates() -> usize {
+    wanted_waiting_of(&[&BIG_COMPILES, &GRAPHICS_COMPILES, &GIANT_COMPILES])
+}
+
+/// Per gate (compute, graphics, giant): (slots held, wanted builds waiting).
+pub(super) fn gate_gauges() -> ([usize; 3], [usize; 3]) {
+    let lanes = [&BIG_COMPILES, &GRAPHICS_COMPILES, &GIANT_COMPILES];
+    let mut held = [0; 3];
+    let mut waiting = [0; 3];
+    for (k, s) in lanes.into_iter().enumerate() {
+        held[k] = *s.n.lock().unwrap();
+        waiting[k] = s.wanted_waiting.load(Ordering::SeqCst);
+    }
+    (held, waiting)
+}
+
 /// The current thread is a preload worker (`xcl-pso-pre*`).
 fn is_preload_thread() -> bool {
     std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso-pre"))
@@ -4318,6 +4340,14 @@ mod big_compile_tests {
 
     /// The pool of the tests' own lanes: they reserve nothing unless a test says so.
     static TEST_RESERVED: Reserved = Reserved(Mutex::new(0));
+
+    #[test]
+    fn wanted_waiting_is_summed_over_the_lanes() {
+        static A: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(1) };
+        static B: Slots = Slots { n: Mutex::new(0), cv: std::sync::Condvar::new(), most: 1, wanted_most: 1, reserved: &TEST_RESERVED, preloads: AtomicUsize::new(0), wanted_waiting: AtomicUsize::new(2) };
+        assert_eq!(wanted_waiting_of(&[&A, &B]), 3);
+        assert_eq!(wanted_waiting_of(&[]), 0);
+    }
 
     #[test]
     fn wanted_builds_bypass_commit_and_unwanted_slot_but_respect_hard_cap() {
