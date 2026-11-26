@@ -4893,3 +4893,75 @@ under 20 GB for 300 s after the first intro frame, no `Close` failure, no device
   the adoptions, against the merged `alloc_pool`.
 - A commit and video-memory budget with back-pressure (option C of the analysis) once usage has
   settled.
+
+## 2026-11-26 Stall fix, refinement U5b: compute waits share a frame budget (user chose "shared frame budget"; replaces the "wait" default of U5)
+
+### Why
+
+Run 9 (RTX 5080, build 8b774152 + U5, default switches): with compute waited for (U5's 120 s
+limit), the title advanced one burst of work per 120 s. Two waits expired at 216.6 s and 336.8 s.
+The programs waited for are 1.2-1.4 MB of DXIL and take 92-133 s each in the driver compiler
+(`driver compile finish #2046 ... 92325 ms`, `#1975 ... 133522 ms`). Run 10 with
+`XCL_PSO_COMPUTE_WAIT_MS=250`: frames from about 150 s at 1-3 fps, 1,000-2,300 draws per 2 s, no
+device removal in 260 s; but a 40 s gap (110-150 s) because 183 compute programs each used
+their 250 ms one after another, and `256 graphics (23154 ms, longest 102 ms)` shows the same
+one-after-another cost for draws under U4. The user chose a shared per-frame budget for compute.
+
+### Decisions
+
+1. **One chance per pipeline (draws and compute).** A pipeline may be waited for only during the
+   first `budget` after it was first needed. `need_now` records the time of its first call on
+   the `Pending` (a new `needed_at: Option<Instant>` in its `demand`). A bind that finds
+   `needed_at.elapsed() >= budget` marks the pipeline `late` and returns the stand-in without
+   waiting. So a burst of N new pipelines costs at most one budget, not N budgets.
+2. **Draws** (`resolve_draw_with`): after `need_now`, in this order: `late` -> stand-in, unbuilt;
+   chance over -> set `late`, stand-in, unbuilt, no wait and no `note_blocked`; frame allowance
+   zero -> stand-in, unbuilt, not late; else wait up to `min(frame allowance, chance left,
+   wait_budget() if set)`, then as U4 (a wait that ran out sets `late`).
+3. **Compute, default = frame mode.** `XCL_PSO_COMPUTE_FRAME_WAIT_MS` (default 100; 0: never
+   wait) is a budget per shown frame shared by all threads, with its own counter
+   (`COMPUTE_FRAME_SPENT`), separate from the draw budget. The no-budget compute path of
+   `resolve_wait_inner` follows the same order as draws, with `note_blocked(true, false, took)`.
+   It never takes the job (U5).
+4. **`XCL_PSO_COMPUTE_WAIT_MS` becomes the opt-in for waiting.** Unset: frame mode. `0`: wait
+   until built, no limit. `n`: wait at most n ms per bind (U5's behaviour, with its warning and
+   `telemetry_pipeline_wait_expired`). A pure `compute_wait_from(wait_ms: Option<&str>,
+   frame_ms: Option<&str>) -> ComputeWait` (`Frame(Duration)` or `Limit(Option<Duration>)`)
+   decides: (None, None) -> Frame(100 ms); (Some("0"), _) -> Limit(None); (Some("5000"), _) ->
+   Limit(Some(5 s)); (None, Some("250")) -> Frame(250 ms); (None, Some("0")) -> Frame(0);
+   an unparsable value counts as unset.
+5. **No put-off in frame mode.** `waits_bounded()` (from #2581) is also true in frame mode, so
+   `list_x::defer` puts nothing off by default: the dispatch is recorded at its bind, which waits
+   inside the budget or leaves it out. Put-off to the submit remains for
+   `XCL_PSO_COMPUTE_WAIT_MS` set and `XCL_PSO_WAIT_MS` unset. This also removes the per-put-off
+   list segment and allocator that the memory analysis named as the amplifier.
+6. **Unit tests keep "wait" as their ambient mode.** Under `cfg!(test)` the mode read from the
+   environment is `Limit(None)`, so existing unit tests that expect a compute bind to wait until
+   built, or a dispatch to be put off, keep their meaning. New tests call inner functions that
+   take the mode, frame and budget as parameters. Integration tests run the real binary and so
+   run in frame mode; if one of them depends on a first-frame dispatch, it sets
+   `XCL_PSO_COMPUTE_WAIT_MS=0` in its own environment.
+7. Image-only skip (U5) is unchanged and applies in every mode.
+
+### Unit U5b
+
+- **Files:** `crates/xcl/src/hle/d3d12x/pso_async.rs` only (plus an integration test's
+  environment, only if the PC run shows it is needed).
+- **Tests (`pso_async` test module):**
+  - `a_pipeline_gets_one_chance_to_be_waited_for`: draw path, budget 60 ms: first call waits
+    about 60 ms and returns unbuilt; a second pipeline first needed in the same frame returns in
+    under 15 ms and is not late; called again in the next frame more than 60 ms after its first
+    need it returns in under 15 ms and is now late.
+  - `the_frame_budget_is_shared_and_resets_on_the_next_frame` (U4) is rewritten for the new
+    rule: in the next frame a pipeline first needed there still gets the full budget.
+  - `a_compute_bind_waits_inside_the_frame_budget`: frame mode, budget 60 ms: returns the
+    stand-in after about 60 ms, the job ran on a worker, `late` is set; once built the real
+    pipeline is returned.
+  - `compute_binds_share_the_frame_budget`: two pending compute pipelines in one frame: the
+    second returns in under 15 ms.
+  - `compute_wait_mode_follows_the_switches`: the table of decision 4.
+  - `waits_are_bounded_in_frame_mode`: a pure `waits_bounded_for(mode, wait_budget_set)`.
+- **Acceptance:** `cargo test -p xcl --lib -- pso_async:: bind:: list_x::` and the whole suite
+  pass. Retail run with default switches: after the loading screen no stretch of more than 5 s
+  with 0 presents; per frame `pso_wait_draw_ms + pso_wait_dispatch_ms` at most about 220 ms; no
+  device removal; `builds_title` 0.
