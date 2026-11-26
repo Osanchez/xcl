@@ -878,6 +878,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
             } else if w0 == DISPATCH || w0 & !4 == 0x4002_E800 {
                 let (x, y, z) = (get(1), get(2), get(3));
                 at += 4;
+                crate::report::telemetry_dispatch_issued();
                 match pso {
                     Some(p) if (*p).translated => {
                         // a pipeline still being built in the background is waited for; if
@@ -886,6 +887,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let real = super::pso_async::resolve_wait((*p).pc);
                         if !super::real::is_translated_compute(real) {
                             out.skipped_dispatches += 1;
+                            crate::report::telemetry_skip(list.as_raw(), crate::report::Call::Dispatch, (*p).pc);
                             continue;
                         }
                         let user_sgprs = super::real::pso_user_sgprs(real);
@@ -921,7 +923,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         super::culprit::after_dispatch(&list, mark);
                         out.dispatches += 1;
                     }
-                    _ => out.skipped_dispatches += 1,
+                    _ => { out.skipped_dispatches += 1; crate::report::telemetry_skip(list.as_raw(), crate::report::Call::Dispatch, 0) }
                 }
             } else if w0 & 0xC000_0000 == PARAM_BASE {
                 let i = ((w0 >> 10) & 0x3F) as usize;

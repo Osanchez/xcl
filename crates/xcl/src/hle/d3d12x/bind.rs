@@ -131,6 +131,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
 /// A put-off dispatch that could not be recorded.
 pub(super) fn dispatch_dropped() {
     count(DISPATCHES_SKIPPED);
+    crate::report::telemetry_dispatch_dropped();
 }
 
 /// `to` goes on in the arena `from` took its pieces from (`from` takes no more).
@@ -278,10 +279,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let raw_pso = with(this, |s| s.pso);
-    let unbuilt_compute = signature_dispatches(sig) && put_off_to_submit(raw_pso) && super::real::is_console_compute(raw_pso);
+    let sig_dispatches = signature_dispatches(sig);
+    let unbuilt_compute = sig_dispatches && put_off_to_submit(raw_pso) && super::real::is_console_compute(raw_pso);
     if unbuilt_compute && super::list_x::defer(this, super::list_x::Deferred::Indirect(sig, max, args, args_off, count_buf, count_off)) {
         return super::pso_async::need_by_submit(raw_pso);
     }
+    crate::report::telemetry_indirect_issued(this, sig_dispatches);
     let (pso, unbuilt) = super::pso_async::resolve_draw(raw_pso);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
@@ -293,6 +296,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
         if unbuilt {
             count(DRAWS_SKIPPED);
+            crate::report::telemetry_skip(this, crate::report::Call::Indirect(sig_dispatches), raw_pso);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
@@ -305,6 +309,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // root-changing signature) invalidates the command list (Close → E_INVALIDARG).
         if let Some(tp) = super::real::two_pass_of(pso) {
             count(DRAWS_SKIPPED);
+            crate::report::telemetry_skip_other(this, crate::report::Call::Indirect(false));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!(
@@ -320,8 +325,9 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         // A native PC compute pipeline is not one of these and still goes to the PC call.
         // (`CONSOLE_COMPUTE` holds the title's object, which for a shared stand-in differs from
         // the driver pipeline `resolve_wait` returned.)
-        if signature_dispatches(sig) && (super::real::is_console_compute(raw_pso) || super::real::is_console_compute(pso)) {
+        if sig_dispatches && (super::real::is_console_compute(raw_pso) || super::real::is_console_compute(pso)) {
             count(DISPATCHES_SKIPPED);
+            crate::report::telemetry_skip(this, crate::report::Call::Indirect(true), raw_pso);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect dispatch with a pipeline that has no translated console shader ({raw_pso:#x}) skipped");
@@ -329,6 +335,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             return;
         }
         // a PC pipeline: the title's root signature, as for a draw (`graphics_bound`)
+        crate::report::telemetry_pc_call(this, crate::report::Call::Indirect(sig_dispatches), raw_pso);
         let rs = with(this, |s| s.rs_gfx) as *mut c_void;
         if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
             list.SetGraphicsRootSignature(r);
@@ -340,6 +347,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
         }
+        crate::report::telemetry_skip_other(this, crate::report::Call::Indirect(sig_dispatches));
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
@@ -352,6 +360,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                     Err(e) => {
                         crate::xlog_warn!("D3D12.X: ExecuteIndirect whole compute PSO: {e}");
                         count(DISPATCHES_SKIPPED);
+                        crate::report::telemetry_skip_other(this, crate::report::Call::Indirect(true));
                         return;
                     }
                 }
@@ -364,6 +373,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
+            crate::report::telemetry_skip_other(this, crate::report::Call::Indirect(!gfx));
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
@@ -566,6 +576,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         // (Close → E_INVALIDARG).
         if let Some(tp) = super::real::two_pass_of(real) {
             count(DRAWS_SKIPPED);
+            crate::report::telemetry_skip_other(this, crate::report::Call::Draw);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!(
@@ -576,6 +587,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             return None;
         }
         count(DRAWS_PC);
+        crate::report::telemetry_pc_call(this, crate::report::Call::Draw, pso);
         if super::present::trace_frame() {
             // which pipelines draw without a translation (first 12 distinct)
             static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
@@ -614,6 +626,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
         Err(e) => {
             super::list_x::note_dropped_draw(this);
             count(DRAWS_SKIPPED);
+            crate::report::telemetry_skip_other(this, crate::report::Call::Draw);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: draw with a translated pipeline skipped: {e}");
@@ -893,7 +906,8 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
     if put_off_to_submit(pso) && super::list_x::defer(this, super::list_x::Deferred::Dispatch(x, y, z)) {
         return super::pso_async::need_by_submit(pso);
     }
-    let pso = super::pso_async::resolve_wait(pso);
+    crate::report::telemetry_dispatch_issued();
+    let (raw, pso) = (pso, super::pso_async::resolve_wait(pso));
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
         // a console pipeline without a translation (including a background build that
@@ -903,12 +917,14 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
             crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
         }
         count(DISPATCHES_SKIPPED);
+        crate::report::telemetry_skip(this, crate::report::Call::Dispatch, raw);
         return;
     }
     match translated_dispatch(this, list, pso, x, y, z) {
         Ok(()) => count(DISPATCHES),
         Err(e) => {
             count(DISPATCHES_SKIPPED);
+            crate::report::telemetry_skip_other(this, crate::report::Call::Dispatch);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: Dispatch with a translated pipeline skipped: {e}");

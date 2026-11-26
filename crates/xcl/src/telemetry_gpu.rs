@@ -2196,6 +2196,7 @@ pub fn telemetry_list_reset(list: *mut c_void) {
     if !xlog::telemetry_on(Tier::Frame) {
         return;
     }
+    writer_clear(list as usize);
     if let Some(t) = GPU.get() {
         t.list_reset(list, xlog::telemetry_on(Tier::Pass));
     }
@@ -2203,6 +2204,10 @@ pub fn telemetry_list_reset(list: *mut c_void) {
 
 /// A draw with the pipeline `pso` (the resolved pointer) was recorded into `list`.
 pub fn telemetry_draw(list: *mut c_void, pso: usize) {
+    if !xlog::telemetry_on(Tier::Frame) {
+        return;
+    }
+    bump(DRAW_TOTAL);
     if !xlog::telemetry_on(Tier::Pass) {
         return;
     }
@@ -2241,6 +2246,225 @@ pub fn telemetry_dispatch(list: *mut c_void, pso: usize) {
             }
         });
     }
+}
+
+// ---- call counts: totals and calls left out, by kind and reason (part 3b) ----
+
+/// Counted calls, in this order; frame and activity fields take these names.
+pub const COUNT_NAMES: [&str; 33] = [
+    "draw_total", "ei_draw_total", "dispatch_total", "ei_dispatch_total",            // 0-3 totals
+    "ei_draw_skip_building", "ei_draw_skip_late", "ei_draw_skip_abandoned",          // 4-6
+    "ei_draw_skip_quarantined", "ei_draw_skip_failed", "ei_draw_skip_other",         // 7-9
+    "draw_standin_building", "draw_standin_late", "draw_standin_abandoned",          // 10-12
+    "draw_standin_quarantined", "draw_standin_failed", "draw_skip_other", "draw_pc", // 13-16
+    "dispatch_skip_building", "dispatch_skip_late", "dispatch_skip_image_only",      // 17-19
+    "dispatch_skip_background", "dispatch_skip_size_gate", "dispatch_skip_abandoned",// 20-22
+    "dispatch_skip_quarantined", "dispatch_skip_failed", "dispatch_skip_other",      // 23-25
+    "ei_after_skipped_dispatch", "mustdraw_skipped", "mustdraw_wait_timeout",        // 26-28
+    "mustdraw_wait_us", "cache_hit_layer", "cache_miss_layer", "reserved_0",         // 29-32
+];
+static COUNTS: [AtomicU64; 33] = [const { AtomicU64::new(0) }; 33];
+
+const DRAW_TOTAL: usize = 0;
+const EI_DRAW_TOTAL: usize = 1;
+const DISPATCH_TOTAL: usize = 2;
+const EI_DISPATCH_TOTAL: usize = 3;
+const EI_DRAW_SKIP_BASE: usize = 4;
+const EI_DRAW_SKIP_OTHER: usize = 9;
+const DRAW_STANDIN_BASE: usize = 10;
+const DRAW_SKIP_OTHER: usize = 15;
+const DRAW_PC: usize = 16;
+const DISPATCH_SKIP_BUILDING: usize = 17;
+const DISPATCH_SKIP_FAILED: usize = 24;
+const DISPATCH_SKIP_OTHER: usize = 25;
+const EI_AFTER_SKIPPED_DISPATCH: usize = 26;
+const MUSTDRAW_SKIPPED: usize = 27;
+const MUSTDRAW_WAIT_TIMEOUT: usize = 28;
+const MUSTDRAW_WAIT_US: usize = 29;
+const CACHE_HIT_LAYER: usize = 30;
+const CACHE_MISS_LAYER: usize = 31;
+
+fn bump(i: usize) {
+    COUNTS[i].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The call counts now (relaxed loads).
+pub fn counts_now() -> [u64; 33] {
+    let mut a = [0u64; 33];
+    for (x, c) in a.iter_mut().zip(COUNTS.iter()) {
+        *x = c.load(Ordering::Relaxed);
+    }
+    a
+}
+
+/// What kind of call is left out: a direct draw, an ExecuteIndirect (`true`: its signature
+/// dispatches) or a direct dispatch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Call {
+    Draw,
+    Indirect(bool),
+    Dispatch,
+}
+
+fn is_dispatch(call: Call) -> bool {
+    matches!(call, Call::Dispatch | Call::Indirect(true))
+}
+
+/// pure: the count a call of `call` left out for `why` (a `pso_async::Unbuilt` name) goes to. A draw
+/// kind has five reasons (`None` and the reasons only a dispatch has map to `failed`), a dispatch
+/// kind has one count per name (`None` maps to `failed`, a name not known to `other`).
+fn skip_index(call: Call, why: Option<&str>) -> usize {
+    if is_dispatch(call) {
+        return match why {
+            None => DISPATCH_SKIP_FAILED,
+            Some("building") => DISPATCH_SKIP_BUILDING,
+            Some("late") => DISPATCH_SKIP_BUILDING + 1,
+            Some("image_only") => DISPATCH_SKIP_BUILDING + 2,
+            Some("background") => DISPATCH_SKIP_BUILDING + 3,
+            Some("size_gate") => DISPATCH_SKIP_BUILDING + 4,
+            Some("abandoned") => DISPATCH_SKIP_BUILDING + 5,
+            Some("quarantined") => DISPATCH_SKIP_BUILDING + 6,
+            Some("failed") => DISPATCH_SKIP_FAILED,
+            Some(_) => DISPATCH_SKIP_OTHER,
+        };
+    }
+    let base = if call == Call::Draw { DRAW_STANDIN_BASE } else { EI_DRAW_SKIP_BASE };
+    base + match why {
+        Some("building") => 0,
+        Some("late") => 1,
+        Some("abandoned") => 2,
+        Some("quarantined") => 3,
+        _ => 4,
+    }
+}
+
+/// Lists in which a dispatch that may write memory was left out since their last Reset.
+static SKIPPED_WRITER: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// pure: `list` had a dispatch left out.
+fn writer_mark(set: &mut HashSet<usize>, list: usize) {
+    if list != 0 {
+        set.insert(list);
+    }
+}
+
+/// pure: a dispatch was left out in `list` since its last Reset.
+fn writer_hit(set: &HashSet<usize>, list: usize) -> bool {
+    list != 0 && set.contains(&list)
+}
+
+fn writer_clear(list: usize) {
+    if let Some(set) = SKIPPED_WRITER.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        set.remove(&list);
+    }
+}
+
+fn writer_note(list: *mut c_void) {
+    writer_mark(SKIPPED_WRITER.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new), list as usize);
+}
+
+/// A call of `call` on `list` is left out for the pipeline `pso` (a stand-in pointer): counted by
+/// the reason `pso_async::skipped` gives (`s`).
+fn note_skip(list: *mut c_void, call: Call, s: crate::hle::d3d12x::pso_async::Skipped) {
+    let why = s.why.map(|w| w.name());
+    bump(skip_index(call, why));
+    if s.must_draw {
+        bump(MUSTDRAW_SKIPPED);
+    }
+    if is_dispatch(call) && why != Some("image_only") {
+        writer_note(list);
+    }
+}
+
+/// A call of `call` on `list` is left out because the pipeline `pso` (a stand-in pointer, 0: none)
+/// is not built or has no translation.
+pub fn telemetry_skip(list: *mut c_void, call: Call, pso: usize) {
+    if !xlog::telemetry_on(Tier::Frame) {
+        return;
+    }
+    note_skip(list, call, crate::hle::d3d12x::pso_async::skipped(pso));
+}
+
+/// A call of `call` on `list` is left out for a reason that is not a pipeline's (a two-pass
+/// pipeline, an ABI error, root arguments the call changes).
+pub fn telemetry_skip_other(list: *mut c_void, call: Call) {
+    if !xlog::telemetry_on(Tier::Frame) {
+        return;
+    }
+    match call {
+        Call::Draw => bump(DRAW_SKIP_OTHER),
+        Call::Indirect(false) => bump(EI_DRAW_SKIP_OTHER),
+        Call::Dispatch | Call::Indirect(true) => {
+            bump(DISPATCH_SKIP_OTHER);
+            writer_note(list);
+        }
+    }
+}
+
+/// A call of `call` goes to the PC list with the pipeline `pso` and no translation: it draws when
+/// that pipeline is built (`draw_pc`), else it is left out like `telemetry_skip`.
+pub fn telemetry_pc_call(list: *mut c_void, call: Call, pso: usize) {
+    if !xlog::telemetry_on(Tier::Frame) {
+        return;
+    }
+    if crate::hle::d3d12x::pso_async::why_unbuilt(pso).is_some() {
+        note_skip(list, call, crate::hle::d3d12x::pso_async::skipped(pso));
+    } else if !is_dispatch(call) {
+        bump(DRAW_PC);
+    }
+}
+
+/// An ExecuteIndirect (`dispatches`: its signature dispatches) was recorded into `list`, whatever
+/// became of it; counted after a left-out dispatch in the same list too.
+pub fn telemetry_indirect_issued(list: *mut c_void, dispatches: bool) {
+    if !xlog::telemetry_on(Tier::Frame) {
+        return;
+    }
+    if dispatches {
+        bump(EI_DISPATCH_TOTAL);
+        bump(DISPATCH_TOTAL);
+    } else {
+        bump(EI_DRAW_TOTAL);
+        bump(DRAW_TOTAL);
+    }
+    let after = writer_hit(SKIPPED_WRITER.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new), list as usize);
+    if after {
+        bump(EI_AFTER_SKIPPED_DISPATCH);
+    }
+}
+
+/// A direct dispatch was recorded (or left out: `telemetry_skip` counts that too).
+pub fn telemetry_dispatch_issued() {
+    if !xlog::telemetry_on(Tier::Frame) {
+        return;
+    }
+    bump(DISPATCH_TOTAL);
+}
+
+/// A put-off dispatch could not be recorded (`bind::dispatch_dropped`).
+pub fn telemetry_dispatch_dropped() {
+    if !xlog::telemetry_on(Tier::Frame) {
+        return;
+    }
+    bump(DISPATCH_TOTAL);
+    bump(DISPATCH_SKIP_OTHER);
+}
+
+/// A bind waited `took` for a must-draw pipeline; `timed_out`: it used up its chance.
+pub fn telemetry_mustdraw_wait(took: Duration, timed_out: bool) {
+    if !xlog::telemetry_on(Tier::Frame) {
+        return;
+    }
+    COUNTS[MUSTDRAW_WAIT_US].fetch_add(took.as_micros() as u64, Ordering::Relaxed);
+    if timed_out {
+        bump(MUSTDRAW_WAIT_TIMEOUT);
+    }
+}
+
+/// pure: the fields of a frame's call-count deltas `d`: the four totals always, the others when
+/// non-zero. `mustdraw_wait_us` (29) is written by the frame as `mustdraw_wait_ms`; `reserved_0` never.
+fn frame_count_fields(d: &[u64; 33]) -> Vec<(&'static str, u64)> {
+    (0..32).filter(|&i| i != MUSTDRAW_WAIT_US && (i < 4 || d[i] != 0)).map(|i| (COUNT_NAMES[i], d[i])).collect()
 }
 
 /// The pipeline `pso` (a pointer) was bound on `list`.
@@ -2422,10 +2646,24 @@ fn built_by(name: Option<&str>) -> &'static str {
 }
 
 /// A bind's wait for a pipeline ran out its limit (a later unit fills this in).
-pub fn telemetry_pipeline_wait_expired(_compute: bool, _ms: u64) {}
+pub fn telemetry_pipeline_wait_expired(compute: bool, ms: u64) {
+    if !xlog::telemetry_on(Tier::Frame) {
+        return;
+    }
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let Some(n) = xlog::sampled(&COUNT) else { return };
+    let stage = if compute { "compute" } else { "graphics" };
+    let extra: [(&'static str, Value); 3] = [("stage", stage.into()), ("ms", ms.into()), ("n", n.into())];
+    crate::report::telemetry_error(crate::report::ErrKind::PipelineWaitExpired, "pso_async", "a compute pipeline was not built in time", None, false, &extra);
+}
 
-/// A pipeline's first bind found it built (`ready`) or not (a later unit fills this in).
-pub fn telemetry_first_use(_ready: bool) {}
+/// A pipeline's first bind found it built (`ready`) or not.
+pub fn telemetry_first_use(ready: bool) {
+    if !xlog::telemetry_on(Tier::Frame) {
+        return;
+    }
+    bump(if ready { CACHE_HIT_LAYER } else { CACHE_MISS_LAYER });
+}
 
 /// A pipeline's build ended (a later unit fills this in).
 pub fn telemetry_pipeline_ready(_r: &crate::hle::d3d12x::pso_async::BuildRecord) {}
@@ -2712,7 +2950,7 @@ struct Close {
 }
 
 /// The counters a frame record takes deltas of.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Counters {
     draws: u64,
     dispatches: u64,
@@ -2722,9 +2960,18 @@ struct Counters {
     wait_ns: u64,
     wait_calls: u64,
     barriers: u64,
+    counts: [u64; 33],
+}
+
+impl Default for Counters {
+    fn default() -> Counters {
+        Counters::ZERO
+    }
 }
 
 impl Counters {
+    const ZERO: Counters = Counters { draws: 0, dispatches: 0, pso_draw_us: 0, pso_dispatch_us: 0, look_us: 0, wait_ns: 0, wait_calls: 0, barriers: 0, counts: [0; 33] };
+
     /// bind::activity (draws, dispatches), pso_async::blocked (total us, graphics + compute),
     /// sparse::look_counters()[0] (whole looks, us), and the wait counters above.
     fn now() -> Counters {
@@ -2739,6 +2986,7 @@ impl Counters {
             wait_ns: WAIT_NS.load(Ordering::Relaxed),
             wait_calls: WAIT_CALLS.load(Ordering::Relaxed),
             barriers: BARRIER_BATCHES.load(Ordering::Relaxed),
+            counts: counts_now(),
         }
     }
 }
@@ -2758,6 +3006,8 @@ struct FrameRec {
     pso_wait_draw_ms: f64,
     pso_wait_dispatch_ms: f64,
     look_ms: f64,
+    /// call counts of the frame (deltas)
+    counts: [u64; 33],
     lists: u32,
     sampled: bool,
     /// calibrated [start, end) of this frame's lists with valid ticks
@@ -2780,7 +3030,7 @@ impl FrameBook {
         FrameBook {
             pending: VecDeque::new(),
             waiting: Vec::new(),
-            prev: Counters { draws: 0, dispatches: 0, pso_draw_us: 0, pso_dispatch_us: 0, look_us: 0, wait_ns: 0, wait_calls: 0, barriers: 0 },
+            prev: Counters::ZERO,
             last_qpc: None,
             last_written: 0,
         }
@@ -2808,6 +3058,7 @@ impl FrameBook {
             pso_wait_draw_ms: d(n.pso_draw_us, p.pso_draw_us) as f64 / 1000.0,
             pso_wait_dispatch_ms: d(n.pso_dispatch_us, p.pso_dispatch_us) as f64 / 1000.0,
             look_ms: d(n.look_us, p.look_us) as f64 / 1000.0,
+            counts: std::array::from_fn(|i| d(n.counts[i], p.counts[i])),
             lists: c.lists,
             sampled: c.sampled,
             intervals: Vec::new(),
@@ -2923,6 +3174,8 @@ fn frame_facts(r: &FrameRec, want: u32, forced: Option<&'static str>) -> FrameFa
         pso_wait_draw_ms: r.pso_wait_draw_ms,
         pso_wait_dispatch_ms: r.pso_wait_dispatch_ms,
         look_ms: r.look_ms,
+        counts: frame_count_fields(&r.counts),
+        mustdraw_wait_ms: r.counts[MUSTDRAW_WAIT_US] as f64 / 1000.0,
         sampled: r.sampled,
         why,
     }
@@ -3325,6 +3578,111 @@ mod tests {
         b.close(c);
         let r = &b.pending[1];
         assert_eq!((r.pso_wait_draw_ms, r.pso_wait_dispatch_ms, r.pso_wait_ms), (0.5, 0.0, 0.5));
+    }
+
+    #[test]
+    fn skip_index_follows_call_and_reason() {
+        let name = |i: usize| COUNT_NAMES[i];
+        // a direct draw: stand-in counts; the reasons only a dispatch has, and None, are failed
+        for (why, want) in [
+            (Some("building"), "draw_standin_building"),
+            (Some("late"), "draw_standin_late"),
+            (Some("abandoned"), "draw_standin_abandoned"),
+            (Some("quarantined"), "draw_standin_quarantined"),
+            (Some("failed"), "draw_standin_failed"),
+            (None, "draw_standin_failed"),
+            (Some("image_only"), "draw_standin_failed"),
+            (Some("background"), "draw_standin_failed"),
+            (Some("size_gate"), "draw_standin_failed"),
+        ] {
+            assert_eq!(name(skip_index(Call::Draw, why)), want, "{why:?}");
+        }
+        // an indirect draw
+        for (why, want) in [
+            (Some("building"), "ei_draw_skip_building"),
+            (Some("late"), "ei_draw_skip_late"),
+            (Some("abandoned"), "ei_draw_skip_abandoned"),
+            (Some("quarantined"), "ei_draw_skip_quarantined"),
+            (Some("failed"), "ei_draw_skip_failed"),
+            (None, "ei_draw_skip_failed"),
+            (Some("image_only"), "ei_draw_skip_failed"),
+            (Some("background"), "ei_draw_skip_failed"),
+            (Some("size_gate"), "ei_draw_skip_failed"),
+        ] {
+            assert_eq!(name(skip_index(Call::Indirect(false), why)), want, "{why:?}");
+        }
+        // a dispatch, direct or indirect: one count per reason name
+        for call in [Call::Dispatch, Call::Indirect(true)] {
+            for r in ["building", "late", "image_only", "background", "size_gate", "abandoned", "quarantined", "failed"] {
+                assert_eq!(name(skip_index(call, Some(r))), format!("dispatch_skip_{r}"), "{call:?} {r}");
+            }
+            assert_eq!(name(skip_index(call, None)), "dispatch_skip_failed");
+            assert_eq!(name(skip_index(call, Some("other"))), "dispatch_skip_other");
+            assert_eq!(name(skip_index(call, Some("nothing known"))), "dispatch_skip_other");
+        }
+        // the table has a name for every slot, each once
+        let mut seen = std::collections::BTreeSet::new();
+        assert!(COUNT_NAMES.iter().all(|n| seen.insert(*n)));
+        assert_eq!(COUNT_NAMES[MUSTDRAW_WAIT_US], "mustdraw_wait_us");
+        assert_eq!(COUNT_NAMES[32], "reserved_0");
+    }
+
+    #[test]
+    fn frame_count_fields_keep_totals_and_drop_zero_skips() {
+        let mut d = [0u64; 33];
+        let f = frame_count_fields(&d);
+        assert_eq!(f, [("draw_total", 0), ("ei_draw_total", 0), ("dispatch_total", 0), ("ei_dispatch_total", 0)]);
+        d[0] = 400;
+        d[5] = 3; // ei_draw_skip_late
+        d[24] = 7; // dispatch_skip_failed
+        d[29] = 2500; // the wait goes out as mustdraw_wait_ms, not here
+        d[32] = 9; // reserved_0 is never written
+        let f = frame_count_fields(&d);
+        assert_eq!(f, [("draw_total", 400), ("ei_draw_total", 0), ("dispatch_total", 0), ("ei_dispatch_total", 0), ("ei_draw_skip_late", 3), ("dispatch_skip_failed", 7)]);
+        assert!(f.iter().all(|(n, _)| *n != "mustdraw_wait_us" && *n != "mustdraw_wait_ms" && *n != "reserved_0"));
+    }
+
+    #[test]
+    fn frame_book_takes_count_deltas() {
+        let mut b = FrameBook::new();
+        let mut c = close_of(1, 16, 1, true);
+        let mut counts = [0u64; 33];
+        counts[0] = 100;
+        counts[4] = 10;
+        counts[29] = 1500;
+        c.counters = Counters { counts, ..Counters::default() };
+        b.close(c);
+        assert_eq!((b.pending[0].counts[0], b.pending[0].counts[4], b.pending[0].counts[29]), (100, 10, 1500));
+        let mut c = close_of(2, 32, 1, true);
+        counts[0] = 150;
+        counts[4] = 10;
+        counts[5] = 2;
+        counts[29] = 4000;
+        c.counters = Counters { counts, ..Counters::default() };
+        b.close(c);
+        let r = &b.pending[1];
+        assert_eq!((r.counts[0], r.counts[4], r.counts[5], r.counts[29]), (50, 0, 2, 2500));
+        let facts = frame_facts(r, 1, None);
+        assert_eq!(facts.mustdraw_wait_ms, 2.5);
+        assert!(facts.counts.contains(&("ei_draw_skip_late", 2)));
+        assert!(!facts.counts.iter().any(|(n, _)| *n == "ei_draw_skip_building"));
+    }
+
+    #[test]
+    fn a_skipped_dispatch_marks_its_list_until_reset() {
+        // the tier cannot be forced in a unit test: the pure helpers the entry points use
+        let mut set = HashSet::new();
+        let (a, b) = (0x10usize, 0x20usize);
+        assert!(!writer_hit(&set, a));
+        writer_mark(&mut set, a);
+        assert!(writer_hit(&set, a) && !writer_hit(&set, b));
+        writer_mark(&mut set, 0);
+        assert!(!writer_hit(&set, 0), "a null list is never marked");
+        set.remove(&a); // what writer_clear does for the list's Reset
+        assert!(!writer_hit(&set, a));
+        // only a dispatch kind marks a list
+        assert!(is_dispatch(Call::Dispatch) && is_dispatch(Call::Indirect(true)));
+        assert!(!is_dispatch(Call::Draw) && !is_dispatch(Call::Indirect(false)));
     }
 
     #[test]

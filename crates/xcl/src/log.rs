@@ -737,6 +737,9 @@ pub struct FrameFacts {
     pub pso_wait_draw_ms: f64,
     pub pso_wait_dispatch_ms: f64,
     pub look_ms: f64,
+    /// call counts of the frame: skips only when non-zero, totals always (`telemetry_gpu::frame_count_fields`)
+    pub counts: Vec<(&'static str, u64)>,
+    pub mustdraw_wait_ms: f64,
     pub sampled: bool,
     pub why: Option<&'static str>,
 }
@@ -851,8 +854,12 @@ pub fn frame_fields(f: &FrameFacts) -> Fields {
         ("pso_wait_draw_ms", ms_val(f.pso_wait_draw_ms)),
         ("pso_wait_dispatch_ms", ms_val(f.pso_wait_dispatch_ms)),
         ("look_ms", ms_val(f.look_ms)),
-        ("sampled", Value::from(f.sampled)),
     ];
+    for (name, n) in &f.counts {
+        v.push((*name, Value::from(*n)));
+    }
+    v.push(("mustdraw_wait_ms", ms_val(f.mustdraw_wait_ms)));
+    v.push(("sampled", Value::from(f.sampled)));
     if let Some(w) = f.why {
         v.push(("why", Value::from(w)));
     }
@@ -1090,6 +1097,8 @@ mod timing_tests {
             pso_wait_draw_ms: 0.0,
             pso_wait_dispatch_ms: 0.0,
             look_ms: 0.25,
+            counts: vec![],
+            mustdraw_wait_ms: 0.0,
             sampled: true,
             why: None,
         }
@@ -1134,6 +1143,22 @@ mod timing_tests {
         f.pso_wait_dispatch_ms = f64::INFINITY;
         let o = line("frame", &frame_fields(&f));
         assert!(o["pso_wait_draw_ms"].is_null() && o["pso_wait_dispatch_ms"].is_null());
+    }
+
+    #[test]
+    fn frame_fields_append_counts_flat() {
+        let mut f = frame();
+        f.counts = vec![("draw_total", 400), ("ei_draw_skip_late", 7)];
+        f.mustdraw_wait_ms = 1.23456;
+        let o = line("frame", &frame_fields(&f));
+        assert_eq!(o["draw_total"], 400);
+        assert_eq!(o["ei_draw_skip_late"], 7);
+        assert!(o["draw_total"].is_u64() && o["ei_draw_skip_late"].is_u64());
+        assert_eq!(o["mustdraw_wait_ms"], 1.235);
+        // without counts the wait field is still there
+        let o = line("frame", &frame_fields(&frame()));
+        assert_eq!(o["mustdraw_wait_ms"], 0.0);
+        assert!(!o.contains_key("draw_total"));
     }
 
     #[test]

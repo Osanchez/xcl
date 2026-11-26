@@ -114,6 +114,8 @@ pub enum ErrKind {
     LoopGuardTripped,
     Timeout,
     LoadFailed,
+    /// a bind's wait for a compute pipeline ran out its limit
+    PipelineWaitExpired,
 }
 
 impl ErrKind {
@@ -131,6 +133,7 @@ impl ErrKind {
             ErrKind::LoopGuardTripped => "loop_guard_tripped",
             ErrKind::Timeout => "timeout",
             ErrKind::LoadFailed => "load_failed",
+            ErrKind::PipelineWaitExpired => "pipeline_wait_expired",
         }
     }
 
@@ -325,6 +328,9 @@ pub fn telemetry_activity(presents_2s: u64, committed_mb: u64) {
     let builds_prev = ACTIVITY_BUILDS_TITLE.swap(builds, Ordering::Relaxed);
     let mut f = vec![("presents_2s", presents_2s.into()), ("committed_mb", committed_mb.into())];
     f.extend(activity_pso_fields(pso_us, pso_us_prev, builds, builds_prev));
+    let counts = super::counts_now();
+    let prev = std::mem::replace(&mut *ACTIVITY_COUNTS.lock().unwrap_or_else(|e| e.into_inner()), counts);
+    f.extend(activity_count_fields(&counts, &prev));
     crate::log::event(crate::log::Tier::Frame, "activity", &f);
 }
 
@@ -338,6 +344,26 @@ fn activity_pso_fields(pso_us: u64, pso_us_prev: u64, builds: u64, builds_prev: 
     [
         ("pso_wait_ms", (pso_us.saturating_sub(pso_us_prev) as f64 / 1000.0).into()),
         ("builds_title", builds.saturating_sub(builds_prev).into()),
+    ]
+}
+
+/// The call counts at the previous `activity` event.
+static ACTIVITY_COUNTS: std::sync::Mutex<[u64; 33]> = std::sync::Mutex::new([0; 33]);
+
+/// pure: the 2 s deltas of the call counts: `draw_total`, `draw_no_output` (the left-out and
+/// stand-in draws, counts 4-15), `dispatch_total`, `dispatch_skipped` (counts 17-25),
+/// `cache_hit_layer`, `cache_miss_layer` and `mustdraw_wait_ms` (3 decimals).
+fn activity_count_fields(now: &[u64; 33], prev: &[u64; 33]) -> Vec<(&'static str, serde_json::Value)> {
+    let d = |i: usize| now[i].saturating_sub(prev[i]);
+    let sum = |r: std::ops::Range<usize>| r.map(d).sum::<u64>();
+    vec![
+        ("draw_total", d(0).into()),
+        ("draw_no_output", sum(4..16).into()),
+        ("dispatch_total", d(2).into()),
+        ("dispatch_skipped", sum(17..26).into()),
+        ("cache_hit_layer", d(30).into()),
+        ("cache_miss_layer", d(31).into()),
+        ("mustdraw_wait_ms", (d(29) as f64 / 1000.0).into()),
     ]
 }
 
@@ -373,7 +399,7 @@ pub(super) fn diagnostic_switches(vars: &BTreeMap<String, String>) -> (Vec<Strin
 mod telemetry_p5b_tests {
     use super::*;
 
-    const ALL: [ErrKind; 12] = [
+    const ALL: [ErrKind; 13] = [
         ErrKind::DeviceRemoved,
         ErrKind::GpuFault,
         ErrKind::PipelineRejected,
@@ -386,6 +412,7 @@ mod telemetry_p5b_tests {
         ErrKind::LoopGuardTripped,
         ErrKind::Timeout,
         ErrKind::LoadFailed,
+        ErrKind::PipelineWaitExpired,
     ];
 
     fn keys(f: &[(&'static str, serde_json::Value)]) -> Vec<&'static str> {
@@ -401,7 +428,7 @@ mod telemetry_p5b_tests {
             assert!(!n.starts_with('_') && !n.ends_with('_') && !n.contains("__"), "{n}");
             assert!(seen.insert(n), "duplicate {n}");
         }
-        assert_eq!(seen.len(), 12);
+        assert_eq!(seen.len(), 13);
     }
 
     #[test]
@@ -1238,6 +1265,43 @@ mod telemetry_p5e_tests {
         // a counter that went back never wraps
         let f = activity_pso_fields(10, 20, 1, 3);
         assert_eq!((f[0].1.as_f64(), f[1].1.as_u64()), (Some(0.0), Some(0)));
+    }
+
+    #[test]
+    fn activity_count_fields_are_deltas_and_sums() {
+        let mut prev = [0u64; 33];
+        let mut now = [0u64; 33];
+        now[0] = 500;
+        prev[0] = 100;
+        now[2] = 40;
+        prev[2] = 10;
+        // draw skips and stand-ins (4-15) and dispatch skips (17-25) are summed; others stay out
+        now[4] = 3;
+        now[9] = 2;
+        prev[9] = 1;
+        now[15] = 5;
+        now[16] = 99;
+        now[17] = 4;
+        prev[17] = 1;
+        now[25] = 6;
+        now[26] = 77;
+        now[29] = 2500;
+        prev[29] = 500;
+        now[30] = 8;
+        now[31] = 9;
+        prev[31] = 4;
+        let f = activity_count_fields(&now, &prev);
+        let get = |k: &str| f.iter().find(|(n, _)| *n == k).unwrap().1.clone();
+        assert_eq!(get("draw_total"), serde_json::json!(400));
+        assert_eq!(get("draw_no_output"), serde_json::json!(3 + 1 + 5));
+        assert_eq!(get("dispatch_total"), serde_json::json!(30));
+        assert_eq!(get("dispatch_skipped"), serde_json::json!(3 + 6));
+        assert_eq!(get("cache_hit_layer"), serde_json::json!(8));
+        assert_eq!(get("cache_miss_layer"), serde_json::json!(5));
+        assert_eq!(get("mustdraw_wait_ms"), serde_json::json!(2.0));
+        // a count that went back never wraps
+        let f = activity_count_fields(&prev, &now);
+        assert!(f.iter().all(|(_, v)| v.as_f64() == Some(0.0)));
     }
 
     #[test]

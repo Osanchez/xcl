@@ -234,6 +234,12 @@ fn telemetry_frame_events_match_the_run() {
     for (k, (_, f)) in frames.iter().enumerate() {
         assert_eq!(f["i"].as_u64(), Some(k as u64 + 1), "frame events must run 1..N without gaps: {f}");
         assert!(f["pso_wait_draw_ms"].is_number() && f["pso_wait_dispatch_ms"].is_number(), "frame {}: missing pso_wait_draw_ms / pso_wait_dispatch_ms: {f}", k + 1);
+        // the call totals are always written and count every draw and dispatch the title made
+        for (total, issued) in [("draw_total", "draws"), ("dispatch_total", "dispatches")] {
+            let (t, n) = (f[total].as_u64(), f[issued].as_u64());
+            assert!(t.is_some() && n.is_some() && t >= n, "frame {}: {total} {t:?} must be at least {issued} {n:?}: {f}", k + 1);
+        }
+        assert!(f["ei_draw_total"].is_u64() && f["ei_dispatch_total"].is_u64() && f["mustdraw_wait_ms"].is_number(), "frame {}: {f}", k + 1);
     }
 
     // `memory` events only move forward
@@ -436,6 +442,7 @@ fn activity_events_mirror_the_log() {
     assert!(acts.len().abs_diff(lines.len()) <= 1, "{} activity events vs {} log lines", acts.len(), lines.len());
     for a in &acts {
         assert!(a["presents_2s"].is_u64() && a["committed_mb"].is_u64(), "activity: {a}");
+        assert!(a["draw_total"].is_u64() && a["dispatch_total"].is_u64() && a["dispatch_skipped"].is_u64(), "activity: {a}");
     }
     if acts.len() == lines.len() {
         for (k, (a, n)) in acts.iter().zip(&lines).enumerate() {
