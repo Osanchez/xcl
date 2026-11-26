@@ -1,4 +1,4 @@
-# Resume here (2026-11-25)
+# Resume here (2026-11-26)
 
 Handoff for continuing this fork's work on another PC. Read this first, then
 [telemetry.md](telemetry.md) and the last entry of `.flowestra/decisions.md`.
@@ -15,7 +15,13 @@ anyone watching it.
 - **Security review of those commits:** four AI reviewers read all 19,001 diff lines; findings were
   checked against the code. No malicious code found. Older code and dependencies were not reviewed.
 - **Hourly sync is off.** The `fork-sync` workflow is disabled on GitHub. Syncing is manual.
-- **Telemetry spec rewritten** (`telemetry.md`). Awaiting the user's final review; nothing is built.
+- **Telemetry parts 1 to 6 built and tested** (2026-11-26): 14 commits on branch `adopt/diagnostics-2`
+  (worktree `xcl-adopt`), on top of 15 adopted upstream PRs. The branch is not pushed and `dev` has not
+  been moved to it: that is the user's decision. Status table: `telemetry.md` section 8. Last
+  whole-suite result (RTX 5080, desktop session): 1603 passed, 4 failed
+  (`gpu::dxil::fuzz_tests::fuzz_validate_and_gpu_0..3`, failing before this work), 47 ignored, 44
+  SKIPPED lines. Not tested on AMD. Smoke run of the title, 60 s, telemetry off: 1,659 frames against
+  1,662 on `dev`, no device removal, no crash.
 - **`CLAUDE.md` hard limits** added (no game data, gated merges, commit only when asked).
 - **Merge protection, first version** (`scripts/dev/pr-gate.py`, `merge-pr.py`, `merge-guard.py`,
   `.githooks/pre-merge-commit`, `test_merge_protection.py`): 60 tests passed on 2026-11-25, but
@@ -34,22 +40,29 @@ anyone watching it.
    - cover `timeout`, PowerShell `iex` / `Start-Process`, and `patch`;
    - binary files must be named in the review.
    Then repeat an adversarial review before relying on it.
-2. **User reviews `telemetry.md`.** No telemetry code before approval.
-3. **Build telemetry parts 1 to 6** from the spec, in order. Tests use `tests/testtitle` and
-   synthetic shaders only.
+2. **Deep dive on the title's freeze past the menus**, with telemetry at tier `pass`. Known before
+   the dive: frames stop about 96 to 117 s after the first button press; the stub
+   `ID3D12GraphicsCommandList10::#101` is called right before; the menus are frame-clock bound (about
+   33 ms per frame, of which about 2 ms CPU and under 2 ms GPU). What the title shows is labelled by
+   the user from a screenshot (phase control file), not guessed.
+3. **After that, by the user's choice and with measurements first:** items from the study of another
+   project's AMD work (kept outside the repo). Nothing from it may be ported: its licence is
+   GPL-3.0-or-later, XCL is GPL-2.0-only.
 4. **Split-wave exchange report:** build it cleanly on a new
    branch, `git switch -c shaders/wave64-exchange-report origin/main` (the old one was local and
    empty), so it could be shared. Decide later whether to send it.
 
 ## Open questions for the user
 
-1. Approve `telemetry.md`, or change it?
-2. Which title, if any, will be measured? Unanswered. It does not block parts 1 to 6.
+1. Move `dev` to `adopt/diagnostics-2` (and push it), or not?
+2. Which title, if any, will be measured? Unanswered.
 3. Publish the exchange report upstream once its numbers are known?
 4. Report the two test findings below upstream? Nothing has been posted.
 
-Settled: D1 to D8 are in `telemetry.md`. Code goes in `log.rs` and `report.rs`; overhead is checked
-from part 2; every outside change needs a full diff review plus the user's approval; building
+Settled: D1 to D17 are in `telemetry.md`. Telemetry code is in the fork-only files
+`crates/xcl/src/telemetry_gpu.rs` and `crates/xcl/src/telemetry_run.rs` (included from `report.rs`),
+with event and manifest plumbing in `log.rs` and `report.rs` and one-line call sites in upstream files
+(this replaces the earlier D6); overhead is measured (`telemetry.md` 5.10); every outside change needs a full diff review plus the user's approval; building
 reviewed code locally is fine.
 
 ## Known test state

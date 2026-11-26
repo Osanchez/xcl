@@ -50,6 +50,7 @@ not tested" in a PR (`AGENTS.md:27`).
 | [gpu-recompiler.md](gpu-recompiler.md) | RDNA2 decode, HLSL emission, DXC, textures, UMA windows, BVH, how to add an instruction |
 | [testing-and-scripts.md](testing-and-scripts.md) | Test layout, what each test needs, every file in `scripts/` |
 | [fork-workflow-for-agents.md](fork-workflow-for-agents.md) | Short rules for coding agents working in the fork |
+| [telemetry.md](telemetry.md) | The fork's telemetry: the run folder, the manifest, every event, the tiers and switches, how to read a run |
 | [toolkit/README.md](toolkit/README.md) | Index of the third-party reverse-engineering tools, with one notes page per tool |
 
 ## Other documents
