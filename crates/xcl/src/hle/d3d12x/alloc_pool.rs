@@ -252,14 +252,19 @@ pub(super) unsafe fn allocator_in_flight(alloc: usize) -> bool {
 /// allocator may get its address, and must not go on with this one's PC allocators. The ones
 /// made here go with it (those lists still record on are left alone: not freed, not tracked).
 pub unsafe fn forget(alloc: usize) {
-    let made: Vec<usize> = {
+    let (made, free_backings): (Vec<usize>, Vec<usize>) = {
         let mut g = STATE.lock().unwrap();
-        let Some(s) = g.as_mut() else { return };
+        let Some(s) = g.as_mut() else {
+            drop(g);
+            super::console_list::allocator_reset(alloc as *mut c_void);
+            return;
+        };
         s.types.remove(&alloc);
         let mut mine: Vec<usize> = s.aside.remove(&alloc).unwrap_or_default();
         mine.extend(s.cur.remove(&alloc));
         mine.push(alloc);
         let mut made = Vec::new();
+        let mut free_backings = Vec::new();
         for b in mine {
             let free = s.backings.get(&b).is_none_or(|x| x.free());
             if let Some(gone) = s.backings.remove(&b) {
@@ -267,13 +272,19 @@ pub unsafe fn forget(alloc: usize) {
                     s.of_list.remove(&l);
                 }
             }
-            if b != alloc && free {
-                made.push(b);
+            if free {
+                free_backings.push(b);
+                if b != alloc {
+                    made.push(b);
+                }
             }
         }
-        made
+        (made, free_backings)
     };
-    // (outside the lock: their Release comes back here)
+    // (outside the lock: UMA frees and Release callbacks must not re-enter STATE)
+    for b in free_backings {
+        super::console_list::allocator_reset(b as *mut c_void);
+    }
     for b in made {
         drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
     }
@@ -857,6 +868,95 @@ mod tests {
             resets.clear();
             assert_eq!(title_reset_in(&mut s, alloc as *mut c_void, |r| { resets.push(r as usize); 0 }), None);
             assert!(resets.is_empty(), "already-reset aside backings should not be reset again");
+        }
+    }
+
+    #[test]
+    fn stalled_primary_stand_in_reset_keeps_uma_blocks_until_native_backing_resets() {
+        unsafe {
+            let Ok(dev) = crate::gpu::agility::create_device(None, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0) else {
+                return crate::gpu::recomp::runner::skip_test("no GPU");
+            };
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut ids = Box::new([0u8; 5]);
+            let base = ids.as_mut_ptr() as usize;
+            let (title_alloc, spare_backing, primary, stand_in, queue) = (base, base + 1, base + 2, base + 3, base + 4);
+
+            // 1. Primary records on logical `title_alloc` (native backing == `title_alloc`)
+            //    with UMA block `0x1111` and is submitted while GPU fence stays unsignaled.
+            created_on(primary, title_alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+            super::super::bind::reset(primary as *mut c_void, title_alloc, 0);
+            super::super::bind::push_uma_for_test(primary as *mut c_void, 0x1111);
+            {
+                let mut g = STATE.lock().unwrap();
+                let s = g.as_mut().unwrap();
+                s.aside.insert(title_alloc, vec![spare_backing]);
+                s.backings.insert(spare_backing, Backing::default());
+                s.backings.entry(title_alloc).or_default().marks.insert(queue, (fence.clone(), 1));
+                let recording = s.recordings[&primary];
+                s.last_submit.insert(primary, LastSubmit { queue, fence: fence.clone(), value: 1, recording });
+            }
+
+            // 2. Title resets list while `primary` is still in flight: `title_list::reset` selects
+            //    `stand_in`, detaches `primary`'s bind blocks, and retires `primary`'s recording.
+            super::super::bind::reset(primary as *mut c_void, 0, 0);
+            retire_recording(primary);
+            assert!(in_flight(primary), "primary must remain in_flight until GPU finishes");
+
+            // 3. Title resets logical `title_alloc`: `alloc_pool` swaps to `spare_backing` and
+            //    ONLY resets `spare_backing` (NOT `title_alloc`, which still has GPU work in flight).
+            let mut native_resets = Vec::new();
+            {
+                let mut g = STATE.lock().unwrap();
+                let s = g.as_mut().unwrap();
+                assert_eq!(
+                    title_reset_in(s, title_alloc as *mut c_void, |r| { native_resets.push(r as usize); 0 }),
+                    Some(0)
+                );
+            }
+            assert_eq!(native_resets, vec![spare_backing], "swap reset must only reset the idle spare backing");
+            assert_eq!(current(title_alloc), spare_backing);
+
+            // `stand_in` recording on logical `title_alloc` must key its UMA blocks to `spare_backing`.
+            super::super::bind::reset(stand_in as *mut c_void, title_alloc, 0);
+            super::super::bind::push_uma_for_test(stand_in as *mut c_void, 0x2222);
+            super::super::bind::reset(stand_in as *mut c_void, 0, 0);
+
+            // Clearing `spare_backing` (what `reset_pc_allocator(spare_backing)` does) leaves
+            // `primary`'s blocks under stalled native backing `title_alloc` untouched.
+            assert_eq!(super::super::console_list::take_pending_for_test(spare_backing), vec![0x2222]);
+            assert_eq!(super::super::console_list::take_pending_for_test(title_alloc), vec![0x1111]);
+
+            // 4. Once the GPU signals the fence on `title_alloc`, the next title reset reclaims
+            //    and resets native backing `title_alloc`, which is when its blocks may be freed.
+            super::super::console_list::hold_until_reset(title_alloc, vec![0x1111]);
+            fence.Signal(1).unwrap();
+            native_resets.clear();
+            {
+                let mut g = STATE.lock().unwrap();
+                let s = g.as_mut().unwrap();
+                assert_eq!(
+                    title_reset_in(s, title_alloc as *mut c_void, |r| { native_resets.push(r as usize); 0 }),
+                    Some(0)
+                );
+            }
+            assert!(native_resets.contains(&title_alloc), "completed aside backing must be reset on reclaim");
+            assert_eq!(super::super::console_list::take_pending_for_test(title_alloc), vec![0x1111]);
+
+            super::super::bind::forget(primary as *mut c_void);
+            super::super::bind::forget(stand_in as *mut c_void);
+            forget_list(primary);
+            forget_list(stand_in);
+            // Remove synthetic non-COM `spare_backing` before `forget` drops made PC allocators.
+            {
+                let mut g = STATE.lock().unwrap();
+                if let Some(s) = g.as_mut() {
+                    s.cur.remove(&title_alloc);
+                    s.aside.remove(&title_alloc);
+                    s.backings.remove(&spare_backing);
+                }
+            }
+            forget(title_alloc);
         }
     }
 }
