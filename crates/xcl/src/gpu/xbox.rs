@@ -183,6 +183,24 @@ fn find_xdat(blob: &[u8]) -> Option<(super::shader::Part, usize)> {
     Some((dxil, x))
 }
 
+/// The name in the container's `ILDN` part (u16 flags, u16 length, the name, maybe a NUL).
+/// `None` without the part, or when the length is 0, over 260 or longer than the part, or the
+/// name is not printable ASCII.
+pub fn debug_name(blob: &[u8]) -> Option<String> {
+    let parts = container_parts(blob)?;
+    let part = parts.into_iter().find(|p| p.fourcc == "ILDN")?;
+    let d = &blob[part.offset..part.offset + part.size];
+    let len = u16::from_le_bytes([*d.get(2)?, *d.get(3)?]) as usize;
+    if !(1..=260).contains(&len) {
+        return None;
+    }
+    let name = d.get(4..4 + len)?;
+    if !name.iter().all(|b| (0x20..=0x7E).contains(b)) {
+        return None;
+    }
+    Some(String::from_utf8_lossy(name).into_owned())
+}
+
 /// Is this a console shader container (DXIL part carrying XDAT instead of bitcode)?
 pub fn is_xbox(blob: &[u8]) -> bool {
     find_xdat(blob).is_some()
@@ -993,6 +1011,39 @@ pub(crate) mod tests {
         assert_eq!(wave64(0x1F | 0x40), (false, true));
         assert_eq!(wave64(0), (false, true));
         assert_eq!(wave64(0xDEAD_BEEF), (false, true));
+    }
+
+    fn ildn(flags: u16, len: u16, name: &[u8]) -> Vec<u8> {
+        let mut v = flags.to_le_bytes().to_vec();
+        v.extend_from_slice(&len.to_le_bytes());
+        v.extend_from_slice(name);
+        v
+    }
+
+    #[test]
+    fn debug_name_reads_ildn() {
+        let mut named = b"CS_TestResolve".to_vec();
+        named.push(0);
+        let blob = container(&[(b"HASH", &[0; 20]), (b"ILDN", &ildn(1, 14, &named))]);
+        assert_eq!(debug_name(&blob).as_deref(), Some("CS_TestResolve"));
+    }
+
+    #[test]
+    fn debug_name_none_without_ildn() {
+        assert_eq!(debug_name(&container(&[(b"HASH", &[0; 20])])), None);
+        assert_eq!(debug_name(b"random"), None);
+    }
+
+    #[test]
+    fn debug_name_rejects_bad_lengths_and_non_ascii() {
+        let name = |part: &[u8]| debug_name(&container(&[(b"ILDN", part)]));
+        assert_eq!(name(&ildn(0, 0, b"")), None, "zero length");
+        assert_eq!(name(&ildn(0, 20, b"short")), None, "longer than the part");
+        assert_eq!(name(&ildn(0, 261, &[b'a'; 261])), None, "over 260");
+        assert_eq!(name(&ildn(0, 260, &[b'a'; 260])).map(|n| n.len()), Some(260));
+        assert_eq!(name(&ildn(0, 4, b"ab\x01c")), None, "control byte");
+        assert_eq!(name(&ildn(0, 4, b"ab\xC3\xA9")), None, "non-ASCII");
+        assert_eq!(name(&[0, 0, 5]), None, "no room for the length");
     }
 
     #[test]

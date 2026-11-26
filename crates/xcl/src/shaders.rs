@@ -808,6 +808,8 @@ struct ShadersOptions {
     min_kb: usize,
     count: usize,
     record_hash: Option<u64>,
+    list_records: Option<String>,
+    role: String,
     measure_pso: Option<u64>,
     repeat: usize,
     precompile: bool,
@@ -843,6 +845,8 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
         min_kb: 1024,
         count: 2,
         record_hash: None,
+        list_records: None,
+        role: "consumer".to_string(),
         measure_pso: None,
         repeat: 1,
         precompile: false,
@@ -881,6 +885,14 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--min-kb" => opts.min_kb = p.parse_usize("--min-kb")?,
             "--count" => opts.count = p.parse_usize("--count")?,
             "--record-hash" => opts.record_hash = Some(p.parse_hex_u64("--record-hash")?),
+            "--list-records" => opts.list_records = Some(p.value("--list-records")?.to_string()),
+            "--role" => {
+                let v = p.value("--role")?;
+                if v != "producer" && v != "consumer" {
+                    return Err(format!("invalid value for --role: {v} (expected producer or consumer)"));
+                }
+                opts.role = v.to_string();
+            }
             "--measure-pso" => opts.measure_pso = Some(p.parse_hex_u64("--measure-pso")?),
             "--repeat" => opts.repeat = p.parse_usize("--repeat")?,
             "--precompile" => opts.precompile = true,
@@ -947,7 +959,7 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             let records = pack::scan(&data, 0x40);
             let what = format!("RPF9 package {:.1} MB, {} shader records", data.len() as f64 / 1048576.0, records.len());
             (Input::Pack { data, records }, what)
-        } else if opts.export_hlsl.is_some() || opts.measure_pso.is_some() {
+        } else if opts.export_hlsl.is_some() || opts.measure_pso.is_some() || opts.list_records.is_some() {
             // one shader file: the record to export or measure
             (Input::Files(vec![path.to_path_buf()]), "single file".to_string())
         } else {
@@ -956,6 +968,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
             return print(path, "single file", a, top, json, t0, compile);
         }
     };
+    if let Some(glob) = &opts.list_records {
+        return list_records(&input, glob, &opts.role);
+    }
     if let Some(dir) = &opts.export_hlsl {
         return export_hlsl(
             &input,
@@ -1016,6 +1031,52 @@ fn record_by_hash(input: &Input, target: u64) -> Result<(String, Vec<u8>), Strin
         }
     }
     Err(format!("record {target:016x} not found ({unreadable} record(s) could not be read or inflated)"))
+}
+
+/// The lines `--list-records` prints: for each compute record (name without the ` @offset`
+/// suffix, inflated blob) whose name matches the glob (whole name, case-insensitive), the
+/// record key (`fnv64` of the blob, 16 hex digits), the role and the name. A key is listed once.
+fn list_record_lines(items: impl Iterator<Item = (String, Vec<u8>)>, glob: &str, role: &str) -> Vec<String> {
+    let glob = glob.to_ascii_lowercase();
+    let mut listed = HashSet::new();
+    let mut lines = Vec::new();
+    for (name, blob) in items {
+        if !crate::util::glob_match(&glob, &name.to_ascii_lowercase()) {
+            continue;
+        }
+        let hash = shader::fnv64(&blob);
+        if listed.insert(hash) {
+            lines.push(format!("{hash:016x} {role}  # {name}"));
+        }
+    }
+    lines
+}
+
+/// `--list-records`: print the record keys of the compute programs whose pack name matches
+/// `glob`, in input order. Compiles and writes nothing.
+fn list_records(input: &Input, glob: &str, role: &str) -> i32 {
+    let mut compute = Vec::new();
+    for i in 0..input.len() {
+        let (name, blob) = input.get(i);
+        let Some(blob) = blob else {
+            eprintln!("  {name}: could not read or inflate record");
+            continue;
+        };
+        if !is_compute_container(&blob) {
+            continue;
+        }
+        let name = match input {
+            Input::Pack { .. } => name.rsplit_once(" @").map_or(name.as_str(), |(n, _)| n).to_string(),
+            Input::Files(_) => name,
+        };
+        compute.push((name, blob));
+    }
+    let lines = list_record_lines(compute.into_iter(), glob, role);
+    for l in &lines {
+        println!("{l}");
+    }
+    eprintln!("{} records listed", lines.len());
+    0
 }
 
 /// Write compute HLSL in input order. `record_hash` selects exactly one console blob and
@@ -2094,6 +2155,36 @@ mod tests {
             compute[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
         }
         sample(5, &[compute])
+    }
+
+    #[test]
+    fn list_records_matches_glob_and_prints_roles() {
+        let a = b"blob a".to_vec();
+        let b = b"blob b".to_vec();
+        let items = || {
+            vec![
+                ("Fx_TestResolve_01".to_string(), a.clone()),
+                ("other_name".to_string(), b.clone()),
+                ("fx_testresolve_02".to_string(), a.clone()),
+                ("FX_TESTRESOLVE_03".to_string(), b.clone()),
+            ]
+            .into_iter()
+        };
+        let lines = list_record_lines(items(), "fx_test*", "consumer");
+        assert_eq!(
+            lines,
+            vec![
+                format!("{:016x} consumer  # Fx_TestResolve_01", shader::fnv64(&a)),
+                format!("{:016x} consumer  # FX_TESTRESOLVE_03", shader::fnv64(&b)),
+            ]
+        );
+        let lines = list_record_lines(items(), "OTHER_NAME", "producer");
+        assert_eq!(lines, vec![format!("{:016x} producer  # other_name", shader::fnv64(&b))]);
+        assert!(list_record_lines(items(), "nomatch*", "consumer").is_empty());
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_args(&a(&["--list-records", "x*"])).unwrap().role, "consumer");
+        assert_eq!(parse_args(&a(&["--list-records", "x*", "--role", "producer"])).unwrap().role, "producer");
+        assert!(parse_args(&a(&["--list-records", "x*", "--role", "other"])).is_err());
     }
 
     #[test]

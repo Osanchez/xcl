@@ -39,6 +39,8 @@ Usage:
           --used-only skips compute shaders whose pipelines were not used in earlier runs.
       --export-hlsl DIR [--count N] [--min-kb N] [--record-hash HEX]: writes deterministic
           compute HLSL for investigation; an exact hash bypasses the size threshold.
+      --list-records GLOB [--role producer|consumer]: prints the record key of each compute
+          program whose pack name matches GLOB, as `<key> <role>  # <name>` (a list file).
       --measure-pso HEX [--repeat N]: times cache-disabled driver compilation of one exact
           compute record with XCL's real root signature and static samplers.
       --direct [--sample N] [--seed S] [--validate] [--compare]: direct DXIL translator
