@@ -354,6 +354,7 @@ pub fn telemetry_start(boot: &crate::config::Boot) {
     }
     crate::xlog_info!("telemetry: {} -> {}", tier.name(), dir.display());
     gpu_tel::telemetry_gpu_start();
+    run_tel::telemetry_poll_start(boot.logs_dir());
 }
 
 /// The manifest of a run at its start (device and DXC fields still null).
