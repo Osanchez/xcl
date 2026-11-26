@@ -11395,8 +11395,8 @@ Rule: the title gets the columns between "XCL " and the uptime, with one free co
 uptime: `room = 28 - (len(uptime) + 1) - 4` (15 for "HH:MM:SS", 14 past 99 hours). If it fits,
 print it whole. Otherwise print the longest run of whole words that fits in `room - 3`, trailing
 `, : ; -` and spaces removed, then "..." ('.' is in the font). If the first word alone is longer,
-cut it at `room - 3` and add "...". "Grand Theft Auto V" -> "Grand Theft...";
-"Halo: The Master Chief Collection" -> "Halo: The..."; "Abc: Defghijklmnop" -> "Abc...".
+cut it at `room - 3` and add "...". "Large Sample Title V" -> "Large Sample...";
+"Demo: The Long Subtitle Edition" -> "Demo: The..."; "Abc: Defghijklmnop" -> "Abc...".
 
 Changes:
 - `layout.rs`, new function:
@@ -11431,9 +11431,9 @@ Changes:
   line(out, p, 28 - up.len() as u32, 6, up.as_str(), LABEL);
   ```
 - Tests in `layout.rs` `mod tests`:
-  - `long_title_is_cut_at_a_word_with_dots`: the three examples above at 15; "Halo" unchanged;
+  - `long_title_is_cut_at_a_word_with_dots`: the three examples above at 15; "Demo" unchanged;
     "Supercalifragilistic" -> "Supercalifr..." ; result length always <= max; `max = 3` -> empty.
-  - `title_leaves_a_column_before_the_uptime`: `st.title = "Grand Theft Auto V"`, Full at 1080;
+  - `title_leaves_a_column_before_the_uptime`: `st.title = "Large Sample Title V"`, Full at 1080;
     on the header row the last title glyph's right edge is at least one column (12 px) left of the
     first uptime glyph.
   - Existing `glyphs_advance_six_dots_and_skip_spaces` ("A B") and
