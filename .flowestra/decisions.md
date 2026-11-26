@@ -9850,3 +9850,118 @@ numbers below. The cost baseline: the same run with telemetry `frame` and no new
 - **U3's rt-role counters:** a ray-tracing feature metric, not removal evidence.
 - **GBV on the full title:** too slow (research report §3.1). The switch is there for reduced
   repros.
+
+## 2026-11-26 NVIDIA driver profile: a read-only `xcl nvprofile dump` / `list` (orchestrator decided; the user delegated profile decisions)
+
+### 0. Decision and review
+
+- **User (2026-11-26):** asked to "investigate other GPU profile settings that are typically
+  adjusted for games" and to come back with findings; then: "I want you to make the decision
+  yourself for now until I say otherwise, just remind me when you have made one. I'm trying to
+  get a good starting profile". The shader heap is at 2048 MB by the user's choice.
+- **Decision (orchestrator):** before any other setting is changed, read real data from the
+  installed driver: what resolves for `xcl.exe`, which predefined profiles set the shader heap
+  and to what, and the full predefined profiles of comparable titles. That needs the read-only
+  command below. It never writes to the driver and runs unelevated. Testing a further setting
+  needs a separate writing change (`install --set`), decided after the dump is read.
+- **Measured on the PC today (read only):** the driver's shader cache folder
+  (`%LOCALAPPDATA%\NVIDIA\DXCache`) holds 933 files, 25.0 GB; its largest files are 2,048 MB.
+- **Research behind it** (outside the repository): candidates in order are the shader heap size
+  from a measured peak, the shader disk cache (on/off and size), power management mode,
+  background and idle frame limits (check only), and the per-application Resizable BAR policy.
+  Low-latency, v-sync, frame limiter, threaded optimisation, CUDA fallback, texture filtering and
+  feature overrides were judged not worth testing for a D3D12 process at 2-3 frames a second.
+- **Checked by the orchestrator:** `gpu/nvprofile.rs` holds `struct Api`, `api()`, `Session`,
+  `status`, `install`, `remove`, `parse`, `run` and the tests named below; the interface ids and
+  status codes in the section come from NVIDIA's MIT-licensed headers and are verified on the PC
+  by the command's first run (a wrong id fails with "NVAPI has no function").
+- **One addition to the section:** the functions that load `ReadApi` use the same
+  System32-only loading as `api()` (`LoadLibraryExW` with `LOAD_LIBRARY_SEARCH_SYSTEM32`).
+### C. Read-only `xcl nvprofile dump` / `list`: work unit for a writer
+
+Goal: print real profile data from the installed driver. Never calls `SetSetting`, `CreateProfile`,
+`CreateApplication`, `DeleteProfile`, `SaveSettings`, or any `Restore*` / `Delete*` function. Runs unelevated.
+Target: about 250 changed lines in `crates/xcl/src/gpu/nvprofile.rs` and 1 line of help in `crates/xcl/src/main.rs:53`.
+
+#### C.1 Functions to add to `struct Api` (`nvprofile.rs:91-103`) and `api()` (`nvprofile.rs:121-133`)
+
+Ids from `nvapi_interface.h` (NVIDIA/nvapi `main` `51e5aae`), signatures from `nvapi.h` of the same commit:
+
+| function | id | signature (C) | header line |
+|---|---|---|---|
+| `NvAPI_DRS_EnumProfiles` | `0xBC371EE0` | `(NvDRSSessionHandle, NvU32 index, NvDRSProfileHandle*)` | nvapi.h 24993 |
+| `NvAPI_DRS_GetNumProfiles` | `0x1DAE4FBC` | `(NvDRSSessionHandle, NvU32*)` | 25013 |
+| `NvAPI_DRS_GetProfileInfo` | `0x61CD6FD6` | `(NvDRSSessionHandle, NvDRSProfileHandle, NVDRS_PROFILE*)` | 24928 |
+| `NvAPI_DRS_EnumApplications` | `0x7FA2173A` | `(hSession, hProfile, NvU32 startIndex, NvU32* appCount, NVDRS_APPLICATION*)` | 25131 |
+| `NvAPI_DRS_EnumSettings` | `0xAE3039DA` | `(hSession, hProfile, NvU32 startIndex, NvU32* settingsCount, NVDRS_SETTING*)` | 25223 |
+| `NvAPI_DRS_GetSettingNameFromId` | `0xD61CBE6E` | `(NvU32 settingId, NvAPI_UnicodeString* name)` (pointer to `[u16; 2048]`) | 25305 |
+| `NvAPI_DRS_GetBaseProfile` | `0xDA8466A0` | `(hSession, NvDRSProfileHandle*)` | 25405 |
+| `NvAPI_DRS_GetCurrentGlobalProfile` | `0x617BFF9F` | `(hSession, NvDRSProfileHandle*)` | 24908 |
+
+All `extern "C"` like the existing ones. Keep the read-only functions in a second struct `ReadApi` (or load them lazily
+in `dump`/`list`) so an older driver lacking one does not break `install`/`status` – `api()` fails on any missing id
+today (`nvprofile.rs:112-115`).
+
+Status code to add: `END_ENUMERATION: Status = -7` (`nvapi_lite_common.h` l.273).
+
+#### C.2 Structures (already in the file; versions)
+- `Profile` = `NVDRS_PROFILE_V1`, version `ver::<Profile>(1)` (`NVDRS_PROFILE_VER1`). `gpu_support` is a bitfield u32.
+- `Application` = `NVDRS_APPLICATION_V1`, `ver::<Application>(1)`. Enough for names; `EnumApplications` takes an array
+  of the same struct, each element's `version` set. (V4 adds `fileInFolder`, flags, `commandLine`: optional, adds 2
+  wide strings; not needed.)
+- `Setting` = `NVDRS_SETTING_V1`, `ver::<Setting>(1)`, `#pragma pack(4)`. Size stays 12,320 (test at
+  `nvprofile.rs:326-330`). **QWORD**: do not add a `u64` member to `Value` (it would raise the union's alignment to 8
+  and its size to 4,104, breaking the layout). Read a QWORD as
+  `binary.len as u64 | (u32::from_le_bytes(binary.data[0..4].try_into().unwrap()) as u64) << 32`:
+  the low dword is at offset 0 (where `len` sits) and the high dword at offset 4. FLOAT: `f32::from_bits(u32)`.
+
+#### C.3 New functions (names are suggestions)
+
+1. `fn profiles(api, s) -> Result<Vec<Handle>, String>`: loop `index = 0..` calling `EnumProfiles`; stop on
+   `END_ENUMERATION`; any other non-OK is an error. (`GetNumProfiles` only for a sanity print.)
+2. `fn profile_info(api, s, h) -> Result<Box<Profile>, String>`: `GetProfileInfo` with version set.
+3. `fn apps(api, s, h, n: u32) -> Result<Vec<String>, String>`: `vec![zeroed Application; n]` with versions set,
+   `appCount = n`, `startIndex` advancing by the returned count until `END_ENUMERATION` or `n` reached.
+4. `fn settings(api, s, h, n: u32) -> Result<Vec<Box<Setting>>, String>`: same paging with `EnumSettings`. Each element
+   is 12 KB; profiles hold tens of settings. Use a `Vec<Setting>` allocated zeroed on the heap
+   (`vec![unsafe{zeroed()}; n]` via a loop of `zeroed::<Setting>()` copies is fine).
+5. `fn setting_name(api, id, from_struct: &Wide) -> String`: the struct's `name` if non-empty, else
+   `GetSettingNameFromId`, else `"(unnamed)"`. Do not embed NPI's name table (keep it small; optional decision).
+6. `fn format_value(kind: u32, v: &Value) -> String` (pure): 0 DWORD → `0x%08X (%u)`; 1 BINARY → `len N: ` + first 32
+   bytes hex; 2 STRING / 3 WSTRING → UTF-16 up to NUL; 4 QWORD → `0x%016X`; 5 FLOAT → `%g`; other → `type K`.
+7. `fn location_name(loc: u32) -> &'static str` (pure): 0 "this profile", 1 "global profile", 2 "base profile",
+   3 "driver default" (`_NVDRS_SETTING_LOCATION`).
+8. `fn matches(pattern: &str, text: &str) -> bool` (pure): case-insensitive substring.
+9. `pub fn dump(target: &str) -> Result<(), String>`: open a session (`Session::open`, which calls `LoadSettings`:
+   read-only). Find the profile: first `FindApplicationByName(target)` (an exe), then `FindProfileByName(target)`;
+   neither found → error listing that `list <pattern>` exists. Print: profile name, predefined yes/no, number of apps
+   and the app names, then one line per setting from `EnumSettings`:
+   `0x%08X  <name>  <type>  current=<v>  predefined=<v or ->  <user-set | predefined>  [location]`.
+   A setting whose `is_current_predefined == 0` is user-set; `is_predefined_valid == 0` prints predefined as `-`.
+   Then a section "resolved for this profile" that calls the existing `get_setting` for a fixed list
+   `CANDIDATES: [u32; N]` (the ids in section D: `0x001ABC0F, 0x00198FFF, 0x00AC8497, 0x1057EB71, 0x10835005,
+   0x10835016, 0x10835017, 0x10835002, 0x00A879CF, 0x007BA09E, 0x000BFA21, 0x000F00BA, 0x000F00FF`) and prints the value
+   and `location_name`. A `SETTING_NOT_FOUND` prints "driver default (not stored)".
+   Add the line "values of internal settings may be masked by the driver" once at the end (A.2).
+10. `pub fn list(pattern: Option<&str>, setting: Option<u32>) -> Result<(), String>`: for every profile, print
+    `name | predefined | apps | settings` when the name or any app name `matches(pattern)`; with `--setting ID`, call
+    `get_setting(profile, ID)` and print only profiles where `location == 0` (set in that profile), with the value.
+    Also print the base profile (`GetBaseProfile`) and the current global profile name (`GetCurrentGlobalProfile` +
+    `GetProfileInfo`) in the header.
+11. `parse`: add `Command::Dump(String)`, `Command::List { pattern: Option<String>, setting: Option<u32> }`.
+    `--setting` takes hex with or without `0x`. `run` (`nvprofile.rs:295-319`) dispatches them and skips the trailing
+    `status` print for these two.
+
+#### C.4 Unit tests (in `nvprofile.rs` `mod tests`)
+- `the_command_line_is_checked` (extend): `dump xcl.exe` → `Dump("xcl.exe")`; `dump` alone → error; `list` →
+  `List{None,None}`; `list rdr --setting 0x001abc0f` → pattern + `0x001ABC0F`; `--setting 1ABC0F` accepted;
+  `--setting zz` and a stray extra argument → error.
+- `values_are_formatted_by_type`: DWORD, WSTRING (with NUL), BINARY (len and hex, truncated), QWORD read from the two
+  dwords (`0x0000000100000000` for 4 GB), FLOAT, unknown type.
+- `locations_are_named`: 0-3 and an out-of-range value.
+- `pattern_matching_ignores_case`.
+- `struct_sizes_match_nvapi` stays unchanged (proves the QWORD approach did not touch the layout).
+- A test that the dump path cannot write: e.g. a `const READ_ONLY_IDS` list checked against the ids used by
+  `ReadApi`, asserting none of `0x577DD202` (SetSetting), `0xFCBC7E14` (SaveSettings), `0xCC176068`, `0x4347A9DE`,
+  `0x17093206` is in it.
+The DRS calls themselves are not mocked (as in PR #2590); the PC run is the integration test.
