@@ -653,10 +653,19 @@ const LOOP_GUARD: &str = "if (xcl_budget == 0u) break; xcl_budget--;";
 /// the next largest 61 (#1307).
 const STRUCTURED_BYTES_PER_CODE_BYTE: usize = 128;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LOOP_BUDGET_TEST: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 /// The loop iteration budget of a lane (`LOOP_GUARD`): `XCL_LOOP_BUDGET`, a whole number from 1,
 /// or 65 536. A lower one shows whether a GPU busy for seconds is a loop running on data it
 /// was not given (#505); a translation with it set is not cached (`pso::cache_allowed`).
 pub(crate) fn loop_budget() -> u32 {
+    #[cfg(test)]
+    if let Some(n) = LOOP_BUDGET_TEST.with(|c| c.get()) {
+        return n;
+    }
     loop_budget_from(std::env::var("XCL_LOOP_BUDGET").ok().as_deref())
 }
 

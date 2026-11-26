@@ -159,10 +159,16 @@ fn translate_entry(
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
+    #[cfg(test)]
+    let loop_budget_seam = crate::gpu::recomp::LOOP_BUDGET_TEST.with(|c| c.get());
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
-        .spawn(move || translate_on_this_thread(&code, o, entry, compact, nest, tables))
+        .spawn(move || {
+            #[cfg(test)]
+            crate::gpu::recomp::LOOP_BUDGET_TEST.with(|c| c.set(loop_budget_seam));
+            translate_on_this_thread(&code, o, entry, compact, nest, tables)
+        })
         .map_err(|e| format!("translator thread: {e}"))?
         .join()
         .map_err(|e| {

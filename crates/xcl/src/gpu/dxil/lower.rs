@@ -32,7 +32,9 @@ pub const VAR_XDEAD: u32 = VAR_BUDGET + 4;
 /// `tw0 + 1` of the last image store / atomic through the k-th T# of `Lw::img_writes` (16
 /// slots; the recompiler's `xcl_iw{srsrc}`)
 pub const VAR_IMG_WRITE: u32 = VAR_BUDGET + 8;
-/// loop iterations a lane may run (the recompiler's `xcl_budget`)
+/// loop iterations a lane may run (the recompiler's `xcl_budget`); the default of
+/// `recomp::loop_budget`, which the translator now uses (tests use this constant)
+#[allow(dead_code)]
 pub const LOOP_BUDGET: u32 = 1 << 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +115,7 @@ impl Init {
 
     fn first(&mut self, s: &mut Shader, var: u32) -> Value {
         if var == VAR_BUDGET {
-            return s.m.i32c(LOOP_BUDGET);
+            return s.m.i32c(crate::gpu::recomp::loop_budget());
         }
         if var == super::lower_round::VAR_F32_MODE {
             return s.m.i32c(super::lower_round::MODE_INIT);

@@ -439,3 +439,52 @@ fn gpu_nested_compact_matches_plain_and_flat() {
         .expect("nested budget GPU run");
     assert_eq!((got3.sgpr, got3.vgpr, got3.scc), (plain3.sgpr, plain3.vgpr, plain3.scc), "nested loop budget");
 }
+
+/// Sets the loop budget the translator reads (`recomp::LOOP_BUDGET_TEST`) for this thread; restores
+/// "unset" on drop, so a failing assert cannot leak it to another test on the thread.
+struct BudgetSeam;
+
+impl BudgetSeam {
+    fn set(n: Option<u32>) -> Self {
+        crate::gpu::recomp::LOOP_BUDGET_TEST.with(|c| c.set(n));
+        BudgetSeam
+    }
+}
+
+impl Drop for BudgetSeam {
+    fn drop(&mut self) {
+        crate::gpu::recomp::LOOP_BUDGET_TEST.with(|c| c.set(None));
+    }
+}
+
+#[test]
+fn gpu_direct_loop_budget_follows_the_variable() {
+    match (runner::adapter(), crate::gpu::recomp::dxc::location()) {
+        (Ok(_), Ok(_)) => {}
+        (a, _) => return runner::skip_test(if a.is_err() { "no GPU" } else { "no DXC" }),
+    }
+    let i = |n: &str, e: &str, f: &[(&str, u64)], lit: Option<u32>| encode(n, e, f, lit).unwrap_or_else(|x| panic!("{n}: {x}"));
+    // s0 counts iterations; the loop leaves when s0 == `exit` (never, for u32::MAX)
+    let looping = |exit: u32| {
+        let mut v = Vec::new();
+        v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None));
+        v.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 255)], Some(exit)));
+        v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)], None));
+        v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 129)], None));
+        v.extend(i("S_ENDPGM", "ENC_SOPP", &[], None));
+        v
+    };
+    let o = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let run = |code: &[u8], compact: bool, budget: Option<u32>| {
+        let _seam = BudgetSeam::set(budget);
+        let k = translate_full_as(code, o, compact).unwrap_or_else(|e| panic!("compact {compact}: {e}"));
+        runner::run_with_statics(&k.dxil, &KernelState::default(), &[], &[], &[], &k.static_samplers).expect("GPU run")
+    };
+    for compact in [true, false] {
+        let never = looping(u32::MAX);
+        assert_eq!(run(&never, compact, Some(4096)).sgpr[0], 4096, "compact {compact}: budget 4096");
+        assert_eq!(run(&never, compact, None).sgpr[0], super::lower::LOOP_BUDGET, "compact {compact}: default budget");
+        let out = run(&looping(100), compact, Some(4096));
+        assert_eq!(&out.sgpr[..2], &[100, 1], "compact {compact}: a loop with an exit runs to it");
+    }
+}
