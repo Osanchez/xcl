@@ -4965,3 +4965,578 @@ one-after-another cost for draws under U4. The user chose a shared per-frame bud
   pass. Retail run with default switches: after the loading screen no stretch of more than 5 s
   with 0 presents; per frame `pso_wait_draw_ms + pso_wait_dispatch_ms` at most about 220 ms; no
   device removal; `builds_title` 0.
+
+## 2026-11-26 Stall fix, refinement: pipeline worker pool with lanes and a graphics reserve (orchestrator approved; internal scheduling inside the approved stall-fix design)
+
+Approved by the orchestrator on 2026-11-26 as a refinement the user would not see from outside
+(order of work and which threads take it; no switch, file format or wait rule changes). Drafted by
+an Opus design worker from run 12 (RTX 5080, driver 32.0.16.2140, build fa14d6f6, default
+switches). Checked by the orchestrator in run 12's data: no graphics `pipeline` event between
+128.2 s and 365.2 s (237.1 s), then 165 graphics builds between 365 and 370 s with a median
+`compile_ms` of 12.7 (`run12/log.txt:2465`, `2466`, `2535`). The units below are called U1-U4
+inside this entry; they are not the U1-U9 of the first stall-fix entry.
+
+Status: draft for the orchestrator's review. Nothing here is built or run. Code paths are
+`crates/xcl/src/...` on `dev` at fa14d6f6. Run data: `/Users/osanchez/xcl-pc/out/runs/run12/`.
+Helper scripts: `scratchpad/worker-pool-tools/` (`per_minute.py`, `dump_classify.py`,
+`skip_share.py`; run with `python3 -I <script> <file>`). Upstream PRs were read as text
+(`gh pr view/diff -R xcl-dev/xcl`) on 2026-11-26.
+
+### Summary (recommendation first)
+
+**Recommendation: option B, "lanes and a graphics reserve", plus option 2 of the analysis for
+image-only programs. Keep U7. Write our own code; do not adopt #628 or #2628.**
+
+1. **Lanes instead of one FIFO.** The pool's single channel plus the `NEEDED` side list become one
+   locked set of lanes. A general worker takes, in this order: wanted graphics, piece helpers,
+   wanted compute, unwanted graphics, unwanted compute, image-only. Within a lane: first in, first
+   out.
+2. **A graphics reserve.** `k = clamp(n / 4, 2, 8)` extra threads (`xcl-pso-g*`, 3 on the
+   16-thread PC) take only graphics lanes. They never run a compute build, so they never wait at a
+   compute gate. This gives the invariant a test can check: *while any graphics build is queued,
+   at least k workers are not inside a compute build or its gate.*
+3. **Image-only programs come last.** A worker takes one only when every other lane is empty and
+   no wanted build waits at any gate, and at most one is in flight at a time.
+4. **Kept as is:** U7's parking and extra workers (general workers only, cap 2n), the gate (lanes,
+   slots, commit headroom, U6's preload rule), and every wait and budget rule of U4/U5/U5b.
+5. **Telemetry:** queue lengths, worker states and gate load on the 2 s `activity` event, and a
+   new `pipeline_ready` event with the time from a pipeline's first need to built.
+
+**Why, in one paragraph (run 12).** From 128.2 s to 365.2 s no graphics pipeline was built (237 s;
+`pipeline` events). At 300 s all 30 general workers (15 + 15 extra, U7's cap) were busy: 26 waited
+in `big_compile_turn` for compute programs and 4 were in the NVIDIA compiler (`log.txt:2331-2385`).
+U7 started its extra workers, but they took the next queued item, which was compute again. The
+graphics wave at 365 s came when one freed worker got past the compute entries queued before the
+graphics ones: `xcl-pso-5` finished a 234.8 s compile at 334.7 s, then spent 30 s on smaller
+uncached compute programs that are not gated, and then built about 185 graphics pipelines alone in
+4 s (`log.txt:2465-2535`). Graphics builds take 3-57 ms each with a driver blob. The cause is the
+order the work is picked in, not the number of threads.
+
+**Size:** 4 units, each under 400 changed lines: U1 lanes and reserve (`pso_async.rs`), U2
+image-only last (`pso_async.rs`, `real.rs`), U3 telemetry (fork-only files plus one line), U4 docs.
+
+### 1. Goal and scope
+
+**Goal.** With default switches, a graphics pipeline the scene needs is built within seconds of
+its first need, however many huge compute builds are queued or waiting at the gate.
+
+**In scope.**
+- The order in which pool workers take builds.
+- Which threads may take which builds (the graphics reserve).
+- When image-only ("spared") compute programs are built.
+- Telemetry that shows the queues, the workers and the time from need to built.
+
+**Out of scope (explicitly).**
+- Gate slot counts, commit headroom, lane sizes (`real.rs:4073-4109`, `4166-4179`, `4299-4304`).
+- Wait and budget rules of U4/U5/U5b (`pso_async.rs:1557-1690`, `1739-1806`).
+- Giving a worker back at the gate (option A). Rejected now, see 5.1. Possible follow-up.
+- Gating 128-256 KB compute compiles (upstream #2726). These took 2-22 s each in run 12, ungated
+  (`log.txt:2464`, `2478-2534`). The lanes stop them from delaying graphics. Their own cost is a
+  separate change.
+- Frame rate (2 fps from about 187 s, `log.txt:2002`, `2473`). It has a separate cause, the looks
+  before submits.
+- Per-cause skip counters (analysis 8.1) and stall-fix U8 counters. They help, but this change
+  does not need them.
+- The about 33 % of draws still skipped after the graphics wave (394-459 s, see 2.2). This change
+  does not explain it.
+
+### 2. Architecture and data flow
+
+#### 2.1 Today (fa14d6f6)
+
+- **Queue.** One `mpsc` channel of `Work` closures (`pso_async.rs:330-347`) and a side list
+  `NEEDED` (`pso_async.rs:283-288`). A worker blocks in `recv`. After each item it receives, it
+  first drains `NEEDED` (`pso_async.rs:318-328`).
+- **Into `NEEDED`.** `need_now` pushes once per pipeline, graphics and compute alike, and sends a
+  no-op closure to wake a worker (`pso_async.rs:1710-1722`). It is called by every waiting bind:
+  draws through `wait_in_frame` (`pso_async.rs:1739-1740`, from `resolve_draw_with` at 1782-1804),
+  compute binds in frame mode (`pso_async.rs:1564-1576`, through `wait_in_frame`) and the limited or unlimited
+  compute wait (`pso_async.rs:1599-1602`), plus `need_by_submit` (`pso_async.rs:2077-2080`).
+- **Into the channel.** `enqueue` (`pso_async.rs:400-402`): from `resolve` on a lazy pipeline's
+  first use (SetPipelineState and others, `pso_async.rs:1521-1535`), from `resolve_within`
+  (`1835`), from `resolve_spared` for image-only programs (`1886-1904`), and from `submit` when
+  lazy creation is off (`494`). `build_pieces` sends piece helpers (`pso_async.rs:419-443`).
+- **Workers.** `compile_threads()` workers (`gpu/recomp/dxc.rs:409-415`; 15 on the PC), named
+  `xcl-pso-{k}`, 64 MB stack (`pso_async.rs:336-344`). Preloads run on 2-4 separate
+  `xcl-pso-pre-*` threads at the lowest priority (`pso_async.rs:592-640`).
+- **The size is known only inside the build.** A lazy compute job translates first. Only then does
+  it know its DXIL size (`real.rs:4699-4702`). The gate is reached inside `compute_container`
+  (`real.rs:4802-4824`) → `driver_compile_identified` (`real.rs:4202-4205`).
+- **Gate.** On an `xcl-pso*` thread, a compile of 256 KB or more with no driver blob waits in
+  `big_compile_turn` (`real.rs:4202-4205`, `4238-4240`, `4253-4294`). There are three lanes:
+  compute (`BIG_COMPILES`), graphics, and giant (4 MiB and more) (`real.rs:4166-4179`). Unwanted
+  builds: `most` = 4 on the PC (`real.rs:4073-4075`) and commit headroom
+  (`real.rs:4270-4272`, `4301-4311`). Wanted builds: `wanted_most` = 5 (`real.rs:4107-4109`), no
+  commit check. A preload gives way (`real.rs:4269`).
+- **U7.** The first time a build waits in the gate it calls `park()` (`real.rs:4289-4291`). On a
+  pool worker this counts it and, while `WORKERS - PARKED < n` and `WORKERS < 2n`, starts
+  `xcl-pso-x{k}` (`pso_async.rs:351-393`). Extra workers never exit.
+- **Image-only.** At creation, `big_and_image_only` marks a compute pipeline spared
+  (`real.rs:5997`, `6014-6016`). Binds never wait for it, and its dispatches are left out until it
+  is built (`pso_async.rs:1560-1562`, `1886-1904`). Its build is not wanted.
+
+#### 2.2 What run 12 shows (switches in `manifest.json`: `XCL_TELEMETRY=pass`, `XCL_ACTIVITY=1`, `XCL_RUN_SECONDS=720`, `XCL_THREAD_DUMP_AT=300,600`, `XCL_UMA_MB=4095`)
+
+| Time (s) | Graphics built | Compute built | Source |
+|---|---|---|---|
+| 90-120 | 124 (122 worker, 2 extra) | 229 | `pipeline` events, `per_minute.py` |
+| 120-150 | 8 (extra) | 61 | same |
+| 128.2 → 365.2 | **0** (a 237 s gap) | 12 | same |
+| 360-390 | 188 (185 worker) | 19 | same |
+| 390-720 | 2-22 per 30 s | 0-13 per 30 s | same |
+
+- **Skipped draws.** Of the draws with translated pipelines, 76.7 %, 75.8 %, 75.0 %, 75.2 % and
+  73.4 % were skipped in the windows 102-157, 157-200, 200-250, 250-297 and 297-351 s. After the
+  wave it fell to 44.0 % (351-394 s) and 33.2 % (394-459 s). Source: the "console code so far"
+  lines, with `skip_share.py`. The last such line is at 459 s (`log.txt` "262144 draws ...").
+- **The 300 s dump** (`log.txt:2228`, 158 threads; `dump_classify.py`). Of 30 general workers, 26
+  were in `big_compile_turn` called from `compute_container` and 4 were in `nvgpucomp64`
+  (`xcl-pso-0, -1, -5, -x2`). There were 15 extra workers (`xcl-pso-x0` … `x14`,
+  `log.txt:2371-2385`), so U7's cap of 2n was reached. Preloads: 2 in the gate, 1 in the driver.
+  No graphics build was in the gate.
+- **The 600 s dump** (`log.txt:3611`): 25 in the gate, 6 in the driver, 2 idle. **704 s**
+  (`log.txt:4227`): 19 in the gate, 9 in the driver, 4 idle.
+- **Compute compiles are slow.** Huge compute builds took 183-374 s each in the driver (`pipeline`
+  events: `compile_ms` 207,422 / 223,971 / 234,802 / 374,461 …). Waits at the gate reached
+  175-440 s (`waited_ms`). Only 20 uncached huge compute compiles started after 90 s
+  (`driver compile start … compute … absent`).
+- **Graphics compiles are cheap.** The graphics builds at 365-369 s took 9-57 ms each, with a
+  driver blob (`pipeline` events, `log.txt:2535ff`).
+- **Why the wave came at 365 s.** In order:
+  1. `xcl-pso-0` (thread 31368) finished a huge compute at 307.3 s (`log.txt:2405`). It then built
+     a 234,552 B compute in 21.9 s, ungated (`log.txt:2464`), and logged nothing more: it parked
+     on the next huge one.
+  2. `xcl-pso-1` (21372) finished at 323.9 s (`log.txt:2439`) and logged nothing more.
+  3. `xcl-pso-5` (2204) finished at 334.7 s (`log.txt:2465`). It built five compute programs of
+     73-178 KB in 1.9-13.2 s each (`log.txt:2478-2534`), then started graphics at 365.26 s
+     (`log.txt:2535`). It built about 185 of them by 369 s.
+
+  So graphics entries sat in `NEEDED` behind compute entries. The skip rate stayed flat at about
+  75 % from 102 to 351 s, so these pipelines were needed the whole time. That is an inference: run
+  12 records no time of first need.
+- **The image-only programs are queued.** 129 to 255 were queued unwanted at 99.77 s
+  (`log.txt:1328`, "(129 so far)"; the counter logs at powers of two). After 90 s, no unwanted
+  non-preload huge compute passed the gate (every `pipeline` compute event after the gate has
+  `wanted: true`). With 5 wanted compiles running, an unwanted one cannot take a slot (`*n < cap` with
+  `cap = most` = 4 for an unwanted build, `real.rs:4268-4270`). So any image-only build a worker picked up is still parked. Run 12
+  cannot say how many of the 26 these were. U3's gauges will.
+- **Caveat.** `manifest.json` says `commit` 63a216d4. The `by: "extra"` events and the `xcl-pso-x*`
+  threads show that U7 (fa14d6f6) code ran. The manifest's commit is stale.
+
+#### 2.3 After
+
+```
+need_now (wanted) ─┬─ graphics ─> [WG]        enqueue (unwanted) ─┬─ graphics ─> [UG]
+                   └─ compute ──> [WC]                            ├─ compute ──> [UC]
+build_pieces helpers ───────────> [H]                             └─ spared ───> [S]   (U2)
+
+general worker (xcl-pso-N, xcl-pso-xN):  WG > H > WC > UG > UC > S*
+reserved worker (xcl-pso-gN, k of them):  WG > UG            (never compute, never H, never S)
+S* = only if WG, H, WC, UG, UC are empty, no wanted build waits at any gate, and no other
+     S build is in flight (at most 1)
+Gate: unchanged. U7: unchanged for general workers; reserved workers never count as parked.
+```
+
+#### 2.4 The scheduling rule
+
+| Class | Lane | Taken by | Order (general) | At most in flight |
+|---|---|---|---|---|
+| wanted graphics (a draw or graphics EI waited, `need_now`) | WG | general + reserved | 1 | unbounded (all workers) |
+| piece helpers of a split program (`build_pieces`) | H | general | 2 | unbounded |
+| wanted compute: small, huge, giant (a compute bind or submit waited) | WC | general | 3 | general workers (n plus U7 extras, at most 2n); slots as today |
+| unwanted graphics (sent by `resolve`, nobody waited yet) | UG | general + reserved | 4 | unbounded |
+| unwanted compute (sent by `resolve`, `submit` with lazy off) | UC | general | 5 | general workers |
+| image-only (spared) compute | S | general | 6, gated | **1** |
+| preloads (an earlier run's pipelines) | own list | `xcl-pso-pre-*` | separate threads | as today (U6: at most 1 slot, none while a wanted build waits) |
+
+A pipeline can be in two lanes: UG, then WG when a draw waits. Whichever worker takes `job` first
+builds it; the other entry finds `None` and does nothing (`pso_async.rs:404-416`). A wanted
+pipeline that turns late stays wanted. Its entry already went to a wanted lane once (the
+`by_submit` guard, `pso_async.rs:1714-1716`).
+
+**Invariants (tested in U1 and U2):**
+- **I1.** A reserved worker never takes an item from H, WC, UC or S.
+- **I2.** While any graphics item (WG or UG) is queued and a reserved worker is idle, a reserved
+  worker takes it within one wake-up. So with every general worker parked, a queued graphics build
+  still completes.
+- **I3.** A general worker takes the first non-empty lane in the order WG, H, WC, UG, UC, and S
+  only under the S rule.
+- **I4.** At most one S build is in flight. None starts while another lane has items or a wanted
+  build waits at a gate.
+
+### 3. Dependencies
+
+#### 3.1 Upstream PRs
+
+| PR | State (2026-11-26) | Size | Tests | Applies to dev? | Defects for us | Decision |
+|---|---|---|---|---|---|---|
+| #628 "prioritize graphics pipelines in the async PSO worker pool" | open, CONFLICTING | +143 -16, `pso_async.rs` only | 2 unit tests (`graphics_jobs_dequeue_ahead_of_queued_compute_jobs`, `worker_pool_prioritizes_graphics_pipeline_over_queued_compute`); 688 passed before its rebase; RTX 4070 smoke pair in the description | **No.** Its base `queue()` sends `Arc<Pending>` over the old channel (diff hunk `@@ -72,29`). Our tree has `Work` closures, `NEEDED`, `build_pieces` helpers, `RECEIVER` and `park()` (`pso_async.rs:283-443`). The gate's merge check would conflict on every hunk. | (1) The queue holds only `Arc<Pending>`, so the `build_pieces` helpers (`pso_async.rs:432`) have no place in it. (2) It does not know wanted from unwanted, so a SetPipelineState-sent graphics build goes ahead of a compute build the submit waits for. That breaks `a_compute_wait_goes_ahead_of_the_fifo`'s intent the other way. (3) No reserve: once every worker is in a compute gate, graphics wait anyway. That is run 12's exact state. (4) It removes nothing of U7, but its pool cannot start extras. | **Do not adopt.** Take its idea (graphics first) and credit it in U1's commit body. |
+| #2628 "a worker waiting for a big compile turn leaves the queue to a helper" | open, MERGEABLE | +186 -18, `pso_async.rs`, `real.rs` | 2 unit tests | Overlaps U7 entirely | Its helpers take the next queued item too, the same failure as U7 in run 12 | Do not adopt |
+| #2726 "gate 128-256 KiB compute driver compiles in MEDIUM_COMPILES" | open, CONFLICTING; targets an `amd-dev` branch | +169 -6, `real.rs` | 2 unit tests | No (`MEDIUM_COMPILES` is not in our tree) | n/a | Out of scope; see section 1 |
+| #1686 "big compiles of bound programs take turns under a bind budget" | open, CONFLICTING | +142 -1 | 3 tests | No | Gate change for `XCL_PSO_WAIT_MS`; our U5b budgets replaced that need | Not adopted |
+| #2053 "catch panics in async PSO builds" | open | +192 -18 | | Probably conflicts with U1 (both edit the worker loop) | A panicking build kills a worker today; unchanged by this spec | Out of scope. Note: if adopted later, rebase it onto U1's `worker_loop`. |
+
+Searches made: "pso worker priority", "pipeline worker pool", "huge compile", "big_compile_turn",
+"graphics first pipeline", "compile slot", "pso queue", "park worker", "image-only". No PR found
+for "image-only builds last" or for a graphics reserve.
+
+**Sibling project (idea only, GPL-3.0, no code read or copied).** It gives slow pipelines at most a
+quarter of its workers. We cannot tell a slow compute build before it runs (2.1, "the size is
+known only inside the build"), so we turn the idea around: a quarter of the pool, reserved for
+graphics.
+
+#### 3.2 Order between units
+
+U1 → U2 (same file `pso_async.rs`) → U3 (reads U1/U2's `queue_gauges`; one line in `pso_async.rs`)
+→ U4 (docs).
+
+### 4. Constraints
+
+- **Memory per compile.** A huge driver compile takes about 1-1.5 GB (the comments at `real.rs:4063-4065`
+  and `real.rs:4296-4300`, which cite #1269). Unwanted compiles keep their 3 GB headroom check
+  (`real.rs:4296-4311`). Nothing here starts more compiles: slot counts are unchanged. U2 lowers
+  the unwanted load: at most one image-only build in flight.
+- **Threads.** Today on the PC: 15 general, up to 15 extra, 3 preload, plus `xcl-pso-waits` (300 s
+  dump). After: plus k = 3 reserved threads (`clamp(n/4, 2, 8)`). Each reserved thread has a 64 MB
+  stack, as the other workers have (`pso_async.rs:341`). Translation recurses deeply, and the stack
+  is committed only as it is used. The worst case grows from 34 to 37 pipeline threads.
+- **Stack size.** Reserved threads must use 64 MB (`stack_size(64 << 20)`), like
+  `pso_async.rs:341`: graphics translation recurses too.
+- **The title's watchdog** ends the title when its main thread has been held about 30 s
+  (`pso_async.rs:1806-1809` comment). No title-thread wait changes: draws and compute keep the
+  100 ms frame budgets (U4/U5b).
+- **Platform.** Windows only; the crate does not build on macOS. Units are built and tested on
+  the PC (RTX 5080, 16 threads, 63 GB). Never `cargo fmt`. Each runtime unit needs a
+  `scripts/smoke.ps1` pair before any upstream PR (CONTRIBUTING.md item 3).
+- **Thread names matter.** The gate applies to threads named `xcl-pso*` (`real.rs:4203`). Preload
+  detection is the prefix `xcl-pso-pre` (`real.rs:4182`). Telemetry's `built_by` maps
+  prefixes (`telemetry_gpu.rs:2414-2421`). The reserved prefix `xcl-pso-g` matches `xcl-pso`, so
+  its huge graphics compiles are gated in the graphics lane. It does not match `xcl-pso-pre`.
+
+### 5. Considerations
+
+#### 5.1 Mechanisms compared
+
+| | (A) Give the worker back at the gate | **(B) Lanes + reserved workers (chosen)** | (C) U7 + cap on workers in huge compute |
+|---|---|---|---|
+| Idea | No slot: the build leaves the worker. It is re-queued on a "huge" list and handed out when a slot frees. | Order by class, and a reserve that never runs compute | Keep U7. Let at most H workers be in a huge compute build or its gate. |
+| Fits the code? | Poorly. The job is `FnOnce` (`pso_async.rs:280`), and the gate sits three calls deep in `compute_container`. That code makes two gated attempts (`real.rs:4802-4824`) with blob, retry and logging side effects. Yielding needs a re-runnable job, a new "yield" result through `translated_compute_pso_once`, `compute_container` and `dispatch_chain`, and a translation repeated per attempt. | Well. Only the queue (`pso_async.rs:283-443`, `1710-1722`) changes. Builds and the gate do not. | Poorly. Whether a build is huge is known only after its translation (`real.rs:4702`). A cap on compute in flight also holds back small compute (the 229 cached compute builds of 90-120 s). A cap on parked workers cannot be enforced, because a worker at the gate holds its build on its stack. |
+| Guarantee for graphics | Strong (no worker ever waits at the gate) | Strong by construction (I1, I2) | None at the 2n cap |
+| Size and risk | Over 400 lines in `real.rs` plus `pso_async.rs`; side effects in a path with known driver retry logic | About 230 + 150 lines; queue logic only | About 150 lines; does not solve run 12 |
+| U7 | Removed (nothing parks) | **Kept** (general workers) | Kept |
+
+#### 5.2 Edge cases
+
+- **Duplicate entries.** The same `Pending` can be in UG and WG, or in UC and WC. Taking the job
+  is the only claim (`p.job.lock().take()`), so a pipeline is never built twice. An orphan
+  (released stand-in) is dropped by whichever entry comes first (`pso_async.rs:405-409`).
+- **Spared and `resolve`.** SetPipelineState calls `resolve` (`bind.rs`/`list_x.rs`, many sites),
+  which sends a spared compute pipeline through `enqueue`. U2 routes it by its `spared` flag, which
+  is set before the title gets the stand-in (`real.rs:6014-6016`; doc at `pso_async.rs:1875-1876`, "Told before the title has the stand-in").
+  So a spared build never lands in UC.
+- **A spared pipeline that is somehow waited for** (`need_now`) goes to WC like any wanted compute.
+  Wanted wins.
+- **`XCL_LAZY_PSO=0`.** Every pipeline is enqueued at creation, into UG or UC. Reserved workers
+  drain UG. Compute that a bind waits for goes through WC ahead of UG, as `NEEDED` did.
+- **`XCL_ASYNC_PSO=0`.** Pipelines are built in the call. The pool is never started. Unchanged.
+- **`XCL_PSO_IMAGE_SKIP=0`.** No pipeline is spared, so the S lane stays empty. Those programs are
+  waited for as compute, through WC.
+- **`XCL_DXC_THREADS=1`.** n = 1 and k = 2. A general worker still exists for compute.
+- **Graphics two-pass pipelines** compile a compute pass with `gate = false` (`real.rs:6394`,
+  `6404`). So a reserved worker never enters a compute gate.
+- **A huge cold graphics build** on a reserved worker waits in the graphics lane (5 slots, wanted).
+  It does not park through U7 (reserved threads are not `IS_WORKER`). That waits only on other
+  graphics compiles, which are short.
+
+#### 5.3 Deadlock and lost wake-up
+
+- **Lock order.** The lanes mutex is a leaf: nothing else is locked while it is held. The S rule
+  reads atomics only (`SPARED_IN_FLIGHT`, `Slots::wanted_waiting`). `need_now` computes `first`
+  under `p.demand` and drops that lock before it pushes (as today, `pso_async.rs:1712-1720`).
+  `queue_gauges` reads the gate (`Slots::n` locks) after it releases the lanes lock.
+- **No lost wake-up for pushes.** A worker checks `pick` and waits under the same mutex that a push
+  takes. Every push notifies one general worker. A push to WG or UG also notifies one reserved
+  worker. A woken worker that finds no item for its class waits again (a spurious wake-up is
+  harmless). Items never outnumber the general notifications. A general worker that finishes a
+  build loops back to `take` without waiting, so it sees what is queued.
+- **The S rule changes without a push** (a gate's wanted waiters leave, or the spared build in
+  flight ends). Two wake-ups cover it: (a) the S guard's drop notifies one general worker; (b) a
+  general worker that waits while S is non-empty uses `wait_timeout(250 ms)` and re-checks.
+- **`build_pieces`** cannot deadlock: the caller drains its own batch (`pso_async.rs:423-438`), and
+  helpers only speed it up. A reserved worker never takes H. With every general worker parked, the
+  caller still finishes alone.
+- **U7 spawning.** `park()` starts a general worker through the pool, after it is initialised
+  (`POOL.get()`, never `get_or_init`, inside `park`). Thread spawning happens outside every lock
+  except a `Once`.
+
+#### 5.4 What could starve, and how each makes progress
+
+- **Graphics:** cannot starve behind compute (I1, I2).
+- **Wanted compute, small and huge (question 5).** It is third in the general order. It is behind
+  only WG and H, whose items take milliseconds (graphics 3-57 ms with a blob, 2.2). The gate is
+  unchanged: wanted builds get up to 5 compute slots and skip the commit check
+  (`real.rs:4268-4277`). U2 takes image-only builds out of the way: at most one holds a compute
+  slot or parks, and none starts while a wanted build waits. U7 still adds general workers while
+  fewer than n are free, up to 2n. So the lighting's compute keeps its slots, and its workers are
+  freed from image-only parkers.
+- **Open risk.** If the title waits for more than about 2n − 6 = 24 distinct uncached huge compute
+  programs at once, every general worker parks again. Then small wanted compute waits for a slot
+  to free, as today. Graphics are not affected. U3's gauges (`pso_workers.parked`, `pso_q`) show
+  it. The follow-up is option A or a higher cap, decided on data.
+- **Unwanted builds (UG, UC)** wait behind wanted ones. Nobody waits for them, so that is
+  intended. Reserved workers keep UG moving.
+- **Image-only:** starve while anything else is queued. That is intended: their dispatches are left
+  out anyway (`pso_async.rs:1855-1863`). In a static scene, once the wanted backlog is done, they
+  are built one at a time.
+
+#### 5.5 Open risks
+
+- A test that saturates "all workers" now has to saturate the general workers with compute jobs.
+  U1 lists the three tests to change.
+- Wake-up cost: about 350 pushes a second in the world-start burst (2.2), each waking at most 2
+  threads. That is negligible.
+- `wanted_waiting_at_gates` counts graphics-lane waiters too, so a waiting wanted graphics compile
+  delays image-only builds. That is conservative and intended.
+
+### 6. Work breakdown
+
+#### U1. Lanes and a graphics reserve (`pso_async.rs` only)
+
+- **Inputs:** dev at fa14d6f6.
+- **Outputs:** the pool takes builds by lane; k reserved graphics threads; `queue_gauges()`.
+- **Files:** `crates/xcl/src/hle/d3d12x/pso_async.rs`.
+- **Changes (function by function):**
+  1. Delete `NEEDED` and `next_needed` (`pso_async.rs:282-288`).
+  2. Replace `RECEIVER` (`305`) with:
+     ```rust
+     /// What a pool worker runs: a pipeline's build, or a helper of one (`build_pieces`).
+     enum Item { Build(Arc<Pending>), Help(Work) }
+     /// The pool's lanes, in the order a general worker takes them (`pick`).
+     const WANTED_GRAPHICS: usize = 0;
+     const HELP: usize = 1;
+     const WANTED_COMPUTE: usize = 2;
+     const GRAPHICS: usize = 3;
+     const COMPUTE: usize = 4;
+     const LANES: usize = 5;
+     struct Pool { lanes: Mutex<[std::collections::VecDeque<Item>; LANES]>, general: Condvar, reserved: Condvar }
+     static POOL: OnceLock<Pool> = OnceLock::new();
+     /// Reserved graphics workers started, and those running a build now.
+     static RESERVED: AtomicUsize = AtomicUsize::new(0);
+     static RESERVED_BUSY: AtomicUsize = AtomicUsize::new(0);
+     ```
+  3. Add `fn reserved_workers(n: usize) -> usize { (n / 4).clamp(2, 8) }`.
+  4. Add the pure picker:
+     `fn pick(lens: &[usize; LANES], reserved: bool) -> Option<usize>`. Reserved: `WANTED_GRAPHICS`
+     if non-empty, else `GRAPHICS` if non-empty, else `None`. General: the first non-empty lane in
+     index order 0..LANES.
+  5. Add `fn lane_for(compute: bool, wanted: bool) -> usize`: (false, true) → `WANTED_GRAPHICS`,
+     (true, true) → `WANTED_COMPUTE`, (false, false) → `GRAPHICS`, (true, false) → `COMPUTE`.
+  6. Replace `queue()` (`330-347`) with `fn pool() -> &'static Pool`. It calls
+     `POOL.get_or_init(|| Pool { .. })`, then a `static START: std::sync::Once` spawns:
+     `n = compile_threads()` general threads `xcl-pso-{k}` running `worker_loop(false)`, with
+     `WORKERS += n` and a decrement on a failed spawn, as today; and `reserved_workers(n)` threads
+     `xcl-pso-g{k}` running `worker_loop(true)`, with `RESERVED += 1` per successful spawn. All
+     use `.stack_size(64 << 20)`. Keep the comment about deep recursion.
+  7. Add `fn push(lane: usize, item: Item)`: `pool()`; lock `lanes`; `push_back`; unlock; if
+     `lane == WANTED_GRAPHICS || lane == GRAPHICS` call `reserved.notify_one()`; always call
+     `general.notify_one()`.
+  8. Add `fn take(reserved: bool) -> Item`: lock `lanes`; loop { compute `lens`; if
+     `pick(&lens, reserved)` is `Some(l)`, return `lanes[l].pop_front().unwrap()`; else wait on
+     `reserved`'s or `general`'s condvar }.
+  9. Replace `worker_loop(rx)` (`318-328`) with `fn worker_loop(reserved: bool)`. If
+     `!reserved`, set `IS_WORKER` to true (reserved threads stay false, so `park()` never counts
+     them). Then loop: `let item = take(reserved)`; if reserved, `RESERVED_BUSY += 1`; run it
+     (`Item::Build(p)` → `build_queued(&p)`, `Item::Help(w)` → `w()`); if reserved,
+     `RESERVED_BUSY -= 1`.
+  10. `park()` (`368-393`): replace `let Some(rx) = RECEIVER.get() else { return parked };` with
+      `if POOL.get().is_none() { return parked; }`. The spawned closure becomes
+      `move || worker_loop(false)`. Nothing else in `park`, `Parked`, `extra_needed` or `workers()`
+      changes.
+  11. `enqueue` (`400-402`): `push(lane_for(p.compute, false), Item::Build(p))`.
+  12. `build_pieces` (`432`): `push(HELP, Item::Help(Box::new(move || { ..same body.. })))`.
+  13. `need_now` (`1717-1720`): replace the two lines (the `NEEDED` push and the no-op send) with
+      `push(lane_for(p.compute, true), Item::Build(p.clone()));`.
+  14. Add
+      `pub struct QueueGauges { pub lanes: [usize; LANES], pub general: usize, pub parked: usize, pub reserved: usize, pub reserved_busy: usize }`
+      and `pub fn queue_gauges() -> QueueGauges`. It reads the lane lengths under the lock (all
+      zero when `POOL` is not initialised; do not start it), then `WORKERS`, `PARKED`, `RESERVED`
+      and `RESERVED_BUSY`, after the lock is released.
+  15. Module doc (`pso_async.rs:1-10`): add one sentence: "Workers take wanted builds before
+      unwanted ones and graphics before compute; a few workers build only graphics, so a queue of
+      slow compute programs never holds up the scene's draws."
+- **Tests to write (`pso_async` `mod tests`):**
+  - `general_workers_take_lanes_in_order`: `pick` with general on `[1,1,1,1,1]` → 0,
+    `[0,1,1,1,1]` → 1, `[0,0,1,1,1]` → 2, `[0,0,0,1,1]` → 3, `[0,0,0,0,1]` → 4, all zero → None.
+  - `reserved_workers_take_only_graphics`: `pick` with reserved on `[1,1,1,1,1]` → 0,
+    `[0,1,1,1,1]` → 3, `[0,1,1,0,1]` → None, `[0,0,0,0,0]` → None.
+  - `lanes_follow_kind_and_demand`: the four rows of `lane_for`.
+  - `reserved_workers_scale_with_the_pool`: n = 1 → 2, 8 → 2, 15 → 3, 32 → 8, 64 → 8.
+  - `a_graphics_build_runs_while_every_general_worker_is_parked` (takes `WORKER_SATURATION_LOCK`):
+    1. Submit `2 * n` compute blockers (`submit(s, true, ..)`). Each sends on a `started` channel,
+       calls `park()` and waits on a shared gate (5 s timeout).
+    2. Receive `2 * n` starts (10 s timeout). U7 starts extras up to 2n.
+    3. Submit a compute job C (records that it ran) and a graphics job G
+       (`submit(s, false, ..)`).
+    4. Assert that G ran within 2 s, and that C had not run by then (no general worker free, and
+       reserved workers do not take compute).
+    5. Open the gate. Wait until all are built (10 s), then `released` every stand-in. Assert
+       that `workers().1` returns to its value before the test.
+- **Tests to change (blockers must saturate general workers only):** in
+  `queued_work_runs_while_every_worker_is_parked` (`pso_async.rs:1083`; `submit(standin, false`
+  at 1094 and the target at 1118), `a_released_queued_pipeline_is_not_built_by_normal_workers`
+  (1140; submits at 1160 and 1179), and
+  `released_queued_pipeline_drops_job_immediately_before_workers_drain` (1240; submits at 1268 and
+  1284), change `false` to `true` in those `submit` calls. No assertion text changes. Reason:
+  reserved workers would otherwise take graphics blockers or the target.
+- **Acceptance:**
+  - `cargo test -p xcl --lib -- pso_async::` passes, including the unchanged
+    `a_compute_wait_goes_ahead_of_the_fifo` (1365) and
+    `a_pipeline_a_submit_needs_is_built_before_the_queue` (925).
+  - `cargo test --workspace -- --test-threads=4` passes, with counts and SKIPPED reported.
+  - A retail run's 300 s thread dump shows 3 `xcl-pso-g*` threads.
+- **Size:** about 130 production lines and 110 test lines.
+
+#### U2. Image-only builds last, one at a time (`pso_async.rs`, `real.rs`)
+
+- **Inputs:** U1 committed.
+- **Outputs:** an S lane under the S rule; `real::wanted_waiting_at_gates`, `real::gate_gauges`;
+  gate fields in `QueueGauges`.
+- **Files:** `pso_async.rs`, `real.rs`.
+- **Changes in `real.rs`** (next to `compile_slots`, `real.rs:4171`):
+  1. `fn wanted_waiting_of(lanes: &[&Slots]) -> usize`: the sum of
+     `wanted_waiting.load(SeqCst)`.
+  2. `pub(super) fn wanted_waiting_at_gates() -> usize`:
+     `wanted_waiting_of(&[&BIG_COMPILES, &GRAPHICS_COMPILES, &GIANT_COMPILES])`. Atomics only, no
+     lock.
+  3. `pub(super) fn gate_gauges() -> ([usize; 3], [usize; 3])`: per lane in the order compute,
+     graphics, giant, `*s.n.lock().unwrap()` (slots held) and `wanted_waiting`.
+- **Changes in `pso_async.rs`:**
+  1. Add `const SPARED: usize = 5;` and set `LANES = 6`.
+     `static SPARED_IN_FLIGHT: AtomicUsize`, `const SPARED_AT_ONCE: usize = 1`,
+     `const SPARED_LOOK: Duration = 250 ms`.
+  2. `pick(lens, reserved, spared_ok: bool)`. General: the first non-empty lane of 0..=4; else
+     `SPARED` if `spared_ok && lens[SPARED] > 0`; else `None`. Reserved: unchanged.
+  3. `lane_for(compute, wanted, spared)`: `wanted` → as U1 (a wanted spared one goes to
+     `WANTED_COMPUTE`); else `spared` → `SPARED`; else as U1. `enqueue` passes
+     `p.spared.load(Acquire)`; `need_now` passes `false`.
+  4. `take(reserved) -> (Item, usize)` (it returns the lane). For a general worker,
+     `spared_ok = SPARED_IN_FLIGHT.load() < SPARED_AT_ONCE && super::real::wanted_waiting_at_gates() == 0`,
+     computed each time round the loop under the lanes lock. When it picks `SPARED`, it does
+     `SPARED_IN_FLIGHT += 1` before it unlocks. When it waits with `lens[SPARED] > 0`, it uses
+     `wait_timeout(SPARED_LOOK)` instead of `wait`.
+  5. `worker_loop`: for lane `SPARED`, run the build inside a guard whose `Drop` does
+     `SPARED_IN_FLIGHT -= 1` and then `pool().general.notify_one()`.
+  6. Extend `QueueGauges` with `pub spared_in_flight: usize`, `pub gate_held: [usize; 3]` and
+     `pub gate_wanted_waiting: [usize; 3]`. Fill them in `queue_gauges()` after the lanes lock is
+     released (`real::gate_gauges()`).
+  7. `resolve_spared` (`1886-1904`) is unchanged: it calls `enqueue`, which now routes to S. Fix
+     its doc line "takes its turn among the driver's compiles" to "is built when no other build
+     waits (`SPARED_AT_ONCE` at a time)".
+- **Tests:**
+  - `pso_async`: `image_only_builds_come_last_and_only_when_allowed`: `pick` (general) on
+    `[0,0,0,0,0,1]` with true → Some(5), with false → None; `[0,0,0,0,1,1]` with true → Some(4);
+    reserved on `[0,0,0,0,0,1]` → None.
+  - `pso_async`: extend `lanes_follow_kind_and_demand` with (true, false, true) → `SPARED` and
+    (true, true, true) → `WANTED_COMPUTE`.
+  - `pso_async`: `at_most_one_image_only_build_runs_at_once` (takes `WORKER_SATURATION_LOCK`):
+    1. `submit_lazy` three compute pipelines and mark each with `image_only`. Each job increments
+       a shared `AtomicUsize`, records the maximum, sleeps 200 ms and decrements.
+    2. Call `resolve` on each.
+    3. Wait until all are built (5 s).
+    4. Assert that the recorded maximum is 1 and that all three were built.
+  - `real.rs` `mod big_compile_tests`: `wanted_waiting_is_summed_over_the_lanes`: two local
+    `Slots` (as the U6 tests build them) with `wanted_waiting` 1 and 2 → `wanted_waiting_of` = 3.
+- **Acceptance:**
+  - `cargo test -p xcl --lib -- pso_async:: real::big_compile_tests` passes, and the whole suite.
+  - The existing `bind.rs` test at `bind.rs:1690-1702` (a spared pipeline is not put off) still
+    passes.
+  - In the acceptance run, no more than one `pipeline` event with `wanted: false` and
+    `by` ≠ `preload` has an overlapping `[t - compile_ms - waited_ms, t]` interval in which
+    `waited_ms > 0`.
+- **Size:** about 70 production lines and 70 test lines.
+
+#### U3. Telemetry: queue gauges and time from need to built (fork-only files plus one line)
+
+- **Inputs:** U2 committed (`queue_gauges` with gate fields).
+- **Files:** `crates/xcl/src/telemetry_gpu.rs`, `crates/xcl/src/telemetry_run.rs`; one line in
+  `pso_async.rs::complete`.
+- **Changes:**
+  1. `telemetry_gpu.rs::built_by` (`2414-2421`): add `Some(n) if n.starts_with("xcl-pso-g") => "reserved"`
+     before the generic `xcl-pso` arm. Update its doc comment.
+  2. `telemetry_gpu.rs`: add
+     `pub fn telemetry_pipeline_ready(compute: bool, need: Option<Duration>, late: bool, ok: bool)`.
+     It returns at once when `need` is `None` or `!xlog::telemetry_on(Tier::Frame)`. Otherwise it
+     writes the event `pipeline_ready` with fields from the pure
+     `fn pipeline_ready_fields(compute, need, late, ok) -> Vec<(&'static str, serde_json::Value)>`:
+     `stage` (`"compute"` / `"graphics"`), `need_ms` (f64, 3 decimals), `late`, `ok`.
+  3. `pso_async.rs::complete` (`133-151`): after the `done` block and before the orphan release,
+     add one line:
+     `crate::report::telemetry_pipeline_ready(p.compute, p.demand.lock().unwrap().needed_at.map(|at| at.elapsed()), p.late.load(Ordering::Acquire), real != 0);`
+     (`demand` is locked alone here, never inside `done`.)
+  4. `telemetry_run.rs::telemetry_activity` (`318-329`): append the fields of the pure
+     `fn activity_queue_fields(g: &crate::hle::d3d12x::pso_async::QueueGauges) -> [(&'static str, serde_json::Value); 3]`:
+     - `pso_q`: the array of the 6 lane lengths, in lane order;
+     - `pso_workers`: `{general, parked, reserved, reserved_busy, spared_in_flight}`;
+     - `pso_gate`: `{held: [c, g, giant], wanted_waiting: [c, g, giant]}`.
+- **Tests:**
+  - `telemetry_gpu`: extend `built_by_names_the_builder_from_the_thread_name` (`3299`) with
+    `built_by(Some("xcl-pso-g1")) == "reserved"`.
+  - `telemetry_gpu`: `pipeline_ready_fields_carry_stage_and_need`: (false, 1500.25 ms, true, true)
+    → `stage` "graphics", `need_ms` 1500.25, `late` true, `ok` true; (true, …) → `stage` "compute".
+  - `telemetry_run`: `activity_queue_fields_follow_the_gauges`: a hand-made `QueueGauges` →
+    exact JSON for the three keys.
+  - `crates/xcl/tests/telemetry_e2e.rs::activity_events_mirror_the_log` (`425`): assert that
+    `pso_q`, `pso_workers` and `pso_gate` exist on `activity` events.
+- **Acceptance:** tests pass. In the acceptance run, `activity` lines carry the three keys, and
+  `pipeline_ready` events exist for graphics and compute.
+- **Size:** about 90 production lines and 60 test lines.
+
+#### U4. Docs
+
+- **Files:** `README.md` (the huge-pipeline paragraph, `README.md:271-290`); add two sentences
+  about reserved graphics workers and image-only builds coming last. `docs/guide/telemetry.md`:
+  5.5 gets `pipeline_ready` and `by: "reserved"`; the `activity` table gets `pso_q`,
+  `pso_workers`, `pso_gate`.
+- **PR note:** if `HANDOFF.md` or `docs/specs/` say that workers drain needed builds first in one
+  FIFO, say so in the PR. Do not edit them.
+- **Acceptance:** review only.
+
+### 7. Concurrency plan
+
+| Wave | Unit | Files | Parallel with |
+|---|---|---|---|
+| 1 | U1 | `pso_async.rs` | U4's draft (docs only) |
+| 2 | U2 | `pso_async.rs`, `real.rs` | none (same file as U1) |
+| 3 | U3 | `telemetry_gpu.rs`, `telemetry_run.rs`, `tests/telemetry_e2e.rs`, one line in `pso_async.rs` | U3's telemetry-file part can be written during wave 2 against the `QueueGauges` fields fixed in this spec; it is committed after U2 |
+| 4 | U4 | `README.md`, `docs/guide/telemetry.md` | final wording after U3 |
+
+No two units in the same wave write the same file.
+
+### 8. Acceptance run on the retail title
+
+**Build:** dev with U1-U3, clean tree, release, on the RTX 5080 PC (driver 32.0.16.2140). Use the
+same DXIL and driver-blob caches as run 12: do not clear them. Make the same input as run 12, then
+leave the scene static.
+
+**Switches (as run 12):** `XCL_TELEMETRY=pass XCL_TELEMETRY_SAMPLE=30 XCL_ACTIVITY=1
+XCL_RUN_SECONDS=720 XCL_THREAD_DUMP_AT=300,600 XCL_UMA_MB=4095`. No other `XCL_PSO_*`.
+
+**Optional control:** right after it, one run of fa14d6f6 with the same switches. The candidate
+runs first, so the warmer blob cache helps the control, not the candidate.
+
+The scene start is the first graphics `pipeline` event with `wanted: true` after 90 s (run 12:
+99.8 s).
+
+| Measure | How | Run 12 | Success |
+|---|---|---|---|
+| Longest gap between graphics `pipeline` events, scene start to end | `per_minute.py`; gap finder | 237 s (128.2 → 365.2) | ≤ 15 s while any `activity.pso_q[0]` or `pso_q[3]` > 0 in that gap |
+| Graphics builds per minute, minutes 1-5 after scene start | `per_minute.py` | 124+2, 8, 0, 0, 0 | > 0 in every minute where `activity.pso_q[0] + pso_q[3]` > 0 at its start |
+| Time from first need to built, graphics | `pipeline_ready` (`stage` graphics), after scene start | not recorded; at least 237 s for those needed in 128-365 s | p95 ≤ 5 s, max ≤ 30 s |
+| Share of draws skipped from scene start + 180 s on | "console code so far" lines, `skip_share.py` | 75.0 %, 75.2 %, 73.4 % (200-351 s) | ≤ 35 % in every window (run 12's post-wave level, 33.2 %, reached without the 4-minute wait) |
+| Reserved workers in the 300 s dump | `dump_classify.py` | none | 3 `xcl-pso-g*`, none in `big_compile_turn` under `compute_container` |
+| Image-only builds in flight | U2's `pipeline` interval check; `activity.pso_workers.spared_in_flight` | not known | ≤ 1 always |
+| Wanted compute still progresses | huge compute `pipeline` events with `wanted: true` after scene start | 15 in 600 s | ≥ 15 in 600 s (no fewer) |
+| Safety | log, `report.json`, `activity` | no device removal | no device removal or crash; `builds_title` 0; peak `committed_mb` ≤ 125 % of run 12's |
+
+The run counts as partial if the title crashes for an unrelated reason. The numbers then count up
+to the crash.
