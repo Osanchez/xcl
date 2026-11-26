@@ -306,6 +306,7 @@ pub fn emit_with_nest(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block
             let (out, body) = (lw.block(Some(1)), lw.block(Some(1)));
             lw.cond_br(none, out, body);
             lw.s.m.set_block(out);
+            if let Some(stage) = lw.lc { lw.count_loop_trip(stage, None)?; }
             let end = lw.c(END);
             lw.s.m.store(to, end, 4);
             lw.s.m.br(target_latch);

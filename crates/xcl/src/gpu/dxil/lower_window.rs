@@ -2,8 +2,9 @@
 //! translator's form of the HLSL kernel's `window_read` / `window_write` and of its
 //! `xcl_m*` accessors with `Options::heap_windows` (`recomp::emit::mem_accessors`).
 
-use super::lower::{Lw, VAR_WIN};
+use super::lower::{LResult, Lw, VAR_WIN};
 use super::module::{CastOp, Pred, Value};
+use super::ops::AtomicOp;
 use crate::gpu::rdna2::Decoded;
 
 /// A term of a 64-bit effective address (`window_at`).
@@ -48,6 +49,71 @@ impl Lw {
         };
         self.uma_base_val = Some(v);
         v
+    }
+
+    /// The loop-counter word (`IO_LOOP_COUNTER` of the io buffer), loaded once in the entry block.
+    fn loop_counter_word(&mut self) -> Value {
+        if let Some(v) = self.lc_word {
+            return v;
+        }
+        let io = self.init.io.expect("io");
+        let off = self.c(crate::gpu::recomp::IO_LOOP_COUNTER as u32 * 4);
+        let cur = self.cur();
+        let entry = self.init.entry;
+        let v = if cur == entry {
+            self.s.raw_load(io, off, 1)[0]
+        } else {
+            let prev = self.s.m.set_insert_before_term(true);
+            self.s.m.set_block(entry);
+            let v = self.s.raw_load(io, off, 1)[0];
+            self.s.m.set_block(cur);
+            self.s.m.set_insert_before_term(prev);
+            v
+        };
+        self.lc_word = Some(v);
+        v
+    }
+
+    /// Counters mode, in the block a loop guard leaves through: the lanes here (and `extra`) are
+    /// counted in their pipeline's word for `stage` - one atomic per hardware wave
+    /// (`WaveActiveCountBits`, never the split form's exchanging ballot). Writes no SSA variable.
+    /// With one window only `k == 0` counts.
+    pub fn count_loop_trip(&mut self, stage: u32, extra: Option<Value>) -> LResult<()> {
+        let word = self.loop_counter_word();
+        let nz = self.cmpc(Pred::Ne, word, 0);
+        let go = match extra {
+            Some(e) => self.land(nz, e),
+            None => nz,
+        };
+        self.guarded(go, &mut |lw| {
+            let t = lw.s.m.i1c(true);
+            let n = lw.s.wave_all_bit_count(t);
+            let first = lw.s.wave_is_first_lane();
+            let k = lw.lshrc(word, 28);
+            let lo = lw.andc(word, 0x0FFF_FFFF);
+            let off = lw.shlc(lo, 4);
+            let off = lw.addc(off, 4 * stage);
+            lw.guarded(first, &mut |lw| {
+                if let Some(coherent) = lw.heap_mem {
+                    let windows = lw.mems.len() as u32;
+                    let inside = lw.cmpc(Pred::ULt, k, windows);
+                    return lw.guarded(inside, &mut |lw| {
+                        let i = lw.addc(k, crate::gpu::recomp::MEM_HEAP_BASE);
+                        let m = lw.s.heap_raw_buffer_uav(i, coherent);
+                        lw.s.raw_atomic(m, AtomicOp::Add, off, n);
+                        Ok(())
+                    });
+                }
+                for (j, m) in lw.mems.clone().into_iter().enumerate() {
+                    let at = lw.cmpc(Pred::Eq, k, j as u32);
+                    lw.guarded(at, &mut |lw| {
+                        lw.s.raw_atomic(m, AtomicOp::Add, off, n);
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            })
+        })
     }
 
     /// Selects the window of an access whose 64-bit effective address is `hi:lo` plus

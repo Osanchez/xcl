@@ -29,6 +29,8 @@ pub const VAR_WIN: u32 = VAR_BUDGET + 2;
 /// arrived" flag (`xcl_xk`, `xcl_x_dead`)
 pub const VAR_XK: u32 = VAR_BUDGET + 3;
 pub const VAR_XDEAD: u32 = VAR_BUDGET + 4;
+/// the lane was counted (`XCL_LOOP_COUNTERS`, the two-phase geometry form only)
+pub const VAR_LC_DONE: u32 = VAR_BUDGET + 6;
 /// `tw0 + 1` of the last image store / atomic through the k-th T# of `Lw::img_writes` (16
 /// slots; the recompiler's `xcl_iw{srsrc}`)
 pub const VAR_IMG_WRITE: u32 = VAR_BUDGET + 8;
@@ -120,7 +122,7 @@ impl Init {
         if var == super::lower_round::VAR_F32_MODE {
             return s.m.i32c(super::lower_round::MODE_INIT);
         }
-        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
+        if var == VAR_FP16_RM || var == VAR_WIN || var == VAR_XK || var == VAR_XDEAD || var == VAR_LC_DONE || (VAR_IMG_WRITE..VAR_IMG_WRITE + 16).contains(&var) {
             return s.m.i32c(0);
         }
         if var >= super::lower_mem::VAR_TMP {
@@ -198,6 +200,10 @@ pub struct Lw {
     pub fmt_comp1_cache: HashMap<(Value, Option<u32>), super::lower_mem::FmtComp1>,
     /// cached `IO_UMA_BASE_HI` loaded once in the entry block for multi-window address math
     pub uma_base_val: Option<Value>,
+    /// counters mode (`XCL_LOOP_COUNTERS`): this program's stage word
+    pub lc: Option<u32>,
+    /// the io word of the loop counters, loaded once in the entry block
+    pub lc_word: Option<Value>,
     /// temporaries handed out (`lower_mem::VAR_TMP`)
     pub ntmp: u32,
     /// the `s_load_dword*` being lowered repeats an earlier one (`reload`): set by the

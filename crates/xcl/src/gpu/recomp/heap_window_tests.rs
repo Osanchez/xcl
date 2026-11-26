@@ -337,7 +337,7 @@ fn gpu_loop_counters_count_guard_exits() {
     let _reset = Budget;
     let _seam = super::tests::LoopCountersSeam::set(Some(true));
 
-    for (direct, heap) in [(false, false), (false, true)] {
+    for (direct, heap) in [(false, false), (false, true), (true, false), (true, true)] {
         // (program, io word, words 0..4 of window 1's slot)
         let runs: [(&Vec<u8>, u32, [u32; 4]); 3] = [
             (&never, (1 << 28) | (slot >> 4) as u32, [64, 0, 0, 0]),

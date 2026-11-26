@@ -161,12 +161,16 @@ fn translate_entry(
     let code = code.to_vec();
     #[cfg(test)]
     let loop_budget_seam = crate::gpu::recomp::LOOP_BUDGET_TEST.with(|c| c.get());
+    #[cfg(test)]
+    let loop_counters_seam = crate::gpu::recomp::LOOP_COUNTERS_TEST.with(|c| c.get());
     std::thread::Builder::new()
         .name("xcl-dxil-translate".into())
         .stack_size(256 << 20)
         .spawn(move || {
             #[cfg(test)]
             crate::gpu::recomp::LOOP_BUDGET_TEST.with(|c| c.set(loop_budget_seam));
+            #[cfg(test)]
+            crate::gpu::recomp::LOOP_COUNTERS_TEST.with(|c| c.set(loop_counters_seam));
             translate_on_this_thread(&code, o, entry, compact, nest, tables)
         })
         .map_err(|e| format!("translator thread: {e}"))?
@@ -368,7 +372,18 @@ fn translate_on_this_thread(
             let left = lw.rd(VAR_BUDGET);
             let none = lw.cmpc(Pred::Eq, left, 0);
             let cont = lw.block(Some(1));
-            lw.cond_br(none, end, cont);
+            if let Some(stage) = lw.lc {
+                let trip = lw.block(Some(1));
+                lw.cond_br(none, trip, cont);
+                lw.s.m.set_block(trip);
+                // the two-phase form continues into the GS after an ES trip: count a lane once
+                let once = if two_phase { let d = lw.rd(super::lower::VAR_LC_DONE); Some(lw.cmpc(Pred::Eq, d, 0)) } else { None };
+                lw.count_loop_trip(stage, once)?;
+                if two_phase { let one = lw.c(1); lw.wr(super::lower::VAR_LC_DONE, one); }
+                lw.br(end);
+            } else {
+                lw.cond_br(none, end, cont);
+            }
             lw.s.m.set_block(cont);
             let one = lw.c(1);
             let l = lw.sub(left, one);
@@ -529,6 +544,8 @@ impl Lw {
             fmt_comp1_cache: HashMap::new(),
             reload: None,
             uma_base_val: None,
+            lc: crate::gpu::recomp::loop_counters().then_some(match entry { Entry::Pixel(_) => 1, Entry::Geometry(_) => 2, _ => 0 }),
+            lc_word: None,
             ntmp: 0,
             scratch: None,
             static_samplers: Default::default(),

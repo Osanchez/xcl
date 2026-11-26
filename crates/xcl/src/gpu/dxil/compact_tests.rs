@@ -488,3 +488,69 @@ fn gpu_direct_loop_budget_follows_the_variable() {
         assert_eq!(&out.sgpr[..2], &[100, 1], "compact {compact}: a loop with an exit runs to it");
     }
 }
+
+/// Sets the loop counters seam (`recomp::LOOP_COUNTERS_TEST`) for this thread; restores "unset" on
+/// drop, so a failing assert cannot leak it to another test on the thread.
+struct LoopCountersSeam;
+
+impl LoopCountersSeam {
+    fn set(on: Option<bool>) -> Self {
+        crate::gpu::recomp::LOOP_COUNTERS_TEST.with(|c| c.set(on));
+        LoopCountersSeam
+    }
+}
+
+impl Drop for LoopCountersSeam {
+    fn drop(&mut self) {
+        crate::gpu::recomp::LOOP_COUNTERS_TEST.with(|c| c.set(None));
+    }
+}
+
+/// XCL_LOOP_COUNTERS on the direct path: a loop that leaves through its guard counts its lanes once
+/// (32 on a 32-thread kernel, one atomic per hardware wave), in word 0 of the slot; a loop that
+/// exits counts nothing, and io word 0 means "do not count". Both dispatch forms.
+#[test]
+fn gpu_direct_loop_counters_count_guard_exits() {
+    match (runner::adapter(), crate::gpu::recomp::dxc::location()) {
+        (Ok(_), Ok(_)) => {}
+        (a, _) => return runner::skip_test(if a.is_err() { "no GPU" } else { "no DXC" }),
+    }
+    let i = |n: &str, e: &str, f: &[(&str, u64)], lit: Option<u32>| encode(n, e, f, lit).unwrap_or_else(|x| panic!("{n}: {x}"));
+    // s0 counts iterations; the loop leaves when s0 == `exit` (never, for u32::MAX)
+    let looping = |exit: u32| {
+        let mut v = Vec::new();
+        v.extend(i("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 129)], None));
+        v.extend(i("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 255)], Some(exit)));
+        v.extend(i("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFC)], None));
+        v.extend(i("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 129)], None));
+        v.extend(i("S_ENDPGM", "ENC_SOPP", &[], None));
+        v
+    };
+    let o = KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+    let arena = crate::gpu::uma::Uma::new(1 << 20).unwrap();
+    let base = arena.window(0).0 as u64;
+    let slot: u64 = 0x4000;
+    let word = |k: u64| unsafe { &mut *((base + slot + 4 * k) as *mut u32) };
+    let _budget = BudgetSeam::set(Some(64));
+    let _seam = LoopCountersSeam::set(Some(true));
+    for compact in [true, false] {
+        // (program, io word, words 0..4 of the slot)
+        let runs = [
+            (looping(u32::MAX), (slot >> 4) as u32, [32, 0, 0, 0]),
+            (looping(10), (slot >> 4) as u32, [0; 4]), // the exit must come before the budget (64) is spent
+            (looping(u32::MAX), 0, [0; 4]),
+        ];
+        for (n, (code, io_word, want)) in runs.iter().enumerate() {
+            for k in 0..4 {
+                *word(k) = 0;
+            }
+            let mut st = KernelState::default();
+            st.sgpr[crate::gpu::recomp::IO_LOOP_COUNTER] = *io_word;
+            let k = translate_full_as(code, o, compact).unwrap_or_else(|e| panic!("compact {compact}: {e}"));
+            runner::run_in_arena(&k.dxil, &st, &arena).unwrap_or_else(|e| panic!("run {n} compact {compact}: {e}"));
+            for k in 0..4 {
+                assert_eq!(*word(k), want[k as usize], "run {n} compact {compact}: slot word {k}");
+            }
+        }
+    }
+}
