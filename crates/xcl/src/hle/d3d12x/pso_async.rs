@@ -37,6 +37,9 @@ struct Pending {
     late: std::sync::atomic::AtomicBool,
     /// its dispatches may be left out while it is built (`image_only`): binds do not wait for it
     spared: std::sync::atomic::AtomicBool,
+    /// left out on purpose, never built (`submit_left_out`): 0 no, 1 a rule (`LeftOut::Rule`), 2 the
+    /// ray-tracing chain being off (`LeftOut::RtOff`)
+    left_out: std::sync::atomic::AtomicU8,
     demand: Mutex<Demand>,
     facts: Facts,
 }
@@ -220,6 +223,19 @@ pub enum Unbuilt {
     Abandoned,
     /// its shader key is quarantined: it is never built
     Quarantined,
+    /// a leave-out rule names it: it is never built (`submit_left_out`)
+    LeftOut,
+    /// it is part of the ray-tracing chain and the chain is off: it is never built
+    RtOff,
+}
+
+/// Why a pipeline is left out at creation (`submit_left_out`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeftOut {
+    /// a leave-out rule names it
+    Rule,
+    /// it is part of the ray-tracing chain and the chain is off
+    RtOff,
 }
 
 #[allow(dead_code)]
@@ -233,6 +249,8 @@ impl Unbuilt {
             Unbuilt::Failed => "failed",
             Unbuilt::Abandoned => "abandoned",
             Unbuilt::Quarantined => "quarantined",
+            Unbuilt::LeftOut => "left_out",
+            Unbuilt::RtOff => "rt_off",
         }
     }
 }
@@ -249,6 +267,8 @@ pub struct Skipped {
 fn why_of(p: &Pending) -> Option<Unbuilt> {
     if p.real.load(Ordering::Acquire) != 0 {
         None
+    } else if let Some(why) = left_out_of(p) {
+        Some(why)
     } else if *p.done.lock().unwrap() {
         if p.facts.outcome.load(Ordering::Acquire) == OUTCOME_QUARANTINED { Some(Unbuilt::Quarantined) } else { Some(Unbuilt::Failed) }
     } else if p.facts.abandoned.load(Ordering::Acquire) {
@@ -261,6 +281,15 @@ fn why_of(p: &Pending) -> Option<Unbuilt> {
         Some(Unbuilt::Late)
     } else {
         Some(Unbuilt::Building)
+    }
+}
+
+/// Why `p` is left out on purpose (`submit_left_out`), if it is.
+fn left_out_of(p: &Pending) -> Option<Unbuilt> {
+    match p.left_out.load(Ordering::Acquire) {
+        1 => Some(Unbuilt::LeftOut),
+        2 => Some(Unbuilt::RtOff),
+        _ => None,
     }
 }
 
@@ -986,6 +1015,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         orphan: Default::default(),
         late: Default::default(),
         spared: Default::default(),
+        left_out: Default::default(),
         demand: Default::default(),
         facts: Default::default(),
     });
@@ -1002,6 +1032,33 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
             q.cv.notify_one();
         }
     }
+}
+
+/// `standin` went to the title for a compute pipeline that is left out on purpose (`why`): it has
+/// no job and is never queued, never built and never recorded as used (key 0), and its
+/// dispatches are left out as a pipeline's that writes only images (`spared`).
+pub fn submit_left_out(standin: usize, why: LeftOut) {
+    let p = Arc::new(Pending {
+        job: Mutex::new(None),
+        sent: std::sync::atomic::AtomicBool::new(true),
+        real: AtomicUsize::new(0),
+        driver: AtomicUsize::new(0),
+        done: Mutex::new(false),
+        cv: Condvar::new(),
+        compute: true,
+        key: 0,
+        used: Default::default(),
+        orphan: Default::default(),
+        late: Default::default(),
+        spared: std::sync::atomic::AtomicBool::new(true),
+        left_out: std::sync::atomic::AtomicU8::new(match why {
+            LeftOut::Rule => 1,
+            LeftOut::RtOff => 2,
+        }),
+        demand: Default::default(),
+        facts: Default::default(),
+    });
+    PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p);
 }
 
 /// The keys of the pipelines earlier runs used (`used-pipelines.txt` beside the DXIL cache):
@@ -2931,7 +2988,7 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
             if !p.sent.swap(true, Ordering::AcqRel) {
                 enqueue(p.clone());
             }
-            if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) && p.spared.load(Ordering::Acquire) {
+            if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) && p.spared.load(Ordering::Acquire) && p.left_out.load(Ordering::Acquire) == 0 {
                 static N: AtomicUsize = AtomicUsize::new(0);
                 let n = N.fetch_add(1, Ordering::Relaxed);
                 if n < 16 || n.is_power_of_two() {
@@ -3216,5 +3273,84 @@ mod tests {
         assert_eq!(due.len(), 1, "the other one when it passes a second");
         assert!(!due[0].compute && !due[0].built_here);
         assert_eq!(due[0].ms, 1100);
+    }
+
+    /// A pipeline left out at creation has no job and is never queued: a bind, a wait and a draw's
+    /// resolve all return its stand-in, and nothing reaches the workers.
+    #[test]
+    fn left_out_pipeline_is_never_enqueued() {
+        let (rule, off) = (0x7E57_E101usize, 0x7E57_E102usize);
+        submit_left_out(rule, LeftOut::Rule);
+        submit_left_out(off, LeftOut::RtOff);
+        for s in [rule, off] {
+            let p = entry(s).unwrap();
+            assert!(p.job.lock().unwrap().is_none(), "no job");
+            assert!(p.sent.load(Ordering::Acquire), "marked sent: no later resolve queues it");
+            assert_eq!(resolve(s), s);
+            assert_eq!(resolve_wait(s), s);
+            assert_eq!(resolve_for_bind(s), s);
+            assert_eq!(resolve_draw(s), (s, true));
+            assert!(p.facts.queued_at.lock().unwrap().is_none(), "never enqueued");
+            assert!(p.facts.picked_at.lock().unwrap().is_none(), "never taken by a worker");
+            assert!(is_pending(s) && is_spared(s), "stays unbuilt, and its binds do not wait");
+            assert_eq!(p.real.load(Ordering::Acquire), 0);
+        }
+        for s in [rule, off] {
+            assert_eq!(released(s), 0);
+        }
+    }
+
+    /// A left-out pipeline has key 0: it is never noted as used, so a later run does not preload it.
+    #[test]
+    fn left_out_records_no_used_key() {
+        let standin = 0x7E57_E111usize;
+        submit_left_out(standin, LeftOut::Rule);
+        let p = entry(standin).unwrap();
+        assert_eq!(p.key, 0);
+        assert!(p.compute);
+        resolve(standin);
+        resolve_wait(standin);
+        assert!(!p.used.load(Ordering::Acquire), "no use is recorded");
+        assert_eq!(released(standin), 0);
+    }
+
+    /// A left-out pipeline names its reason, ahead of the others; the names are the telemetry's.
+    #[test]
+    fn why_unbuilt_names_left_out_and_rt_off() {
+        let (rule, off) = (0x7E57_E121usize, 0x7E57_E122usize);
+        submit_left_out(rule, LeftOut::Rule);
+        submit_left_out(off, LeftOut::RtOff);
+        assert_eq!(why_unbuilt(rule), Some(Unbuilt::LeftOut));
+        assert_eq!(why_unbuilt(off), Some(Unbuilt::RtOff));
+        // (a bind that was left out goes through `late` and `spared`: the reason stays)
+        resolve_wait(rule);
+        assert_eq!(why_unbuilt(rule), Some(Unbuilt::LeftOut));
+        assert_eq!(skipped(off).why, Some(Unbuilt::RtOff));
+        assert_eq!(entry(off).unwrap().facts.skips.load(Ordering::Relaxed), 1);
+        assert_eq!([Unbuilt::LeftOut, Unbuilt::RtOff].map(Unbuilt::name), ["left_out", "rt_off"]);
+        for s in [rule, off] {
+            assert_eq!(released(s), 0);
+        }
+    }
+
+    /// Two stand-ins over one driver pipeline (`shared`): one left out, one built. The state lives on
+    /// each one's own entry: the built one resolves to its real pipeline, the left-out one to the dummy.
+    #[test]
+    fn left_out_and_normal_share_a_driver_standin_independently() {
+        let (left, normal, driver) = (0x7E57_E131usize, 0x7E57_E132usize, 0x7E57_E133usize);
+        submit_left_out(left, LeftOut::Rule);
+        submit_lazy(normal, true, Box::new(|| 0x1234), 0);
+        for s in [left, normal] {
+            shared(s, driver);
+        }
+        assert_eq!(resolve_wait_for(left, None), driver);
+        assert_eq!(resolve_wait_for(normal, None), 0x1234);
+        // (after the other one is built)
+        assert_eq!(resolve(left), driver);
+        assert_eq!(resolve_for_bind(normal), 0x1234);
+        assert_eq!(why_unbuilt(left), Some(Unbuilt::LeftOut));
+        assert_eq!(why_unbuilt(normal), None);
+        // (0x1234 is no pipeline: taken, not released)
+        assert_eq!((released(left), released(normal)), (0, 0x1234));
     }
 }
