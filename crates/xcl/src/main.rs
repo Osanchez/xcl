@@ -50,10 +50,12 @@ Usage:
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
       Use --probe only for header summaries, without --find, --extract, --out or --full.
-  xcl nvprofile [status | install [--mb N] | remove]
+  xcl nvprofile [status | install [--mb N] | remove | dump NAME | list [PATTERN] [--setting ID]]
       NVIDIA only: the driver profile of xcl.exe. `install` raises the shader heap the driver
       reserves for pipelines in use (512 MB by default, a removed device past it, #2403) to
       N MB (1024); it needs an elevated prompt once. `remove` takes XCL's profile out again.
+      `dump` (an exe or profile name) and `list` (profiles by name or exe; --setting ID: those that
+      set it, in hex) only read the driver's profiles and need no elevation.
   xcl --version
 ";
 
